@@ -111,6 +111,46 @@ finally:
 PY
 }
 
+chat() {
+  local script="${ROOT_DIR}/scripts/chat.py"
+  [[ -f "${script}" ]] || { echo "Missing: ${script}" >&2; exit 1; }
+  DATALENS_ENV_FILE="${ENV_FILE}" python3 "${script}" "$@" || true
+}
+
+usage() {
+  cat >&2 <<USAGE
+Usage: $0 <command> [args]
+
+운영
+  preflight              설정 검증 (.env 필수값, compose 문법)
+  up | down | restart    기동 / 정지 / 재시작
+  rebuild                재빌드 후 기동
+  status | logs          컨테이너 상태 / 로그 follow
+  health                 health + ready 확인
+  smoke                  세션 생성 검증
+  agent-check            3턴 시나리오 회귀 검증
+
+대화 테스트
+  new [-l ko|ja]         새 세션 생성
+  ask "질문" [-d]        질문 (세션 유지, 멀티턴)
+  chat [-d]              대화형 반복 모드
+  trace                  DataLens / Ollama / QueryForge 로그 추적
+  end                    세션 종료
+
+옵션
+  -d, --detail           응답 전문 JSON + 3계층 로그
+  -l, --locale ko|ja     세션 로케일 (기본 ko)
+  -t, --timeout <초>     요청 타임아웃 (기본 600)
+
+예시
+  $0 up
+  $0 new -l ko
+  $0 ask "PM_ENB_KPI_1M 컬럼 알려줘" --detail
+  $0 chat
+USAGE
+  exit 2
+}
+
 command="${1:-help}"
 case "${command}" in
   preflight) preflight ;;
@@ -123,5 +163,6 @@ case "${command}" in
   health) health ;;
   smoke) run_check smoke ;;
   agent-check) run_check agent-check ;;
-  *) echo "Usage: $0 {preflight|up|down|restart|rebuild|status|logs|health|smoke|agent-check}" >&2; exit 2 ;;
+  chat|ask|new|end|trace) shift; chat "${command}" "$@" ;;
+  *) usage ;;
 esac
