@@ -34,10 +34,13 @@ from datalens.application.agent import (
 )
 from datalens.config import Settings
 from datalens.infrastructure.queryforge_mcp import McpQueryForgeClient
+from datalens.ports.queryforge import QueryForgeClient, QueryForgeHttpResult, QueryForgeUnavailable
 from datalens.infrastructure.session_store import InMemorySessionStore
 
 
 SESSION_PATTERN = re.compile(r"^dls_[A-Za-z0-9_-]{20,64}$")
+DATA_PAGE_DEFAULT = 100
+DATA_PAGE_MAX = 1000
 LOG = logging.getLogger("datalens.http")
 
 
@@ -122,11 +125,12 @@ def build_app(
     readiness: Readiness | None = None,
     llm_readiness: Readiness | None = None,
     message_handler: MessageHandler | None = None,
+    queryforge_client: QueryForgeClient | None = None,
     closeables: tuple[Any, ...] = (),
 ) -> Starlette:
     store = InMemorySessionStore(settings.session_ttl_seconds, settings.default_locale)
     sessions = session_service or SessionService(store)
-    queryforge = readiness or McpQueryForgeClient(
+    queryforge = queryforge_client or readiness or McpQueryForgeClient(
         settings.queryforge_url(),
         settings.queryforge_api_key.get_secret_value(),
         data_base_url=settings.queryforge_data_url(),
@@ -252,6 +256,203 @@ def build_app(
         await sessions.delete(request.path_params["session_id"])
         return Response(status_code=204)
 
+    def queryforge_session(
+        request: Request, *, dataset: bool
+    ) -> tuple[str, str | None] | JSONResponse:
+        session_id = request.query_params.get("session_id", "")
+        try:
+            session = sessions.require(session_id)
+        except SessionNotFound:
+            code = "DL_DATASET_NOT_FOUND" if dataset else "DL_SESSION_NOT_FOUND"
+            message = "Dataset not found" if dataset else "Session not found"
+            return error_response(request, code, message, 404)
+        if session.queryforge_session_id is None:
+            if dataset:
+                return error_response(request, "DL_DATASET_NOT_FOUND", "Dataset not found", 404)
+        return session_id, session.queryforge_session_id
+
+    def bind_queryforge_session(session_id: str, application_session_id: str | None) -> None:
+        if application_session_id is not None:
+            sessions.bind_queryforge_session(session_id, application_session_id)
+
+    def pagination(request: Request) -> tuple[int, int] | JSONResponse:
+        try:
+            offset = int(request.query_params.get("offset", 0))
+            requested_limit = int(request.query_params.get("limit", DATA_PAGE_DEFAULT))
+        except ValueError:
+            return error_response(request, "DL_INVALID_PAGINATION", "Invalid pagination", 400)
+        if offset < 0 or requested_limit < 1:
+            return error_response(request, "DL_INVALID_PAGINATION", "Invalid pagination", 400)
+        return offset, min(requested_limit, DATA_PAGE_MAX)
+
+    def data_result(request: Request, result: QueryForgeHttpResult) -> JSONResponse:
+        if 200 <= result.status_code < 300:
+            return JSONResponse(result.payload, status_code=result.status_code)
+        if result.status_code == 410:
+            return error_response(request, "DL_DATASET_EXPIRED", "Dataset expired", 410)
+        if result.status_code == 404:
+            return error_response(request, "DL_DATASET_NOT_FOUND", "Dataset not found", 404)
+        if result.status_code == 400:
+            return error_response(request, "DL_INVALID_PAGINATION", "Invalid pagination", 400)
+        return error_response(
+            request, "DL_UPSTREAM_UNAVAILABLE", "Upstream service is unavailable", 503, retryable=True
+        )
+
+    async def dataset_rows(request: Request) -> JSONResponse:
+        owner = queryforge_session(request, dataset=True)
+        if isinstance(owner, JSONResponse):
+            return owner
+        _, application_session_id = owner
+        assert application_session_id is not None
+        page = pagination(request)
+        if isinstance(page, JSONResponse):
+            return page
+        offset, limit = page
+        try:
+            result = await queryforge.fetch_dataset_rows(
+                request.path_params["dataset_id"],
+                application_session_id,
+                offset=offset,
+                limit=limit,
+                timeout_seconds=settings.queryforge_timeout_seconds,
+            )
+        except TimeoutError:
+            return error_response(
+                request, "DL_UPSTREAM_TIMEOUT", "Upstream request timed out", 504, retryable=True
+            )
+        except QueryForgeUnavailable:
+            return error_response(
+                request, "DL_UPSTREAM_UNAVAILABLE", "Upstream service is unavailable", 503, retryable=True
+            )
+        return data_result(request, result)
+
+    async def dataset_meta(request: Request) -> JSONResponse:
+        owner = queryforge_session(request, dataset=True)
+        if isinstance(owner, JSONResponse):
+            return owner
+        _, application_session_id = owner
+        assert application_session_id is not None
+        try:
+            result = await queryforge.fetch_dataset_meta(
+                request.path_params["dataset_id"],
+                application_session_id,
+                timeout_seconds=settings.queryforge_timeout_seconds,
+            )
+        except TimeoutError:
+            return error_response(
+                request, "DL_UPSTREAM_TIMEOUT", "Upstream request timed out", 504, retryable=True
+            )
+        except QueryForgeUnavailable:
+            return error_response(
+                request, "DL_UPSTREAM_UNAVAILABLE", "Upstream service is unavailable", 503, retryable=True
+            )
+        return data_result(request, result)
+
+    async def catalog_tables(request: Request) -> JSONResponse:
+        owner = queryforge_session(request, dataset=False)
+        if isinstance(owner, JSONResponse):
+            return owner
+        session_id, application_session_id = owner
+        page = pagination(request)
+        if isinstance(page, JSONResponse):
+            return page
+        offset, limit = page
+        arguments: dict[str, Any] = {
+            "action": "list_tables",
+            "limit": min(DATA_PAGE_MAX, offset + limit),
+        }
+        pattern = request.query_params.get("pattern")
+        if pattern is not None:
+            arguments["name_pattern"] = pattern
+        try:
+            result = await queryforge.call_tool(
+                "schema",
+                arguments,
+                application_session_id=application_session_id,
+                timeout_seconds=settings.queryforge_timeout_seconds,
+            )
+        except TimeoutError:
+            return error_response(
+                request, "DL_UPSTREAM_TIMEOUT", "Upstream request timed out", 504, retryable=True
+            )
+        except QueryForgeUnavailable:
+            return error_response(
+                request, "DL_UPSTREAM_UNAVAILABLE", "Upstream service is unavailable", 503, retryable=True
+            )
+        if not result.ok:
+            return error_response(request, "DL_CATALOG_UNAVAILABLE", "Catalog request failed", 502)
+        bind_queryforge_session(session_id, result.application_session_id)
+        tables = result.payload.get("tables", [])
+        warnings = result.payload.get("warnings", [])
+        total_count = next(
+            (
+                warning.get("original_items")
+                for warning in warnings
+                if warning.get("code") == "TABLES_TRUNCATED"
+                and isinstance(warning.get("original_items"), int)
+            ),
+            len(tables),
+        )
+        returned = tables[offset : offset + limit]
+        return JSONResponse(
+            {
+                "offset": offset,
+                "limit": limit,
+                "total_count": total_count,
+                "returned_count": len(returned),
+                "tables": returned,
+                "truncated": offset + len(returned) < total_count,
+                "warnings": warnings,
+            }
+        )
+
+    async def catalog_columns(request: Request) -> JSONResponse:
+        owner = queryforge_session(request, dataset=False)
+        if isinstance(owner, JSONResponse):
+            return owner
+        session_id, application_session_id = owner
+        try:
+            result = await queryforge.call_tool(
+                "schema",
+                {"action": "list_columns", "table": request.path_params["table"]},
+                application_session_id=application_session_id,
+                timeout_seconds=settings.queryforge_timeout_seconds,
+            )
+        except TimeoutError:
+            return error_response(
+                request, "DL_UPSTREAM_TIMEOUT", "Upstream request timed out", 504, retryable=True
+            )
+        except QueryForgeUnavailable:
+            return error_response(
+                request, "DL_UPSTREAM_UNAVAILABLE", "Upstream service is unavailable", 503, retryable=True
+            )
+        if not result.ok:
+            status = 404 if result.error and result.error.code in {"UNKNOWN_TABLE", "TABLE_NOT_ALLOWED"} else 502
+            code = "DL_CATALOG_NOT_FOUND" if status == 404 else "DL_CATALOG_UNAVAILABLE"
+            return error_response(request, code, "Catalog entry not found" if status == 404 else "Catalog request failed", status)
+        bind_queryforge_session(session_id, result.application_session_id)
+        columns = result.payload.get("columns", [])
+        warnings = result.payload.get("warnings", [])
+        total_count = next(
+            (
+                warning.get("original_items")
+                for warning in warnings
+                if warning.get("code") == "COLUMNS_TRUNCATED"
+                and isinstance(warning.get("original_items"), int)
+            ),
+            len(columns),
+        )
+        return JSONResponse(
+            {
+                "table": result.payload.get("table"),
+                "total_count": total_count,
+                "returned_count": len(columns),
+                "columns": columns,
+                "truncated": bool(result.payload.get("truncated")),
+                "warnings": warnings,
+            }
+        )
+
     app = Starlette(
         routes=[
             Route("/v1/health", health, methods=["GET"]),
@@ -259,6 +460,10 @@ def build_app(
             Route("/v1/sessions", create_session, methods=["POST"]),
             Route("/v1/sessions/{session_id:str}/messages", message, methods=["POST"]),
             Route("/v1/sessions/{session_id:str}", delete_session, methods=["DELETE"]),
+            Route("/v1/datasets/{dataset_id:str}/rows", dataset_rows, methods=["GET"]),
+            Route("/v1/datasets/{dataset_id:str}/meta", dataset_meta, methods=["GET"]),
+            Route("/v1/catalog/tables", catalog_tables, methods=["GET"]),
+            Route("/v1/catalog/tables/{table:str}/columns", catalog_columns, methods=["GET"]),
         ],
         lifespan=lifespan,
     )

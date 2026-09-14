@@ -50,6 +50,7 @@ def create_app():
         readiness=queryforge,
         llm_readiness=provider,
         message_handler=chat,
+        queryforge_client=queryforge,
         closeables=(provider,),
     )
 

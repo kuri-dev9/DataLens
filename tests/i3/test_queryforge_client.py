@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -50,7 +52,12 @@ class FakeSession:
 
 def client_with(session: FakeSession) -> McpQueryForgeClient:
     client = McpQueryForgeClient("http://queryforge.test/mcp", "top-secret")
-    client._session = session
+
+    @asynccontextmanager
+    async def session_scope(timeout):
+        yield session
+
+    client._session_scope = session_scope
     return client
 
 
@@ -163,12 +170,46 @@ async def test_structured_error_is_preserved_and_unsafe_details_removed() -> Non
 @pytest.mark.anyio
 async def test_transport_reconnect_does_not_change_caller_owned_application_session() -> None:
     first = FakeSession()
-    client = client_with(first)
+    second = FakeSession()
+    sessions = deque([first, second])
+    client = McpQueryForgeClient("http://queryforge.test/mcp", "top-secret")
+
+    @asynccontextmanager
+    async def session_scope(timeout):
+        yield sessions.popleft()
+
+    client._session_scope = session_scope
     await client.call_tool("schema", {}, application_session_id="C" * 22, timeout_seconds=1)
-    client._session = FakeSession()
     await client.call_tool("schema", {}, application_session_id="C" * 22, timeout_seconds=1)
     assert first.calls[0][1]["session_id"] == "C" * 22
-    assert client._session.calls[0][1]["session_id"] == "C" * 22
+    assert second.calls[0][1]["session_id"] == "C" * 22
+
+
+@pytest.mark.anyio
+async def test_asgi_ac3_failed_transport_is_reconnected_on_next_call() -> None:
+    healthy = FakeSession()
+    attempts = 0
+    client = McpQueryForgeClient("http://queryforge.test/mcp", "top-secret")
+    client._tools = (SimpleNamespace(name="cached"),)
+
+    @asynccontextmanager
+    async def session_scope(timeout):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise QueryForgeUnavailable("disconnected")
+        yield healthy
+
+    client._session_scope = session_scope
+    with pytest.raises(QueryForgeUnavailable):
+        await client.call_tool("schema", {}, application_session_id=None, timeout_seconds=1)
+    assert client._tools == ()
+
+    result = await client.call_tool(
+        "schema", {}, application_session_id=None, timeout_seconds=1
+    )
+    assert result.ok is True
+    assert attempts == 2
 
 
 def test_repr_redacts_authentication_secret() -> None:
@@ -199,3 +240,61 @@ async def test_release_uses_current_data_api_contract_and_is_idempotent(status: 
         await data_client.aclose()
     assert captured[0].url.raw_path == b"/data/sessions/qf%2Fsession/release"
     assert captured[0].headers["x-api-key"] == "top-secret"
+
+
+@pytest.mark.anyio
+async def test_data_proxy_forwards_queryforge_session_and_pagination() -> None:
+    captured = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "dataset_id": "ds_000001",
+                "offset": 7,
+                "limit": 1000,
+                "rows": [],
+                "warnings": [],
+            },
+        )
+
+    data_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = McpQueryForgeClient(
+        "http://queryforge.test/mcp",
+        "top-secret",
+        data_base_url="http://queryforge.test",
+        data_client=data_client,
+    )
+    try:
+        result = await client.fetch_dataset_rows(
+            "ds_000001", "S" * 22, offset=7, limit=1000, timeout_seconds=1
+        )
+    finally:
+        await data_client.aclose()
+    assert result.status_code == 200
+    assert result.payload["limit"] == 1000
+    assert captured[0].url.path == "/data/datasets/ds_000001/rows"
+    assert dict(captured[0].url.params) == {"offset": "7", "limit": "1000"}
+    assert captured[0].headers["x-api-key"] == "top-secret"
+    assert captured[0].headers["x-session-id"] == "S" * 22
+
+
+@pytest.mark.anyio
+async def test_data_proxy_preserves_queryforge_error_status_and_body() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": "not_found"})
+
+    data_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = McpQueryForgeClient(
+        "http://queryforge.test/mcp",
+        "top-secret",
+        data_base_url="http://queryforge.test",
+        data_client=data_client,
+    )
+    try:
+        result = await client.fetch_dataset_meta("ds_hidden", "S" * 22, timeout_seconds=1)
+    finally:
+        await data_client.aclose()
+    assert result.status_code == 404
+    assert result.payload == {"error": "not_found"}

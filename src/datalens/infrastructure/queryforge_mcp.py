@@ -13,6 +13,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 from datalens.ports.queryforge import (
     QueryForgeFailure,
+    QueryForgeHttpResult,
     QueryForgeResult,
     QueryForgeToolDefinition,
     QueryForgeUnavailable,
@@ -183,6 +184,63 @@ class McpQueryForgeClient:
             raise TimeoutError("QueryForge session release timed out") from exc
         except httpx.HTTPError as exc:
             raise QueryForgeUnavailable("QueryForge session release failed") from exc
+
+    async def fetch_dataset_rows(
+        self,
+        dataset_id: str,
+        application_session_id: str,
+        *,
+        offset: int,
+        limit: int,
+        timeout_seconds: float,
+    ) -> QueryForgeHttpResult:
+        return await self._data_get(
+            f"/data/datasets/{quote(dataset_id, safe='')}/rows",
+            application_session_id,
+            timeout_seconds,
+            params={"offset": offset, "limit": limit},
+        )
+
+    async def fetch_dataset_meta(
+        self,
+        dataset_id: str,
+        application_session_id: str,
+        *,
+        timeout_seconds: float,
+    ) -> QueryForgeHttpResult:
+        return await self._data_get(
+            f"/data/datasets/{quote(dataset_id, safe='')}/meta",
+            application_session_id,
+            timeout_seconds,
+        )
+
+    async def _data_get(
+        self,
+        path: str,
+        application_session_id: str,
+        timeout_seconds: float,
+        *,
+        params: dict[str, int] | None = None,
+    ) -> QueryForgeHttpResult:
+        if not self._data_base_url:
+            raise QueryForgeUnavailable("QueryForge Data API base URL is not configured")
+        if timeout_seconds <= 0:
+            raise TimeoutError("QueryForge data deadline exhausted")
+        try:
+            response = await self._data_client.get(
+                f"{self._data_base_url}{path}",
+                headers={"x-api-key": self._api_key, "x-session-id": application_session_id},
+                params=params,
+                timeout=min(timeout_seconds, self._default_timeout),
+            )
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("response must be an object")
+            return QueryForgeHttpResult(response.status_code, deepcopy(payload))
+        except httpx.TimeoutException as exc:
+            raise TimeoutError("QueryForge data request timed out") from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise QueryForgeUnavailable("QueryForge data request failed") from exc
 
     @staticmethod
     def _normalize_error(raw: Any) -> QueryForgeFailure | None:

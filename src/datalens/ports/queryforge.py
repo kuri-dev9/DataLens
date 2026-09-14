@@ -29,6 +29,12 @@ class QueryForgeResult:
     error: QueryForgeFailure | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class QueryForgeHttpResult:
+    status_code: int
+    payload: dict[str, Any]
+
+
 class QueryForgeUnavailable(RuntimeError):
     pass
 
@@ -51,3 +57,19 @@ class QueryForgeClient(Protocol):
     async def release_application_session(
         self, application_session_id: str, timeout_seconds: float
     ) -> None: ...
+    async def fetch_dataset_rows(
+        self,
+        dataset_id: str,
+        application_session_id: str,
+        *,
+        offset: int,
+        limit: int,
+        timeout_seconds: float,
+    ) -> QueryForgeHttpResult: ...
+    async def fetch_dataset_meta(
+        self,
+        dataset_id: str,
+        application_session_id: str,
+        *,
+        timeout_seconds: float,
+    ) -> QueryForgeHttpResult: ...
