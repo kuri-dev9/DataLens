@@ -132,8 +132,16 @@ Usage: $0 <command> [args]
 
 대화 테스트
   new [-l ko|ja]         새 세션 생성
-  ask "질문" [-d]        질문 (세션 유지, 멀티턴)
-  chat [-d]              대화형 반복 모드
+  ask "질문" [-d] [-s]   질문 (세션 유지, 멀티턴)
+  raw "질문"             질문 + 전체 응답 및 로그
+  chat [-d] [-s]         대화형 반복 모드
+  tables [pattern] [--limit N] [--stream]
+                         카탈로그 테이블 목록
+  columns <table> [pattern] [--stream]
+                         테이블 컬럼 목록 (pattern은 로컬 출력 필터)
+  rows <dataset_id> [--offset N] [--limit N] [--stream] [--json]
+                         Dataset 행 조회
+  meta <dataset_id>      Dataset 메타데이터
   trace                  DataLens / Ollama / QueryForge 로그 추적
   end                    세션 종료
 
@@ -141,11 +149,17 @@ Usage: $0 <command> [args]
   -d, --detail           응답 전문 JSON + 3계층 로그
   -l, --locale ko|ja     세션 로케일 (기본 ko)
   -t, --timeout <초>     요청 타임아웃 (기본 600)
+  -s, --stream           Accept: text/event-stream으로 스트리밍
+  --limit <건수>         tables/rows 조회 상한 (기본 1000)
+  --offset <위치>        rows 시작 위치 (기본 0)
+  --json                 가공하지 않은 전체 JSON 출력
 
 예시
   $0 up
   $0 new -l ko
   $0 ask "PM_ENB_KPI_1M 컬럼 알려줘" --detail
+  $0 tables PM_ --limit 1000
+  $0 rows ds_000000003 --stream
   $0 chat
 USAGE
   exit 2
@@ -163,6 +177,6 @@ case "${command}" in
   health) health ;;
   smoke) run_check smoke ;;
   agent-check) run_check agent-check ;;
-  chat|ask|new|end|trace) shift; chat "${command}" "$@" ;;
+  chat|ask|raw|new|end|trace|tables|columns|rows|meta) shift; chat "${command}" "$@" ;;
   *) usage ;;
 esac

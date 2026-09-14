@@ -11,6 +11,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -91,6 +92,38 @@ def call(method: str, path: str, payload=None, timeout=600, base=None):
         return status, raw, el
 
 
+def sse_events(method: str, path: str, payload=None, timeout=600):
+    """SSE event/data 쌍을 순서대로 반환한다. 표준 라이브러리만 사용한다."""
+    data = None if payload is None else json.dumps(payload).encode()
+    req = urllib.request.Request(
+        BASE + path,
+        data=data,
+        method=method,
+        headers={
+            "x-api-key": KEY,
+            "content-type": "application/json",
+            "accept": "text/event-stream",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        event = "message"
+        data_lines: list[str] = []
+        for raw in response:
+            line = raw.decode("utf-8").rstrip("\r\n")
+            if line.startswith(":"):
+                continue
+            if not line:
+                if data_lines:
+                    yield event, json.loads("\n".join(data_lines))
+                event, data_lines = "message", []
+            elif line.startswith("event:"):
+                event = line[6:].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[5:].lstrip())
+        if data_lines:
+            yield event, json.loads("\n".join(data_lines))
+
+
 # ─────────────────────────── 출력 ───────────────────────────
 
 def show(status, body, wall, detail=False):
@@ -139,6 +172,27 @@ def show(status, body, wall, detail=False):
     if detail:
         print(f"{C['dim']}\n── 전체 응답 ──\n"
               f"{json.dumps(body, ensure_ascii=False, indent=2)}{C['x']}")
+
+
+def print_table(rows: list[dict], columns: list[tuple[str, str]], max_rows=20):
+    shown = rows[:max_rows]
+    widths = []
+    for key, title in columns:
+        values = [title, *(str(row.get(key, "")) for row in shown)]
+        widths.append(min(60, max(len(value) for value in values)))
+    print("  " + " | ".join(title.ljust(width) for (_, title), width in zip(columns, widths)))
+    print("  " + "-+-".join("-" * width for width in widths))
+    for row in shown:
+        print("  " + " | ".join(str(row.get(key, ""))[:width].ljust(width)
+                                   for (key, _), width in zip(columns, widths)))
+
+
+def show_error(body) -> bool:
+    error = body.get("error") if isinstance(body, dict) else None
+    if not error:
+        return False
+    print(f"{C['r']}[{error.get('code')}] {error.get('message')}{C['x']}", file=sys.stderr)
+    return True
 
 
 # ─────────────────────────── 디버그 ───────────────────────────
@@ -227,7 +281,51 @@ def get_session():
     return STATE.read_text().strip()
 
 
-def ask(msg, detail=False, timeout=600):
+def ask_stream(msg, timeout=600):
+    sid = get_session()
+    print(f"{C['b']}─────────────────────────────────────────────{C['x']}")
+    print(f"{C['b']}질문:{C['x']} {msg}")
+    started = time.monotonic()
+    first_token = None
+    token_events = 0
+    metadata = {}
+    try:
+        for event, data in sse_events(
+            "POST", f"/v1/sessions/{sid}/messages", {"message": msg}, timeout
+        ):
+            if event == "token":
+                if first_token is None:
+                    first_token = time.monotonic()
+                    print(f"  [{first_token - started:.1f}s 대기]")
+                print(data.get("text", ""), end="", flush=True)
+                token_events += 1
+            elif event == "tool_call":
+                label = "조회 중..." if data.get("status") == "started" else "완료"
+                print(f"\n{C['c']}  [{data.get('tool')} {label}]{C['x']}")
+            elif event == "dataset":
+                print(f"\n{C['g']}  [dataset] {data.get('dataset_id')} rows={data.get('row_count')}{C['x']}")
+            elif event == "error":
+                show_error(data)
+                return data
+            elif event == "done":
+                metadata = data.get("metadata") or {}
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode()
+        body = json.loads(raw) if raw else {}
+        show_error(body)
+        return body
+    total = time.monotonic() - started
+    ttft = (first_token - started) if first_token else total
+    generation = max(total - ttft, 0.001)
+    rate = token_events / generation
+    print(f"\n{C['c']}  ── TTFT {ttft:.1f}s | 총 {total:.1f}s | {rate:.1f} tok/s"
+          f" | tool_calls={metadata.get('tool_calls', 0)}{C['x']}")
+    return metadata
+
+
+def ask(msg, detail=False, timeout=600, stream=False):
+    if stream:
+        return ask_stream(msg, timeout)
     sid = get_session()
     print(f"{C['b']}─────────────────────────────────────────────{C['x']}")
     print(f"{C['b']}질문:{C['x']} {msg}")
@@ -245,17 +343,102 @@ def ask(msg, detail=False, timeout=600):
     return body
 
 
+def tables(pattern=None, limit=1000, stream=False, raw_json=False):
+    sid = get_session()
+    params = {"limit": limit}
+    if pattern:
+        params["pattern"] = pattern
+    path = f"/v1/sessions/{sid}/catalog/tables?{urllib.parse.urlencode(params)}"
+    if stream:
+        items, meta, done = [], {}, {}
+        for event, data in sse_events("GET", path):
+            if event == "meta": meta = data
+            elif event == "tables": items.extend(data.get("tables") or [])
+            elif event == "done": done = data
+            elif event == "error": show_error(data); return
+        body = {**meta, "tables": items, "returned_count": done.get("returned", len(items)),
+                "total_count": done.get("total", meta.get("total_count")),
+                "truncated": done.get("returned", len(items)) < done.get("total", len(items))}
+    else:
+        status, body, _ = call("GET", path)
+        if status != 200 or show_error(body): return
+    if raw_json:
+        print(json.dumps(body, ensure_ascii=False, indent=2)); return
+    items = body.get("tables") or []
+    print_table(items, [("name", "테이블명"), ("row_count_estimate", "행수"), ("partitioned", "파티션")], len(items))
+    print(f"  반환 {body.get('returned_count', len(items))} / 전체 {body.get('total_count', len(items))}")
+    if body.get("truncated"):
+        print(f"{C['y']}  [warn] 결과가 절단되었습니다.{C['x']}")
+
+
+def columns(table, pattern=None, stream=False, raw_json=False):
+    sid = get_session()
+    path = f"/v1/sessions/{sid}/catalog/tables/{urllib.parse.quote(table, safe='')}/columns"
+    status, body, _ = call("GET", path)
+    if status != 200 or show_error(body): return
+    items = body.get("columns") or []
+    if pattern:
+        needle = pattern.casefold()
+        items = [item for item in items if needle in str(item.get("name", "")).casefold()]
+    if raw_json:
+        print(json.dumps(body, ensure_ascii=False, indent=2)); return
+    print_table(items, [("name", "컬럼명"), ("type", "타입")], len(items))
+    print(f"  반환 {len(items)} / 전체 {body.get('total_count', len(items))}")
+    if stream:
+        print(f"{C['dim']}  columns 경로는 docs/API.md에서 SSE 대상으로 정의되지 않아 JSON으로 조회했습니다.{C['x']}")
+
+
+def dataset_rows(dataset_id, offset=0, limit=1000, stream=False, raw_json=False):
+    sid = get_session()
+    encoded = urllib.parse.quote(dataset_id, safe="")
+    base = f"/v1/sessions/{sid}/datasets/{encoded}"
+    path = f"{base}/rows?{urllib.parse.urlencode({'offset': offset, 'limit': limit})}"
+    if stream:
+        items, meta, done = [], {}, {}
+        for event, data in sse_events("GET", path):
+            if event == "meta": meta = data
+            elif event == "rows": items.extend(data.get("rows") or [])
+            elif event == "done": done = data
+            elif event == "error": show_error(data); return
+        body = {"dataset_id": dataset_id, "offset": offset, "limit": limit, "rows": items}
+        total = done.get("total", meta.get("row_count"))
+    else:
+        status, body, _ = call("GET", path)
+        if status != 200 or show_error(body): return
+        meta_status, meta, _ = call("GET", f"{base}/meta")
+        total = meta.get("row_count") if meta_status == 200 and isinstance(meta, dict) else len(body.get("rows") or [])
+    if raw_json:
+        print(json.dumps(body, ensure_ascii=False, indent=2)); return
+    items = body.get("rows") or []
+    keys = list(dict.fromkeys(key for row in items[:20] for key in row))
+    print_table(items, [(key, key) for key in keys], 20) if keys else print("  (행 없음)")
+    print(f"  표시 {min(20, len(items))} / 반환 {len(items)} / 전체 {total}")
+
+
+def dataset_meta(dataset_id, raw_json=False):
+    sid = get_session()
+    path = f"/v1/sessions/{sid}/datasets/{urllib.parse.quote(dataset_id, safe='')}/meta"
+    status, body, _ = call("GET", path)
+    if status != 200 or show_error(body): return
+    print(json.dumps(body, ensure_ascii=False, indent=2))
+
+
 # ─────────────────────────── main ───────────────────────────
 
 def main():
     p = argparse.ArgumentParser(description="DataLens 대화 테스트")
     p.add_argument("command", nargs="?", default="chat",
-                   choices=["chat", "ask", "new", "end", "health", "trace"])
+                   choices=["chat", "ask", "raw", "new", "end", "health", "trace",
+                            "tables", "columns", "rows", "meta"])
     p.add_argument("message", nargs="*", help="질문 내용")
     p.add_argument("--detail", "-d", action="store_true",
                    help="전체 JSON + DataLens/Ollama/QueryForge 로그 추적")
     p.add_argument("--locale", "-l", default="ko", type=norm_locale)
     p.add_argument("--timeout", "-t", type=int, default=601)
+    p.add_argument("--limit", type=int, default=1000)
+    p.add_argument("--offset", type=int, default=0)
+    p.add_argument("--stream", "-s", action="store_true")
+    p.add_argument("--json", action="store_true", dest="raw_json")
     a = p.parse_args()
 
     if not KEY:
@@ -276,7 +459,26 @@ def main():
     elif a.command == "ask":
         if not a.message:
             sys.exit("질문을 입력하세요.")
-        ask(" ".join(a.message), a.detail, a.timeout)
+        ask(" ".join(a.message), a.detail, a.timeout, a.stream)
+    elif a.command == "raw":
+        if not a.message:
+            sys.exit("질문을 입력하세요.")
+        ask(" ".join(a.message), True, a.timeout, a.stream)
+    elif a.command == "tables":
+        tables(a.message[0] if a.message else None, a.limit, a.stream, a.raw_json)
+    elif a.command == "columns":
+        if not a.message:
+            sys.exit("테이블명을 입력하세요.")
+        columns(a.message[0], a.message[1] if len(a.message) > 1 else None,
+                a.stream, a.raw_json)
+    elif a.command == "rows":
+        if not a.message:
+            sys.exit("dataset_id를 입력하세요.")
+        dataset_rows(a.message[0], a.offset, a.limit, a.stream, a.raw_json)
+    elif a.command == "meta":
+        if not a.message:
+            sys.exit("dataset_id를 입력하세요.")
+        dataset_meta(a.message[0], a.raw_json)
     else:  # chat
         sid = get_session()
         print(f"세션 {sid}")
@@ -311,7 +513,7 @@ def main():
             if line == "/health":
                 health()
                 continue
-            ask(line, detail, a.timeout)
+            ask(line, detail, a.timeout, a.stream)
 
 
 if __name__ == "__main__":
