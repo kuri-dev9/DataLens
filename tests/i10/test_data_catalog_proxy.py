@@ -121,11 +121,11 @@ def test_data_ac1_rows_and_meta_return_queryforge_payload_unchanged(settings) ->
     client, session_id = _client(settings, queryforge)
     with client:
         rows = client.get(
-            f"/v1/datasets/ds_owned/rows?session_id={session_id}&offset=3&limit=2",
+            f"/v1/sessions/{session_id}/datasets/ds_owned/rows?offset=3&limit=2",
             headers=HEADERS,
         )
         meta = client.get(
-            f"/v1/datasets/ds_owned/meta?session_id={session_id}", headers=HEADERS
+            f"/v1/sessions/{session_id}/datasets/ds_owned/meta", headers=HEADERS
         )
     assert rows.json() == {
         "dataset_id": "ds_owned",
@@ -147,10 +147,10 @@ def test_data_ac2_limit_1000_and_excess_are_clamped_to_queryforge_max(settings) 
     client, session_id = _client(settings, queryforge)
     with client:
         assert client.get(
-            f"/v1/datasets/ds_owned/rows?session_id={session_id}&limit=1000", headers=HEADERS
+            f"/v1/sessions/{session_id}/datasets/ds_owned/rows?limit=1000", headers=HEADERS
         ).status_code == 200
         assert client.get(
-            f"/v1/datasets/ds_owned/rows?session_id={session_id}&limit=5000", headers=HEADERS
+            f"/v1/sessions/{session_id}/datasets/ds_owned/rows?limit=5000", headers=HEADERS
         ).status_code == 200
     assert [call[-1] for call in queryforge.data_calls] == [1000, 1000]
 
@@ -160,7 +160,7 @@ def test_data_ac3_cross_session_dataset_is_indistinguishable_from_missing(settin
     client, session_id = _client(settings, queryforge, "R" * 22)
     with client:
         response = client.get(
-            f"/v1/datasets/ds_owned/rows?session_id={session_id}", headers=HEADERS
+            f"/v1/sessions/{session_id}/datasets/ds_owned/rows", headers=HEADERS
         )
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "DL_DATASET_NOT_FOUND"
@@ -172,9 +172,9 @@ def test_data_ac4_proxy_routes_require_api_key(settings) -> None:
     client, session_id = _client(settings, queryforge)
     with client:
         assert client.get(
-            f"/v1/datasets/ds_owned/rows?session_id={session_id}"
+            f"/v1/sessions/{session_id}/datasets/ds_owned/rows"
         ).status_code == 401
-        assert client.get(f"/v1/catalog/tables?session_id={session_id}").status_code == 401
+        assert client.get(f"/v1/sessions/{session_id}/catalog/tables").status_code == 401
     assert queryforge.data_calls == []
     assert queryforge.tool_calls == []
 
@@ -184,7 +184,7 @@ def test_data_ac5_catalog_returns_all_tables_without_llm(settings) -> None:
     client, session_id = _client(settings, queryforge, None)
     with client:
         response = client.get(
-            f"/v1/catalog/tables?session_id={session_id}&limit=1000", headers=HEADERS
+            f"/v1/sessions/{session_id}/catalog/tables?limit=1000", headers=HEADERS
         )
     assert response.status_code == 200
     assert response.json()["total_count"] == 526
@@ -204,7 +204,7 @@ def test_data_ac6_catalog_pattern_is_case_insensitive(settings) -> None:
     client, session_id = _client(settings, queryforge)
     with client:
         response = client.get(
-            f"/v1/catalog/tables?session_id={session_id}&pattern=REPORT", headers=HEADERS
+            f"/v1/sessions/{session_id}/catalog/tables?pattern=REPORT", headers=HEADERS
         )
     assert [table["name"] for table in response.json()["tables"]] == [
         "Alpha_Report",
@@ -218,7 +218,7 @@ def test_catalog_columns_returns_original_columns_with_counts(settings) -> None:
     client, session_id = _client(settings, queryforge)
     with client:
         response = client.get(
-            f"/v1/catalog/tables/orders/columns?session_id={session_id}", headers=HEADERS
+            f"/v1/sessions/{session_id}/catalog/tables/orders/columns", headers=HEADERS
         )
     assert response.status_code == 200
     assert response.json() == {
@@ -238,11 +238,44 @@ def test_data_ac7_direct_proxy_routes_complete_under_one_second(settings) -> Non
     with client:
         started = time.monotonic()
         rows = client.get(
-            f"/v1/datasets/ds_owned/rows?session_id={session_id}", headers=HEADERS
+            f"/v1/sessions/{session_id}/datasets/ds_owned/rows", headers=HEADERS
         )
         catalog = client.get(
-            f"/v1/catalog/tables?session_id={session_id}", headers=HEADERS
+            f"/v1/sessions/{session_id}/catalog/tables", headers=HEADERS
         )
         elapsed = time.monotonic() - started
     assert rows.status_code == catalog.status_code == 200
     assert elapsed < 1
+
+
+def test_path_ac2_legacy_dataset_and_catalog_paths_are_removed(settings) -> None:
+    queryforge = DirectQueryForge()
+    client, session_id = _client(settings, queryforge)
+    with client:
+        assert client.get(
+            f"/v1/datasets/ds_owned/rows?session_id={session_id}", headers=HEADERS
+        ).status_code == 404
+        assert client.get(
+            f"/v1/catalog/tables?session_id={session_id}", headers=HEADERS
+        ).status_code == 404
+
+
+def test_strm_ac9_rows_and_catalog_are_chunked_as_sse(settings) -> None:
+    queryforge = DirectQueryForge()
+    client, session_id = _client(settings, queryforge)
+    headers = {**HEADERS, "accept": "text/event-stream"}
+    with client:
+        rows = client.get(
+            f"/v1/sessions/{session_id}/datasets/ds_owned/rows?limit=250", headers=headers
+        )
+        catalog = client.get(
+            f"/v1/sessions/{session_id}/catalog/tables?limit=526", headers=headers
+        )
+    assert rows.headers["content-type"].startswith("text/event-stream")
+    assert rows.headers["cache-control"] == "no-cache"
+    assert rows.headers["x-accel-buffering"] == "no"
+    assert "event: meta" in rows.text
+    assert "event: rows" in rows.text
+    assert "event: done" in rows.text
+    assert catalog.text.count("event: tables") == 6
+    assert "event: done" in catalog.text

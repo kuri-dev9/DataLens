@@ -39,7 +39,7 @@ class FakeAgent:
         self.outcome = outcome
         self.calls = []
 
-    async def run(self, session, message, deadline):
+    async def run(self, session, message, deadline, event_sink=None):
         self.calls.append((session, message, deadline))
         if isinstance(self.outcome, Exception):
             raise self.outcome
@@ -108,6 +108,14 @@ class ToolCallingProvider:
             )
         return AssistantTurn("정상 완료", (), "stop")
 
+    async def complete_stream(self, messages, tools, deadline, output_policy, on_token):
+        turn = await self.complete(messages, tools, deadline, output_policy)
+        if not turn.tool_calls:
+            await on_token("정상 ")
+            await on_token("완료")
+            return AssistantTurn("정상 완료", (), "stop")
+        return turn
+
     async def close(self):
         return None
 
@@ -132,6 +140,9 @@ class MockMcpSession:
                 "session_id": "Q" * 22,
                 "action": "list_tables",
                 "tables": [],
+                "dataset_id": "ds_000000001",
+                "row_count": 1,
+                "columns": [{"name": "value", "type": "integer"}],
                 "warnings": [],
                 "error": None,
             },
@@ -183,6 +194,134 @@ def test_asgi_ac1_ac2_tool_call_returns_completed_response_without_cancel_scope_
     )
     assert len(scope_tasks) == 2
     assert all(entered is exited for entered, exited in scope_tasks)
+
+
+def test_strm_ac1_ac2_ac5_ac6_message_accept_negotiation_and_events(settings) -> None:
+    queryforge = McpQueryForgeClient("http://queryforge.test/mcp", "query-secret")
+
+    @asynccontextmanager
+    async def request_scoped_session(timeout):
+        yield MockMcpSession()
+
+    queryforge._session_scope = request_scoped_session
+    store = InMemorySessionStore(settings.session_ttl_seconds)
+    sessions = SessionService(store)
+    agent = BoundedAgent(ToolCallingProvider(), queryforge, max_tool_calls=3, recovery_budget=1)
+    app = build_app(
+        settings,
+        session_service=sessions,
+        readiness=ReadyProbe(),
+        message_handler=ChatApplicationService(sessions, agent),
+        closeables=(queryforge,),
+    )
+    with TestClient(app) as client:
+        stream_session = create(client)
+        streamed = client.post(
+            f"/v1/sessions/{stream_session}/messages",
+            headers={**HEADERS, "accept": "text/event-stream"},
+            json={"message": "테이블 목록"},
+        )
+        json_session = create(client)
+        synchronous = client.post(
+            f"/v1/sessions/{json_session}/messages",
+            headers=HEADERS,
+            json={"message": "테이블 목록"},
+        )
+    assert streamed.headers["content-type"].startswith("text/event-stream")
+    assert "event: start" in streamed.text
+    assert streamed.text.count("event: tool_call") == 2
+    assert "event: dataset" in streamed.text
+    assert "event: token" in streamed.text
+    assert "event: done" in streamed.text
+    assert synchronous.headers["content-type"].startswith("application/json")
+    assert synchronous.json()["status"] == "completed"
+
+
+def test_strm_ac7_error_event_ends_stream_and_next_request_recovers(settings) -> None:
+    agent = FakeAgent(AgentUpstreamUnavailable("down"))
+    app, _ = wired(settings, agent)
+    with TestClient(app) as client:
+        session_id = create(client)
+        failed = client.post(
+            f"/v1/sessions/{session_id}/messages",
+            headers={**HEADERS, "accept": "text/event-stream"},
+            json={"message": "조회"},
+        )
+        agent.outcome = None
+        recovered = client.post(
+            f"/v1/sessions/{session_id}/messages", headers=HEADERS, json={"message": "재시도"}
+        )
+    assert "event: error" in failed.text
+    assert "DL_UPSTREAM_UNAVAILABLE" in failed.text
+    assert recovered.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_strm_ac8_ac10_disconnect_cancels_upstream_without_asgi_error(settings) -> None:
+    cancelled = asyncio.Event()
+
+    class DisconnectableHandler:
+        async def handle_stream(self, session, message, request_id, deadline, event_sink):
+            await event_sink("start", {"request_id": request_id, "session_id": session.session_id})
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        async def handle(self, session, message, request_id, deadline):
+            return {
+                "request_id": request_id,
+                "session_id": session.session_id,
+                "status": "completed",
+                "answer": "복구됨",
+                "datasets": [],
+                "warnings": [],
+                "metadata": {"duration_ms": 0, "tool_calls": 0},
+                "error": None,
+            }
+
+    store = InMemorySessionStore(settings.session_ttl_seconds)
+    sessions = SessionService(store)
+    session = store.create()
+    app = build_app(
+        settings,
+        session_service=sessions,
+        readiness=ReadyProbe(),
+        message_handler=DisconnectableHandler(),
+    )
+    body = b'{"message":"stream"}'
+    receives = [
+        {"type": "http.request", "body": body, "more_body": False},
+        {"type": "http.disconnect"},
+    ]
+
+    async def receive():
+        return receives.pop(0) if receives else {"type": "http.disconnect"}
+
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    await app(
+        {
+            "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+            "method": "POST", "scheme": "http", "path": f"/v1/sessions/{session.session_id}/messages",
+            "raw_path": f"/v1/sessions/{session.session_id}/messages".encode(), "query_string": b"",
+            "headers": [(b"x-api-key", b"data-secret"), (b"accept", b"text/event-stream"), (b"content-type", b"application/json")],
+            "client": ("test", 1), "server": ("test", 80), "root_path": "",
+        },
+        receive,
+        send,
+    )
+    await asyncio.wait_for(cancelled.wait(), 1)
+    with TestClient(app) as client:
+        recovered = client.post(
+            f"/v1/sessions/{session.session_id}/messages", headers=HEADERS, json={"message": "again"}
+        )
+    assert recovered.status_code == 200
+    assert recovered.json()["status"] == "completed"
 
 
 def test_asgi_ac4_deadline_error_returns_timeout_response(settings) -> None:

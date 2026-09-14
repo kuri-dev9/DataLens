@@ -4,7 +4,7 @@ import json
 import time
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from jsonschema import Draft202012Validator
 
@@ -105,7 +105,13 @@ class BoundedAgent:
         self._recovery_budget = recovery_budget
         self._preview_rows = preview_rows
 
-    async def run(self, session: Session, message: str, deadline: float) -> AgentResult:
+    async def run(
+        self,
+        session: Session,
+        message: str,
+        deadline: float,
+        event_sink: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> AgentResult:
         self._remaining(deadline)
         try:
             tools = await self._queryforge.discover_tools(self._remaining(deadline))
@@ -124,7 +130,16 @@ class BoundedAgent:
         while True:
             self._remaining(deadline)
             try:
-                turn = await self._provider.complete(messages, tools, deadline, OutputPolicy())
+                if event_sink is not None and hasattr(self._provider, "complete_stream"):
+                    turn = await self._provider.complete_stream(
+                        messages,
+                        tools,
+                        deadline,
+                        OutputPolicy(),
+                        lambda text: event_sink("token", {"text": text}),
+                    )
+                else:
+                    turn = await self._provider.complete(messages, tools, deadline, OutputPolicy())
             except LLMTimeout as exc:
                 raise AgentTimeoutError("LLM deadline exceeded") from exc
             except LLMUnavailable as exc:
@@ -170,6 +185,11 @@ class BoundedAgent:
                     should_retry = True
                     break
                 tool_arguments = self._bounded_arguments(call.name, call.arguments)
+                tool_started = time.monotonic()
+                if event_sink is not None:
+                    await event_sink(
+                        "tool_call", {"index": tool_count, "tool": call.name, "status": "started"}
+                    )
                 try:
                     result = await self._queryforge.call_tool(
                         call.name,
@@ -182,6 +202,16 @@ class BoundedAgent:
                 except QueryForgeUnavailable as exc:
                     raise AgentUpstreamUnavailable("QueryForge call failed") from exc
                 qf_session_id = result.application_session_id or qf_session_id
+                if event_sink is not None:
+                    await event_sink(
+                        "tool_call",
+                        {
+                            "index": tool_count,
+                            "tool": call.name,
+                            "status": "completed",
+                            "elapsed_ms": int((time.monotonic() - tool_started) * 1000),
+                        },
+                    )
                 if not result.ok:
                     failure = result.error
                     if self._recoverable(failure):
@@ -201,6 +231,8 @@ class BoundedAgent:
                 reference = self._dataset_reference(result)
                 if reference is not None:
                     datasets[reference.dataset_id] = reference
+                    if event_sink is not None:
+                        await event_sink("dataset", reference.public())
                 if call.name == "query":
                     active_table = tool_arguments.get("source", {}).get("table", active_table)
                     scope = tool_arguments.get("partition_scope")

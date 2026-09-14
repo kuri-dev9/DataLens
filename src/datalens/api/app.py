@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import asyncio
+import json
 import logging
 import re
 import secrets
@@ -11,9 +12,8 @@ from typing import Any, AsyncIterator, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.applications import Starlette
-from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from datalens.application.sessions import (
@@ -46,6 +46,9 @@ LOG = logging.getLogger("datalens.http")
 
 class MessageHandler(Protocol):
     async def handle(self, session: Any, message: str, request_id: str, deadline: float) -> dict: ...
+    async def handle_stream(
+        self, session: Any, message: str, request_id: str, deadline: float, event_sink: Any
+    ) -> dict: ...
 
 
 class Readiness(Protocol):
@@ -83,39 +86,123 @@ def error_response(
     return JSONResponse(payload, status_code=status)
 
 
-class RequestIdMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        request.state.request_id = f"dlr_{secrets.token_urlsafe(18)}"
+def sse_event(event: str, data: dict[str, Any]) -> bytes:
+    encoded = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {encoded}\n\n".encode()
+
+
+def wants_sse(request: Request) -> bool:
+    return "text/event-stream" in request.headers.get("accept", "").lower()
+
+
+async def with_keepalive(events: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+    async def pump() -> None:
+        try:
+            async for event in events:
+                await queue.put(event)
+        finally:
+            await queue.put(None)
+
+    task = asyncio.create_task(pump())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=15)
+            except asyncio.TimeoutError:
+                yield b": ping\n\n"
+                continue
+            if item is None:
+                break
+            yield item
+    finally:
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+def sse_response(events: AsyncIterator[bytes]) -> StreamingResponse:
+    return StreamingResponse(
+        with_keepalive(events),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def agent_error_response(request: Request, exc: Exception, session_id: str) -> JSONResponse:
+    if isinstance(exc, AgentNotReady):
+        return error_response(request, "DL_AGENT_NOT_READY", "Agent is not available", 503, retryable=True, session_id=session_id)
+    if isinstance(exc, AgentLimitError):
+        return error_response(request, "DL_AGENT_LIMIT", "Agent execution limit reached", 422, session_id=session_id)
+    if isinstance(exc, AgentPolicyError):
+        return error_response(request, "DL_AGENT_INVALID_TOOL", "Agent requested an invalid tool", 422, session_id=session_id)
+    if isinstance(exc, AgentTimeoutError):
+        return error_response(request, "DL_UPSTREAM_TIMEOUT", "Request processing timed out", 504, retryable=True, session_id=session_id)
+    if isinstance(exc, AgentUpstreamUnavailable):
+        return error_response(request, "DL_UPSTREAM_UNAVAILABLE", "Upstream service is unavailable", 503, retryable=True, session_id=session_id)
+    if isinstance(exc, AgentInvalidUpstreamResponse):
+        return error_response(request, "DL_UPSTREAM_INVALID_RESPONSE", "Upstream service returned an invalid response", 502, session_id=session_id)
+    if isinstance(exc, AgentQueryRejected):
+        return error_response(request, "DL_QUERY_REJECTED", "The data request was rejected", 422, session_id=session_id)
+    return error_response(request, "DL_INTERNAL_ERROR", "Internal error", 500, session_id=session_id)
+
+
+class RequestIdMiddleware:
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        scope.setdefault("state", {})["request_id"] = f"dlr_{secrets.token_urlsafe(18)}"
         started = time.monotonic()
-        response = await call_next(request)
-        response.headers["X-Request-Id"] = request.state.request_id
+        status_code = 500
+
+        async def send_with_request_id(message: dict) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+                headers = list(message.get("headers", []))
+                headers.append((b"x-request-id", scope["state"]["request_id"].encode()))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_request_id)
         LOG.info(
             "http_request",
             extra={
-                "request_id": request.state.request_id,
-                "method": request.method,
-                "path": request.url.path,
-                "session_id": request.path_params.get("session_id"),
-                "operation": f"{request.method} {request.scope.get('route').path if request.scope.get('route') else request.url.path}",
-                "status_code": response.status_code,
+                "request_id": scope["state"]["request_id"],
+                "method": scope["method"],
+                "path": scope["path"],
+                "session_id": scope.get("path_params", {}).get("session_id"),
+                "operation": f"{scope['method']} {getattr(scope.get('route'), 'path', scope['path'])}",
+                "status_code": status_code,
                 "elapsed_ms": int((time.monotonic() - started) * 1000),
             },
         )
-        return response
 
 
-class ApiKeyMiddleware(BaseHTTPMiddleware):
+class ApiKeyMiddleware:
     def __init__(self, app: Any, api_key: str) -> None:
-        super().__init__(app)
+        self.app = app
         self._api_key = api_key
 
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope, receive)
         if request.url.path == "/v1/health":
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
         supplied = request.headers.get("x-api-key", "")
         if not self._api_key or not secrets.compare_digest(supplied, self._api_key):
-            return error_response(request, "DL_UNAUTHORIZED", "Unauthorized", 401)
-        return await call_next(request)
+            await error_response(request, "DL_UNAUTHORIZED", "Unauthorized", 401)(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
 
 
 def build_app(
@@ -215,6 +302,51 @@ def build_app(
             return error_response(request, "DL_SESSION_NOT_FOUND", "Session not found", 404)
         except SessionBusy:
             return error_response(request, "DL_SESSION_BUSY", "Session is processing another turn", 409, retryable=True, session_id=session_id)
+        if wants_sse(request):
+            async def events() -> AsyncIterator[bytes]:
+                queue: asyncio.Queue[tuple[str, dict[str, Any]] | None] = asyncio.Queue()
+
+                async def emit(event: str, data: dict[str, Any]) -> None:
+                    await queue.put((event, data))
+
+                async def execute() -> None:
+                    try:
+                        await emit("start", {"request_id": request.state.request_id, "session_id": session_id})
+                        result = await handler.handle_stream(
+                            session,
+                            parsed.message,
+                            request.state.request_id,
+                            time.monotonic() + settings.request_deadline_seconds,
+                            emit,
+                        )
+                        sessions.touch(session_id)
+                        await emit("done", result)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        await emit("error", json.loads(agent_error_response(request, exc, session_id).body))
+                    finally:
+                        sessions.end_turn(session_id)
+                        await queue.put(None)
+
+                task = asyncio.create_task(execute())
+                try:
+                    while True:
+                        try:
+                            item = await asyncio.wait_for(queue.get(), timeout=15)
+                        except asyncio.TimeoutError:
+                            yield b": ping\n\n"
+                            continue
+                        if item is None:
+                            break
+                        yield sse_event(*item)
+                finally:
+                    if not task.done():
+                        task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
+            return sse_response(events())
         try:
             deadline = time.monotonic() + settings.request_deadline_seconds
             result = await handler.handle(session, parsed.message, request.state.request_id, deadline)
@@ -259,7 +391,7 @@ def build_app(
     def queryforge_session(
         request: Request, *, dataset: bool
     ) -> tuple[str, str | None] | JSONResponse:
-        session_id = request.query_params.get("session_id", "")
+        session_id = request.path_params.get("session_id", "")
         try:
             session = sessions.require(session_id)
         except SessionNotFound:
@@ -308,6 +440,40 @@ def build_app(
         if isinstance(page, JSONResponse):
             return page
         offset, limit = page
+        if wants_sse(request):
+            async def events() -> AsyncIterator[bytes]:
+                try:
+                    meta = await queryforge.fetch_dataset_meta(
+                        request.path_params["dataset_id"], application_session_id,
+                        timeout_seconds=settings.queryforge_timeout_seconds,
+                    )
+                    if not 200 <= meta.status_code < 300:
+                        yield sse_event("error", json.loads(data_result(request, meta).body))
+                        return
+                    yield sse_event("meta", meta.payload)
+                    returned = 0
+                    while returned < limit:
+                        chunk_limit = min(100, limit - returned)
+                        result = await queryforge.fetch_dataset_rows(
+                            request.path_params["dataset_id"], application_session_id,
+                            offset=offset + returned, limit=chunk_limit,
+                            timeout_seconds=settings.queryforge_timeout_seconds,
+                        )
+                        if not 200 <= result.status_code < 300:
+                            yield sse_event("error", json.loads(data_result(request, result).body))
+                            return
+                        rows = result.payload.get("rows", [])
+                        yield sse_event("rows", {"offset": offset + returned, "rows": rows})
+                        returned += len(rows)
+                        if len(rows) < chunk_limit:
+                            break
+                    yield sse_event("done", {"returned": returned, "total": meta.payload.get("row_count")})
+                except TimeoutError:
+                    yield sse_event("error", json.loads(error_response(request, "DL_UPSTREAM_TIMEOUT", "Upstream request timed out", 504, retryable=True).body))
+                except QueryForgeUnavailable:
+                    yield sse_event("error", json.loads(error_response(request, "DL_UPSTREAM_UNAVAILABLE", "Upstream service is unavailable", 503, retryable=True).body))
+
+            return sse_response(events())
         try:
             result = await queryforge.fetch_dataset_rows(
                 request.path_params["dataset_id"],
@@ -394,6 +560,14 @@ def build_app(
             len(tables),
         )
         returned = tables[offset : offset + limit]
+        if wants_sse(request):
+            async def events() -> AsyncIterator[bytes]:
+                yield sse_event("meta", {"offset": offset, "limit": limit, "total_count": total_count})
+                for index in range(0, len(returned), 100):
+                    yield sse_event("tables", {"offset": offset + index, "tables": returned[index:index + 100]})
+                yield sse_event("done", {"returned": len(returned), "total": total_count})
+
+            return sse_response(events())
         return JSONResponse(
             {
                 "offset": offset,
@@ -460,10 +634,10 @@ def build_app(
             Route("/v1/sessions", create_session, methods=["POST"]),
             Route("/v1/sessions/{session_id:str}/messages", message, methods=["POST"]),
             Route("/v1/sessions/{session_id:str}", delete_session, methods=["DELETE"]),
-            Route("/v1/datasets/{dataset_id:str}/rows", dataset_rows, methods=["GET"]),
-            Route("/v1/datasets/{dataset_id:str}/meta", dataset_meta, methods=["GET"]),
-            Route("/v1/catalog/tables", catalog_tables, methods=["GET"]),
-            Route("/v1/catalog/tables/{table:str}/columns", catalog_columns, methods=["GET"]),
+            Route("/v1/sessions/{session_id:str}/datasets/{dataset_id:str}/rows", dataset_rows, methods=["GET"]),
+            Route("/v1/sessions/{session_id:str}/datasets/{dataset_id:str}/meta", dataset_meta, methods=["GET"]),
+            Route("/v1/sessions/{session_id:str}/catalog/tables", catalog_tables, methods=["GET"]),
+            Route("/v1/sessions/{session_id:str}/catalog/tables/{table:str}/columns", catalog_columns, methods=["GET"]),
         ],
         lifespan=lifespan,
     )

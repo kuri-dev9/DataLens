@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+import asyncio
 
 import httpx
 import pytest
@@ -120,6 +121,55 @@ async def test_tool_call_is_normalized() -> None:
     assert turn.tool_calls[0].call_id == "one"
     assert turn.tool_calls[0].name == "schema"
     assert turn.tool_calls[0].arguments == {"action": "list_tables"}
+
+
+@pytest.mark.anyio
+async def test_strm_ac3_ac4_stream_forwards_early_tokens_and_hides_split_thought_blocks() -> None:
+    chunks = [
+        b'{"message":{"content":"<|channel>tho"},"done":false}\n',
+        '{"message":{"content":"ught hidden<channel|>안녕"},"done":false}\n'.encode(),
+        '{"message":{"content":"하세요"},"done":true,"done_reason":"stop"}\n'.encode(),
+    ]
+    release_final = asyncio.Event()
+
+    class DelayedStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield chunks[0]
+            yield chunks[1]
+            await release_final.wait()
+            yield chunks[2]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=DelayedStream())
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = OllamaProvider(
+        "http://ollama.test", "fixture-model", request_timeout_seconds=5, client=client
+    )
+    tokens = []
+    first_token = asyncio.Event()
+
+    async def capture(token: str) -> None:
+        tokens.append(token)
+        first_token.set()
+
+    pending = asyncio.create_task(
+        adapter.complete_stream(
+            [ProviderMessage("system", "system"), ProviderMessage("user", "hello")],
+            (),
+            time.monotonic() + 2,
+            OutputPolicy(),
+            capture,
+        )
+    )
+    await asyncio.wait_for(first_token.wait(), 1)
+    assert not pending.done()
+    release_final.set()
+    turn = await pending
+    await client.aclose()
+    assert "".join(tokens) == "안녕하세요"
+    assert turn.content == "안녕하세요"
+    assert "thought" not in "".join(tokens)
 
 
 @pytest.mark.anyio

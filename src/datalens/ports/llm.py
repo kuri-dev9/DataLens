@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from typing import Any, Awaitable, Callable, Literal, Protocol
 
 from datalens.ports.queryforge import QueryForgeToolDefinition
 
@@ -67,6 +67,15 @@ class LLMProvider(Protocol):
         tools: tuple[QueryForgeToolDefinition, ...],
         deadline: float,
         output_policy: OutputPolicy,
+    ) -> AssistantTurn: ...
+
+    async def complete_stream(
+        self,
+        messages: list[ProviderMessage],
+        tools: tuple[QueryForgeToolDefinition, ...],
+        deadline: float,
+        output_policy: OutputPolicy,
+        on_token: Callable[[str], Awaitable[None]],
     ) -> AssistantTurn: ...
 
     async def close(self) -> None: ...

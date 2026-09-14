@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 import logging
-from typing import Protocol
+from typing import Any, Awaitable, Callable, Protocol
 
 from datalens.application.agent import AgentResult
 from datalens.application.sessions import SessionService
@@ -10,7 +10,13 @@ from datalens.domain.session import Session
 
 
 class Agent(Protocol):
-    async def run(self, session: Session, message: str, deadline: float) -> AgentResult: ...
+    async def run(
+        self,
+        session: Session,
+        message: str,
+        deadline: float,
+        event_sink: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> AgentResult: ...
 
 
 class ChatApplicationService:
@@ -47,4 +53,37 @@ class ChatApplicationService:
                 "stop_reason": "completed",
             },
             "error": None,
+        }
+
+    async def handle_stream(
+        self,
+        session: Session,
+        message: str,
+        request_id: str,
+        deadline: float,
+        event_sink: Callable[[str, dict[str, Any]], Awaitable[None]],
+    ) -> dict:
+        started = time.monotonic()
+        result = await self._agent.run(session, message, deadline, event_sink)
+        committed = self._sessions.commit(result.updated_session)
+        duration_ms = int((time.monotonic() - started) * 1000)
+        logging.getLogger("datalens.agent").info(
+            "agent_turn_completed",
+            extra={
+                "request_id": request_id,
+                "session_id": committed.session_id,
+                "operation": "agent_turn",
+                "elapsed_ms": duration_ms,
+                "status": "completed",
+                "tool_call_count": result.tool_calls,
+            },
+        )
+        return {
+            "status": "completed",
+            "metadata": {
+                "duration_ms": duration_ms,
+                "tool_calls": result.tool_calls,
+                "recovery_count": result.recovery_count,
+                "stop_reason": "completed",
+            },
         }
