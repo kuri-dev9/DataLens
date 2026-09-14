@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "datalens"
+version = "0.1.0"
+description = "DataLens conversational data application"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.27,<1",
+  "jsonschema>=4.23,<5",
+  "mcp>=1.12,<2",
+  "pydantic>=2.8,<3",
+  "pydantic-settings>=2.4,<3",
+  "starlette>=0.38,<1",
+  "uvicorn>=0.30,<1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.3,<9"]
+
+[project.scripts]
+datalens = "datalens.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/datalens"]
+artifacts = ["src/datalens/prompts/**/*.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: requires a running QueryForge server"]

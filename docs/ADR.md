@@ -1,11 +1,11 @@
-# DataLens / QueryForge — Architecture Decision Records
+# QueryForge — Architecture Decision Records
 
 | 항목 | 내용 |
 |---|---|
 | 문서 ID | ADR-INDEX |
-| 버전 | 0.3 |
-| 최종 수정 | 2026-08-10 |
-| 적용 범위 | DataLens, QueryForge 공통 |
+| 버전 | 0.8 |
+| 최종 수정 | 2026-09-08 |
+| 적용 범위 | QueryForge (일부 초기 DataLens 연계 결정은 역사적 배경으로 유지) |
 
 ## 이 문서의 목적
 
@@ -23,73 +23,20 @@ ADR로 분리하여 **결정 상태 / 대안 / 판단 기준 / 재검토 시점*
 | `DEFERRED` | PoC 범위 외. 인터페이스만 확보 |
 | `SUPERSEDED` | 다른 ADR로 대체됨 |
 
-### 마일스톤 참조
-
-| ID | 기간 | 내용 |
-|---|---|---|
-| S0 | 2주 | 문서 확정 + Tool Schema 동결 + LLM 스파이크 |
-| S1 | 4주 | 최소 수직 슬라이스 (schema / query / transform / describe → 단일턴 E2E) |
-| S2 | 4주 | join·집계, 멀티턴 참조 해소, Dataset lineage |
-| S3 | 3주 | Semantic 최소본, 오류 복구 루프, 파티션 최적화 |
-| S4 | 2주 | 로케일 전환, 리소스 제한, 설치 리허설 |
-
----
-
 ## ADR-001 — LLM 모델 및 서빙 스택
 
-**상태**: `PROVISIONAL` — S0 종료 시 실측으로 확정
+**상태**: `SUPERSEDED` — QueryForge 제품 범위 밖
 
 ### 맥락
 
-가용 하드웨어는 NVIDIA **A2 15.3GB** 2장(HP 서버 2대에 각 1장), 시스템 RAM 128GB.
-A2는 저전력 엣지 추론 카드로 메모리 대역폭이 약 200GB/s 수준이다. LLM 토큰 생성 속도는 대체로
-메모리 대역폭에 지배되므로, 이 카드는 모델 크기와 컨텍스트 길이 양쪽에 강한 상한을 건다.
-
-Gemma 4는 2026년 4월 공개되었고 Apache 2.0 라이선스, native function calling, 128K/256K 컨텍스트를
-지원한다. 해외 고객사 납품에서 이전 세대의 커스텀 라이선스가 유발하던 법무 검토 리스크가 없다.
-
-현재 개발 환경에서는 `gemma4:26b`(26B A4B, MoE / 활성 4B)를 사용 중이다.
-
-### 용량 분석
-
-| 후보 | Q4 가중치 추정 | KV 캐시 여유 | 비고 |
-|---|---|---|---|
-| Gemma 4 12B Unified | 약 8GB | 약 6GB | 16~32K 컨텍스트 안정 |
-| Gemma 4 26B A4B (MoE) | 약 14GB | 약 1GB | 컨텍스트 8K 이하 필수. 오프로드 위험 |
-| Gemma 4 E4B | 약 3GB | 충분 | 라우팅/분류 보조용 |
-
-MoE(26B A4B)는 토큰당 활성 파라미터가 4B이므로, **VRAM에 완전히 상주하기만 하면** 대역폭 대비
-생성 속도는 12B dense보다 유리할 수 있다. 반대로 상주에 실패해 CPU 오프로드가 발생하면 속도가 급락한다.
-즉 이 결정은 이론이 아니라 실측 대상이다.
+초기 통합 구상에는 LLM 모델과 서빙 스택 선택이 포함되어 있었다. QueryForge가 독립 MCP Server로
+분리되면서 모델 실행은 MCP Client 또는 상위 Agent의 책임이 되었다.
 
 ### 결정
 
-- **기본안 (A)**: Gemma 4 **12B Unified**, Q4 양자화, 컨텍스트 상한 16K
-- **대안 (B)**: Gemma 4 **26B A4B**, Q4 양자화, 컨텍스트 상한 8K
-- S0 스파이크에서 A/B를 동일 golden set으로 비교한 뒤 확정한다.
-- 서빙 스택: 1차 **Ollama**(설치 단순, 폐쇄망 이미지화 용이, JSON Schema 기반 structured output 지원).
-  대안으로 **vLLM**(guided decoding, 동시성 우위)을 S0에서 병행 평가.
-- 모델은 교체 가능한 부품으로 취급한다. `LLMProvider` 인터페이스(chat / tool_call / structured_output /
-  count_tokens)를 두고 모델명·엔드포인트는 전부 설정값으로 외부화한다.
-
-### 판단 기준 (S0 측정 항목)
-
-1. Tool call 유효율 (well-formed JSON 비율)
-2. 스텝당 평균 지연 (prefill / decode 분리 측정)
-3. 실사용 컨텍스트에서 CPU 오프로드 발생 여부
-4. golden set 단일턴 정답률
-
-### 재검토
-
-S0 종료 시. 또한 고객사 납품 사양 협의 시 **NVIDIA L4(24GB, 약 300GB/s, 72W)** 로의 상향을
-검토 항목으로 제기한다. A2와 동일한 저전력·싱글슬롯 계열이므로 서버 개조 없이 교체 가능한 경우가 많다.
-
-### 서버 2대 배치
-
-GPU가 서버당 1장이므로 텐서 병렬은 적용하지 않는다.
-
-- 서버 #1: LLM 추론 전용 (Ollama/vLLM)
-- 서버 #2: API Server + QueryForge + 카탈로그 저장소. 잔여 GPU는 향후 임베딩 모델(RAG 확장)용으로 예약
+- QueryForge는 특정 모델, GPU 또는 LLM 서빙 런타임에 의존하지 않는다.
+- Client는 `tools/list`로 공개되는 JSON Schema를 사용해 tool call을 생성한다.
+- 모델 선정과 컨텍스트 예산은 QueryForge 외부 배포 구성에서 결정한다.
 
 ---
 
@@ -120,15 +67,14 @@ GPU가 서버당 1장이므로 텐서 병렬은 적용하지 않는다.
 생성 주체와 무관하게 **최종 실행되는 SQL은 예외 없이 AST Validator를 통과**한다.
 문자열 정규식 기반 검사는 사용하지 않는다.
 
-### 탈출구
+### Raw SQL 비도입
 
-Text-to-SQL은 Core 밖의 별도 tool `query_sql`로 분리하고 **기본 비활성**(config flag)으로 둔다.
-활성화 시에도 동일한 Validator와 동일한 리소스 제한을 거친다.
-PoC에서는 인터페이스·flag·Validator 경로까지만 구현하고 본체는 미구현으로 남긴다.
+`query_sql` 및 raw WHERE 입력은 도입하지 않는다. v1 외부 계약은 기존 5 Tool이며 QuerySpec → Planner →
+SQL Generator → AST Validator 경로를 유일한 조회 경로로 유지한다.
 
 ### 재검토
 
-S2 종료 시 golden set으로 Spec 경로와 `query_sql` 경로의 정답률·스텝 수를 비교한다.
+S2 종료 시 golden set으로 QuerySpec 경로의 정답률·스텝 수를 재검토한다.
 
 ---
 
@@ -142,7 +88,8 @@ S2 종료 시 golden set으로 Spec 경로와 `query_sql` 경로의 정답률·�
 
 ### 근거
 
-QueryForge는 DataLens 전용 부속이 아니라 **재사용 가능한 독립 서버**가 목표다. stdio는 클라이언트
+QueryForge는 DataLens 전용 부속이 아니라 Claude, GPT 등 표준 MCP Client가 독립 설치해 사용하는
+**제품성 범용 MySQL Data MCP Server**다. stdio는 클라이언트
 프로세스가 서버를 자식으로 기동하는 모델이라 수명이 종속되고, Dataset을 서버에 상주시키는 구조와
 맞지 않는다. HTTP는 별도 컨테이너 배포, 독립 재기동, 다중 클라이언트, 헬스체크가 모두 자연스럽다.
 docker-compose 기반 폐쇄망 배포와도 정합한다.
@@ -152,6 +99,9 @@ docker-compose 기반 폐쇄망 배포와도 정합한다.
 - QueryForge는 독립 컨테이너로 기동한다.
 - 인증은 ADR-011을 따른다.
 - 네트워크 경계가 생기므로 MCP Response 크기 제한(ADR-017)이 더 중요해진다.
+- 공식 MCP SDK의 Streamable HTTP session과 protocol header를 사용한다. transport session은
+  protocol 협상에 필요하지만 Dataset 소유권이나 승인 상태의 기준으로 사용하지 않는다.
+- Dataset 접근 namespace와 future MutationPlan 격리는 명시적 `session_id`로 식별한다. Dataset retention은 별도 Store 정책이다.
 
 ---
 
@@ -166,16 +116,19 @@ Dataset을 프로세스 메모리에 보관하는 구조에서 멀티 워커로 
 
 ### 결정
 
-PoC는 **단일 워커 프로세스 + in-process Dataset Manager**로 고정한다.
+PoC는 **단일 워커 프로세스 + Persistent Local DatasetStore**로 고정한다.
 `--workers 1`을 기동 스크립트에 명시하고, 다중 워커 기동 시 **기동 자체를 실패**시킨다
 (설정 검증 단계에서 명시적 에러).
+
+QueryForge Application Session은 MCP Transport Session 및 DataLens Application Session과 구분한다. 동일 Client가 재연결하거나
+다른 표준 MCP Client가 호출해도 `session_id` 기반 접근 격리는 동일하며 TTL/retention은 Store가 관리한다.
 
 ### 확장 경로
 
 향후 동시성이 필요하면 다음 중 하나를 택한다. 인터페이스는 `DatasetStore` 추상화로 미리 분리해 둔다.
 
-1. Sticky session 라우팅 (세션 → 워커 고정)
-2. 공유 Dataset 저장소 (Arrow IPC 파일 / Redis 등)
+1. 단일-writer coordination을 둔 로컬 store 공유
+2. 공유/object Dataset 저장소
 
 ### 근거
 
@@ -225,30 +178,30 @@ DB 측 윈도우 함수는 대용량 rank 요구가 실제로 발생할 때 Quer
 
 ---
 
-## ADR-006 — Dataset Storage
+## ADR-006 — Persistent Local Dataset Storage
 
-**상태**: `ACCEPTED` (PoC 범위), 확장은 `DEFERRED`
+**상태**: `ACCEPTED`
 
 ### 결정
 
-**in-memory Polars DataFrame + TTL + LRU eviction**만 구현한다.
+**로컬 영속 DatasetStore**를 기본 구현한다. Dataset data는 Parquet, metadata·lineage·수명 상태·ID 발급 상태는 SQLite에 저장한다. 메모리는 hot cache이고 디스크는 cold storage이자 재기동 복원의 기준이다. Dataset lifecycle은 conversation lifecycle과 분리한다.
 
 | 파라미터 | 초기값 | 비고 |
 |---|---|---|
 | Dataset TTL | 30분 | 설정 가능 |
 | 세션당 최대 Dataset | 20개 | 초과 시 LRU 축출 |
 | 단일 Dataset 최대 행 수 | 1,000,000 | 초과 시 `RESULT_TOO_LARGE` |
-| 전체 Dataset 메모리 상한 | 8GB | 시스템 RAM 128GB 중 보수적 배분 |
+| 전체 Dataset 메모리 상한 | 8GB | hot cache 상한, 설정 가능 |
+| 전체 Dataset 디스크 상한 | 배포 설정 | cleanup/eviction policy 수행 |
+| Retention | 배포 설정 | TTL, last-access, lineage 보존 정책 |
 
 ### 근거
 
-시스템 RAM이 128GB로 충분하고, PoC 동시 세션 수가 적다. Parquet spill / hybrid는 구현·검증 비용 대비
-이득이 없다. 다만 `DatasetStore` 인터페이스(`put` / `get` / `evict` / `stats`)는 분리해 두어
-향후 spill 구현체를 교체 삽입할 수 있게 한다.
+`DatasetStore`는 `put/get/evict/stats/recover`를 제공한다. 임시 Parquet 작성·fsync·검증 후 rename하고 SQLite transaction에서 published 상태를 커밋하여 atomic publish한다. 중단 시 미완성 파일과 preparing record를 복구 절차에서 정리한다.
 
-### 확장 경로 (DEFERRED)
+### ID와 소유권
 
-Arrow IPC 또는 Parquet 임시 파일 기반 spill 구현체 추가.
+`dataset_id`는 SQLite-backed sequence 또는 충돌 저항적 ULID/UUID 기반으로 발급하며 재기동·cleanup 뒤에도 재사용하지 않는다. `session_id`는 접근 격리를 위한 namespace이지 보존 기한이 아니다. 대화 종료 통지는 cleanup hint다.
 
 ---
 
@@ -321,8 +274,8 @@ packs/<pack_name>/
 ```
 
 - QueryForge Core에는 도메인 개념이 존재하지 않는다. `SemanticProvider` 인터페이스로만 소비한다.
-- PoC용 팩 이름은 `poc_telecom`이며, PGW/HSS/CELL 관련 지식은 **오직 이 디렉터리 안에만** 존재한다.
-- **CI 검사**: QueryForge 리포 전체에서 `PGW|HSS|CELL|기지국` 문자열이 검출되면 빌드 실패.
+- 배포별 업무 지식은 **오직 Domain Pack 안에만** 존재한다.
+- **CI 검사**: 설정된 금지 도메인 용어가 QueryForge Core에서 검출되면 빌드 실패한다.
 
 ### 근거
 
@@ -367,8 +320,10 @@ PoC 종료 후. 임베딩 모델 구동은 서버 #2의 잔여 GPU를 사용한�
 
 - **DataLens API**: 정적 API Key 헤더 인증. 세션은 발급된 `session_id`로 격리하며,
   타 세션의 `dataset_id` 접근은 거부한다.
-- **QueryForge MCP**: 내부 네트워크 전용. 공유 시크릿 헤더 인증. 외부 노출 금지.
-- **DB 계정**: 읽기 전용 계정 1개를 서비스 계정으로 사용한다. 사용자별 DB 권한 매핑은 PoC 범위 외.
+- **QueryForge MCP**: 내부 네트워크 전용. 공유 시크릿 헤더 인증. 외부 노출 금지. DataLens 외 Client에도
+  동일한 인증·Application Session·Policy Enforcement를 적용한다.
+- **DB 계정**: v1은 읽기 전용 계정 1개를 서비스 계정으로 사용한다. Future controlled Mutation은
+  별도 최소권한 credential을 사용하며 read credential과 공유하지 않는다.
 
 ### 미결 사항 (OPEN)
 
@@ -391,6 +346,10 @@ PoC는 **동기 응답 + 타임아웃**으로 한다.
 | Transform | 10초 |
 | Agent 턴 전체 | 120초 |
 
+Agent 턴 전체 120초 deadline은 **DataLens API/Application 계층이 소유**하며, API 진입 시 생성한 하나의
+wall-clock deadline을 LLM Provider와 QueryForgeClient에 남은 시간으로 전달한다. DB 쿼리 30초와
+Transform 10초는 QueryForge 내부 실행 제한이며 외부 120초 deadline을 대체하지 않는다.
+
 응답 스트리밍(SSE)과 job + polling 방식은 API 계약에만 예약 필드를 두고 구현하지 않는다.
 
 ### 근거
@@ -411,6 +370,7 @@ S0 실측 후 재검토한다.
 - docker-compose의 `secrets` 또는 컨테이너 주입 환경변수를 사용한다.
 - 설정 파일에는 참조 키만 기록한다 (`password_ref: DB_PASSWORD`).
 - 로그·에러 메시지·MCP 응답에 접속 문자열이 노출되지 않도록 마스킹 필터를 적용한다.
+- Read와 Future Mutation credential은 별도 참조·회전·권한 정책으로 구성할 수 있어야 한다.
 
 ### 근거
 
@@ -425,18 +385,19 @@ S0 실측 후 재검토한다.
 
 ### 결정
 
-- **docker-compose** 기반 배포. 구성: `api`(DataLens), `queryforge`, `llm`(Ollama/vLLM).
-- 폐쇄망 반입은 **오프라인 이미지 tar**(`docker save`) + 모델 가중치 파일 + Domain Pack.
-- QueryForge는 **wheel로 빌드**하여 DataLens가 버전 핀으로 의존한다.
+- **docker-compose** 기반 독립 배포를 사용한다. production compose는 `build:` 없이 versioned
+  `queryforge:<version>` image만 실행한다.
+- 폐쇄망 반입은 `scripts/package.sh`가 생성하는 **오프라인 image tar + compose + 환경 template + 설정 + checksum** bundle을 사용한다.
+- QueryForge는 독립 설치 가능한 wheel과 컨테이너 이미지를 자체 산출물로 만들 수 있으나, DataLens
+  runtime은 QueryForge Python package를 import하거나 wheel에 직접 의존하지 않는다. 두 제품의 runtime
+  경계는 versioned Streamable HTTP MCP contract다.
 - 인터넷 접근을 전제로 하는 설치 절차(pip install from PyPI 등)를 런타임에 포함하지 않는다.
 
 ### 반입 산출물 목록
 
-1. `datalens-images.tar` (전체 컨테이너 이미지)
-2. `gemma4-<size>-<quant>.gguf` 또는 상응 가중치
-3. `packs/<pack_name>/` (Domain Pack)
-4. `docker-compose.yml` + `.env.example`
-5. 설치 절차서
+1. `queryforge-<version>.tar` (Docker image)
+2. `docker-compose.yml` + `.env.example` + `queryforge.yaml`
+3. `README.md` + `THIRD_PARTY_LICENSES.md` + `SHA256SUMS`
 
 ---
 
@@ -503,7 +464,7 @@ PoC 최종 타깃은 일본어이나 개발 기준은 한국어다. 로케일 �
 4. 선언된 최대 조회 범위를 초과하면 `TIME_RANGE_TOO_WIDE`로 거부한다.
 5. 개발 단계에서 `EXPLAIN`으로 파티션 프루닝 적용 여부를 검증하는 테스트를 유지한다.
 
-### DB 취급 원칙 (금지사항)
+### v1 DB 취급 원칙 (금지사항)
 
 QueryForge는 대상 DB에 대해 다음을 **수행하지 않는다**.
 
@@ -512,9 +473,11 @@ QueryForge는 대상 DB에 대해 다음을 **수행하지 않는다**.
 - 파티션 조작
 - 통계 갱신 (ANALYZE TABLE 등)
 - 임시 테이블 생성
-- 쓰기 권한 계정 사용
+- v1 Read Capability에서 쓰기 권한 계정 사용
 
-허용되는 것은 `SELECT`, `EXPLAIN`(읽기 전용), `information_schema` 조회뿐이다.
+v1/PoC에서 허용되는 것은 `SELECT`, `EXPLAIN`(읽기 전용), `information_schema` 조회뿐이다.
+이는 현재 활성 Capability의 제한이며 QueryForge의 영구 Read-only 제품 정의가 아니다. Future controlled
+Mutation은 ADR-028의 별도 경계를 따라 INSERT/UPDATE/DELETE만 확장할 수 있고, TRUNCATE와 DDL은 계속 금지한다.
 
 ### 메타데이터 수집 (Catalog Snapshot)
 
@@ -538,10 +501,10 @@ A2 15.3GB 환경에서 실사용 컨텍스트 상한은 8K~16K다(ADR-001). 이�
 
 | 항목 | 상한 | 비고 |
 |---|---|---|
-| 시스템 프롬프트 + Tool 정의 | 2,000 | Tool 5개 고정 |
+| 시스템 프롬프트 + Tool 정의 | 2,000 | Phase 0는 v1 Read Tool 5개만 노출 |
 | 스키마 컨텍스트 | 2,500 | 선택된 테이블만 |
 | 대화 이력 (압축본) | 2,000 | 원문 누적 금지 |
-| Dataset 메타 + preview | 1,500 | preview 5행 고정 |
+| Dataset 메타 + preview | 1,500 | DataLens가 `preview_rows`로 요청 예산 관리 |
 | Semantic 컨텍스트 | 1,000 | alias, metric 정의 |
 | 작업 여유 + 생성 | 나머지 | |
 
@@ -549,11 +512,16 @@ A2 15.3GB 환경에서 실사용 컨텍스트 상한은 8K~16K다(ADR-001). 이�
 
 1. `schema` tool은 **전체 스키마 반환을 구조적으로 금지**한다.
    `list_tables` → `describe_table` 2단계 탐색만 허용한다.
-2. MCP Response의 `preview`는 **5행 고정 상한**. 전체 데이터는 `dataset_id`로만 참조한다.
+2. MCP Response의 `preview`는 요청 단위 `preview_rows`로 조절한다(생략 시 기본 5행). 실제 반환량은
+   serialization 및 `mcp.max_response_bytes` 서킷브레이커에 의해 더 작아질 수 있다. DataLens는 자신의
+   컨텍스트 예산에 맞춰 요청값을 정하며 전체 데이터는 `dataset_id`로만 참조한다.
 3. 대화 이력은 원문 누적이 아니라 **구조화 요약**(의도, 사용된 dataset_id, 결과 요약)으로 압축한다.
-4. **Agent Loop 스텝 상한 3회.** 초과 시 사용자에게 명확화 질문을 반환한다.
-5. Tool 개수를 5개(`schema`, `relationship`, `query`, `transform`, `describe`)로 고정한다.
-   로컬 모델의 tool 선택 정확도는 tool 개수에 민감하므로 임의 증설을 금지한다.
+4. **DataLens Phase 0 Agent의 Tool 호출 상한 기본값은 3회**다. 이는
+   `DATALENS_AGENT_MAX_TOOL_CALLS`로 관리하는 Phase 0 정책이며 QueryForge의 영구 제약이 아니다.
+   초과 시 사용자에게 명확화 질문을 반환한다.
+5. DataLens Phase 0는 QueryForge v1 Read contract의 5개 Tool(`schema`, `relationship`, `query`,
+   `transform`, `describe`)만 allowlist로 노출한다. 이는 현재 v1 동결 계약이며 영구 불변조건은 아니다.
+   Tool 추가·변경에는 별도 호환성·보안 검토가 필요하다.
 
 ### 근거
 
@@ -593,9 +561,8 @@ TOOL-003 query / OP-012 group_by
 
 ### 기능 범위 원칙
 
-기능 목록은 전부 포함하되 **구현 깊이를 단계화**한다.
-예: Text-to-SQL은 tool 정의 · flag · Validator 경로까지 구현하고 본체는 `NotImplementedError` +
-테스트 skip 마커로 둔다. 이후 "켜는" 작업이 아니라 "채우는" 작업만 남는다.
+기능 목록은 합의된 범위 안에서 포함하고 **구현 깊이를 단계화**한다. Raw SQL/Text-to-SQL은 이 원칙의
+대상이 아니며 도입하지 않는다. 확장점은 안전 경계와 실제 채택 결정이 있는 기능에만 둔다.
 
 ### 근거
 
@@ -614,19 +581,22 @@ PoC 종료 후에도 사용할 제품이 목표이므로 인터페이스 축소�
 QueryForge와 DataLens를 **물리적으로 분리된 리포지토리**로 관리한다.
 
 ```
-/Users/kuri/proj/vscode/QueryForge/     # 독립 semver, 독립 CI
-/Users/kuri/proj/vscode/DataLens/       # QueryForge를 wheel 의존
+workspace/QueryForge/     # 독립 semver, 독립 CI
+workspace/DataLens/       # QueryForge MCP contract의 Consumer
 ```
 
-- QueryForge는 wheel로 빌드되고, DataLens는 버전을 핀으로 고정해 의존한다.
-- QueryForge의 `tests/fixtures/`는 DataLens의 mock 서버로 재사용한다.
+- QueryForge와 DataLens는 별도 프로세스·별도 deployable이다. DataLens는 QueryForge의 versioned
+  Streamable HTTP MCP contract에 의존하며 QueryForge Python package를 import하지 않는다.
+- QueryForge의 공개 tool schema와 contract fixture는 DataLens의 mock/contract test 입력으로 재사용할 수
+  있으나 runtime source dependency로 만들지 않는다.
 - CI 검사: QueryForge 리포에서 도메인 용어 검출 시 빌드 실패 (ADR-009).
 
 ### 근거
 
 단일 리포에서는 마감 압박 시 도메인 로직이 Core로 유입되는 것을 막을 방법이 없다.
 1인 개발 체제에는 리뷰어가 없으므로 물리적 경계와 자동 검사가 유일한 방어선이다.
-또한 wheel 의존 구조는 폐쇄망 배포 패키징(ADR-014)을 자연스럽게 만든다.
+또한 독립 versioned image와 명시적 MCP contract는 폐쇄망에서도 두 제품을 독립 검증·교체할 수 있게 한다
+(ADR-014).
 
 ---
 
@@ -814,7 +784,7 @@ Catalog Snapshot에 distinct count, sample values, cardinality 등 프로파일 
 컬럼의 역할(categorical dimension / metric / identifier) 추론에 도움이 된다. 제안 문서가 이를 요청했다.
 
 그러나 제안 문서는 **수집 방법을 언급하지 않았다.** 대상 테이블은 일단위 대용량 파티션 테이블이며
-외부 자산이다. `SELECT COUNT(DISTINCT NODE_TYPE) FROM PM_EPC_KPI_1M`을 무심코 실행하면
+외부 자산이다. `SELECT COUNT(DISTINCT category_code) FROM partitioned_fact`를 무심코 실행하면
 운영 DB 풀스캔이며 N-8 위반이자 NFR-010(프루닝 미적용 쿼리 0건) 즉시 실패다.
 
 ### 결정
@@ -858,8 +828,8 @@ QuerySpec은 DBMS·dialect·물리 스키마에 종속되지 않으므로 장기
 
 ```jsonl
 {"ts":"...","session_id":"...","locale":"ko",
- "utterance":"MME별 성공률 보여줘",
- "utterance_normalized":"MME:RATE...",
+ "utterance":"서비스별 성공률 보여줘",
+ "utterance_normalized":"SERVICE:RATE...",
  "resolution":[{"term":"성공률","concept":"success_rate","source":"pack","status":"declared"}],
  "intent":"new_query","spec":{...QuerySpec...},"tool":"query",
  "outcome":"ok","rows":42,"steps":2,"latency_ms":8300,"error_code":null}
@@ -964,13 +934,13 @@ ADR-002는 JOIN을 relationship id 참조로만 허용하고, ADR-009는 FK 부�
 "선택 사항이 아니라 PoC 필수 산출물"로 규정한다. 그러나 **그 파일의 스키마가 어느 문서에도 정의되어
 있지 않았다.**
 
-`DB_PoC_Relationship.md` 분석 결과, PoC 대상 관계가 단일 컬럼 조인으로 표현되지 않는다는 것이 확인되었다.
+복합 키 fixture 분석 결과, 관계가 단일 컬럼 조인으로 표현되지 않을 수 있음이 확인되었다.
 
 ```text
-PM_EPC_KPI_1M.NODE_TYPE + NODE_ID  ↔  CM_EPC_INFO.EQUIP_TYPE + EQUIP_ID
+partitioned_fact.source_kind + source_id  ↔  dimension_entity.target_kind + target_id
 ```
 
-단일 컬럼 조인만 지원하도록 구현되면 UC-003(관계 확장 조회)이 EPC 데이터에서 동작하지 않으며,
+단일 컬럼 조인만 지원하도록 구현되면 UC-003(관계 확장 조회)이 복합 키 관계에서 동작하지 않으며,
 이는 PoC 성공 판정 기준 1번의 실패를 의미한다.
 
 ### 결정
@@ -979,7 +949,7 @@ PM_EPC_KPI_1M.NODE_TYPE + NODE_ID  ↔  CM_EPC_INFO.EQUIP_TYPE + EQUIP_ID
 
 | # | 요구 | 근거 |
 |---|---|---|
-| R-1 | **복합 키** — 2개 이상 컬럼 쌍을 하나의 relationship id로 선언 | `DB_PoC_Relationship.md` §5 |
+| R-1 | **복합 키** — 2개 이상 컬럼 쌍을 하나의 relationship id로 선언 | 복합 관계 fixture |
 | R-2 | **관계 상태** — `confirmed / structural / partial / unresolved / deferred` | 동 §2. 사람이 선언·검증한 값이며 자동 산출값이 아니다 |
 | R-3 | **비활성 관계** — 선언은 하되 Query Plan에 자동 삽입되지 않는 상태 | 동 §14.1 규칙 5 (CEI) |
 | R-4 | **대칭 endpoint 탐색** — 동일 논리 관계가 `NODE1` 또는 `NODE2` 어느 쪽에도 성립 | 동 §9.3 |
@@ -996,7 +966,7 @@ PM_EPC_KPI_1M.NODE_TYPE + NODE_ID  ↔  CM_EPC_INFO.EQUIP_TYPE + EQUIP_ID
 ### 근거
 
 R-2는 ADR-020이 기각한 "자동 confidence"와 성격이 다르다. **사람이 실데이터로 검증하고 근거와 함께
-선언한 상태**이며, `DB_PoC_Relationship.md`에서 이미 실무적으로 사용되고 있다. 검증 가능하고 감사 가능하다.
+선언한 상태**이며, 관계 fixture와 계약 테스트로 검증된다. 검증 가능하고 감사 가능하다.
 
 R-6이 없으면 대표 시나리오의 Cause drill-down에서 Metric 중복이 발생하는데, 이는 조용한 오류이므로
 사후 발견이 어렵다. 구조로 막는 것이 옳다.
@@ -1096,15 +1066,8 @@ Semantic Catalog라는 명칭을 사용할 경우 **Domain Pack에서 파생되�
 
 #### ADR-010a를 PoC에서 제외하는 근거 (신규)
 
-`DB_PoC.md` 확정 결과 **PoC Core Scope는 11개 테이블**이다.
-
-```
-PM_EPC_KPI_1M / PM_EPC_CAUSE_1M / PM_EPC_ROOT_CAUSE_1M / PM_EPC_DETACH_DETAIL_1M
-PM_LINK_EPC_KPI_1M / PM_LINK_EPC_ROOT_CAUSE_1M / PM_LINK_EPC_DETACH_DETAIL_1M
-CM_EPC_INFO / CL_MME / CL_SGW / CL_PGW
-```
-
-11개 테이블의 메타데이터는 ADR-017의 스키마 컨텍스트 예산 2,500 토큰 안에 충분히 들어간다.
+초기 검증 범위의 소규모 schema profile 메타데이터는 ADR-017의 스키마 컨텍스트 예산
+2,500 토큰 안에 충분히 들어간다.
 **벡터 검색으로 후보를 좁힐 대상 자체가 없다.** 액션 아이템 #4(테이블 수)는 이로써 해소된다.
 
 부수적 근거로, 컬럼명은 `SUCCESS_CNT` 같은 **식별자이지 산문이 아니므로** 임베딩이 잘 다루는 입력이
@@ -1149,22 +1112,135 @@ Vector Similarity → Candidate → 구조화 검증 → QuerySpec → QueryForg
 
 ---
 
-## 확인 필요 액션 아이템 요약
+## ADR-028 — 제품 경계, Capability 분리 및 실행 품질 기준
 
-| # | 항목 | 관련 ADR | 기한 | 영향 |
-|---|---|---|---|---|
-| 1 | ~~MySQL 버전~~ **해소: 8.x 확정 (2026-08-10)** | ADR-005 | 완료 | 5.7 분기 불필요, 윈도우 함수 가용 |
-| 2 | FK 제약 설정 여부 | ADR-005, 009, 027 | S1 착수 전 | relationships.yaml 필수 여부 |
-| 3 | 일자 경계 / 적재 타임존 | ADR-015 | S1 착수 전 | "어제" 해석이 하루 틀어질 수 있음 |
-| 4 | ~~테이블 수~~ **해소: Core 11개 확정 (`DB_PoC.md`)** | ADR-010, 017 | 완료 | Schema Retrieval 불필요 판정 근거 |
-| 5 | 읽기 전용 계정 발급 가능 여부 | ADR-011, 013 | S1 착수 전 | 보안 설계 |
-| 6 | 사용자별 접근 제어 요구 여부 | ADR-011 | S3 | 정책 계층 도입 여부 |
-| 7 | GPU 상향(L4 등) 가능성 | ADR-001 | 납품 사양 협의 시 | 모델 크기 상한 |
-| 8 | **TOOL-002 응답에 관계 상태·문맥전파 유형 필드 필요 여부** | ADR-027 | **S0 내 (Tool Schema 동결 전)** | 동결 후 추가 시 개정 필요 |
-| 9 | **WrenAI 참조 대상 파일별 라이선스 확인** | ADR-025 | **구현 착수 전** | 상용 납품 가능 여부 |
-| 10 | **다중 장비(PGW/SGW) 실데이터 확보 가능 여부** | ADR-005, SAD 3.1 | S1 착수 전 | 현재 MME 0016 단일 노드. 엔티티 비교 시나리오 검증 범위 |
-| 11 | 대상 테이블 최대 행 수 (운영 규모) | ADR-006, 017 | S1 중 | Dataset 상한. 현재 PoC 표본 140행은 운영 대표성 없음 |
-| 12 | 일본어 콜레이션 / 정렬 규칙 | ADR-005, 015 | S3 | 로케일 전환 시 정렬 결과 |
+**상태**: `ACCEPTED` (v1 Read), Future Mutation 상세 계약은 `DEFERRED`
+
+### 맥락
+
+QueryForge는 DataLens PoC의 내부 부속이 아니라 독립 설치해 Claude, GPT 등 표준 MCP Client에서도
+실사용하는 제품성 범용 MySQL Data MCP Server다. 따라서 transport 연결 상태나 특정 Client의 Agent
+구현을 신뢰 경계로 삼을 수 없으며, pool·lifecycle·type mapping·serialization·concurrency·security는
+PoC 부가 기능이 아니라 Core 품질이다.
+
+기존 `QuerySpec → Planner → SQL Generator → sqlglot AST Validator → Adapter → Dataset → Polars`,
+Catalog Snapshot, Dataset model은 유지한다.
+
+### 결정
+
+1. **Capability 분리**: v1/PoC의 활성 Capability는 Read뿐이다. 영구 Read-only 전제는 제거한다.
+   Future controlled Mutation은 INSERT/UPDATE/DELETE만 허용 가능하며 TRUNCATE와 DDL은 제외한다.
+2. **Mutation 계약 유보**: Future 흐름은 `Preview → Approval → Revalidation → Execute`를 QueryForge가
+   보장한다. 그러나 MutationSpec JSON Schema, MutationPlan 상세 필드, `mutate` 등 Tool 이름은 확정하지 않는다.
+3. **실행 경계**: Read와 Future Mutation은 Executor/Adapter, DB credential, Policy, transaction,
+   retry classification을 별도로 구성할 수 있어야 한다. Read allowlist를 완화해 Mutation을 수용하지 않는다.
+4. **Session 분리**: MCP transport session은 protocol 계층에 한정한다. Dataset과 future MutationPlan은 MCP 연결이 아니라
+   명시적 QueryForge Application Session이 소유한다.
+5. **Policy Enforcement**: 인증과 별개로 Capability, schema/table/column, partition, row/value/response size,
+   approval을 검증하며 Planning 전과 실행 직전에 fail-closed로 적용한다.
+6. **데이터 경계**: MySQL driver value → QueryForge logical type → Polars dtype → MCP JSON 변환 책임을
+   명시한다. text/binary/JSON 개별 값과 전체 response에 byte/depth 상한을 둔다.
+7. **DB lifecycle**: Read는 명시적 read-only transaction에서 실행한다. pool 반환 전 rollback/cursor/session
+   reset을 수행하고 실패 연결은 폐기한다. retry는 실행 전 일시 오류와 실행 후 불명확 오류를 분류하며,
+   timeout/cancel 및 결과 불명확 실행은 자동 재시도하지 않는다. 종료 시 stop-accept → drain → cancel → close.
+8. **결과·관계 정합성**: 외부 limit N은 내부 `limit+1`로 초과를 탐지한다. 복합 FK는 한 관계로 보존하고
+   incoming/outgoing 방향과 cardinality를 Catalog/Relationship 계약에 포함한다.
+9. **Tool 정책**: 현재 5 Tool은 v1에서 유지하되 영구 불변조건으로 두지 않는다. 신규 Tool은 ADR 변경과
+   semver/Client/security 영향 검토를 요한다.
+10. **검증**: concurrent MCP, security, property, 실제 MySQL lifecycle/graceful-shutdown 시험을 CI 필수축으로 둔다.
+
+### 영향
+
+- DataLens 전용 가정이 제거되어 Client별 특수 처리 없이 동일 Application/Policy 경계를 사용한다.
+- v1 외부 Tool 계약과 Read 실행 흐름은 유지된다.
+- Future Mutation은 확장 가능하지만 상세 ADR 전에는 config나 숨은 endpoint로 활성화할 수 없다.
+- Adapter, 설정, 오류 모델, 테스트 fixture에 type mapping·reset·retry·size-limit 계약이 추가된다.
+
+---
+
+## ADR-029~032 — 2026-08-21 통합 결정
+
+**상태**: `ACCEPTED`
+
+### ADR-029 — Dataset 수명과 Application Session
+
+QueryForge Application Session은 내부 `session_id` 기반 접근 namespace다. MCP Transport Session 및
+DataLens Application Session과 독립되고 타 session 접근은 존재 여부를 감춰 거부한다. Phase 0에서는
+두 Application Session을 DataLens 내부에서 1:1 mapping하되 외부에는 DataLens Session ID만 노출한다.
+Dataset retention은 TTL·last-access·lineage·disk-pressure 정책으로 결정하며 release는 cleanup hint다.
+즉 **session-scoped access + store-managed lifecycle**이다.
+
+### ADR-030 — MySQL Type Mapping과 Preview Serialization
+
+`MySQLTypeMapper`(driver value → internal logical type)와 `MCPSerializer`(internal value → MCP JSON)를 분리한다. signedness, DECIMAL precision/scale, BIT/BOOLEAN, text/binary, date/time/timestamp, YEAR, ENUM/SET, JSON, NULL, zero-date를 명시적으로 매핑한다. Preview는 text/binary/JSON/value/row/column/response 한도를 적용하며 절단·생략은 machine-readable `warnings[]`로 공개한다. 원본 Dataset은 변경하지 않는다.
+
+### ADR-031 — DB Capability Detection과 Graceful Shutdown
+
+설치/startup에서 MySQL version, read-only transaction, EXPLAIN, partition metadata, MAX_EXECUTION_TIME, charset/collation, information_schema access, server-side cursor/cancel을 탐지한다. 필수 capability 부재는 기동 실패, 선택 capability 부재는 degraded 상태다. lazy DB startup은 도입하지 않는다. 종료는 stop-accept → drain(deadline) → cancel → cursor/transaction 정리 → Dataset publish 완료/abort → SQLite checkpoint/close → pool close 순서다.
+
+### ADR-032 — Retry와 Query Cost Guard
+
+자동 retry는 SELECT 계열의 분류 가능한 transient error에만 제한적으로 적용한다. timeout/cancel, 결과 수신 시작 후 오류, 결과 불명확 실행은 재시도하지 않으며 mutation 자동 retry는 금지한다.
+
+Cost Guard는 hard safety와 advisory cost를 분리한다. 파티션 키 누락·허용 범위/명시적 hard limit 위반은 `BLOCKED`다. full scan, filesort, 큰 estimated rows 자체는 자동 차단하지 않는다. EXPLAIN/catalog statistics는 partition safety와 diagnostics에 사용한다. 설정 가능한 n rows 또는 n partitions threshold를 넘으면 `CONFIRMATION_REQUIRED`, 아니면 `NORMAL`이다. 확인은 query digest와 policy snapshot에 바인딩된 short-lived single-use token 방향으로 확장하며 상세 수치는 config에 둔다.
+
+---
+
+## ADR-017 개정 — MCP 응답 바이트 상한의 재정의
+
+**대상**: ADR-017 (컨텍스트 토큰 예산) · **상태**: `PROVISIONAL` 유지, `mcp.max_response_bytes`/Preview 관련 결정만 정정
+
+### 재검토 배경
+
+Preview 상한을 요청 단위 파라미터(`preview_rows`)로 열고 HTTP bulk 경로(`/data/datasets/{id}/rows`)의
+페이지 크기 상한을 완화하는 작업을 진행하면서, `mcp.max_response_bytes`(32,768)는 그대로 두었다.
+이후 재검토에서, 이 값이 애초부터 **특정 소비자(DataLens가 구동하는 A2 15.3GB 로컬 모델, 8K~16K 컨텍스트)의
+컨텍스트 예산을 보호하기 위해 QueryForge 서버 자체에 심어진 상한**이라는 점이 문제로 지적되었다.
+QueryForge는 ADR-003·ADR-028이 이미 "Claude, GPT 등 표준 MCP Client에서도 동일한 안전 경계로 사용하는
+범용 제품"으로 규정한 서버인데, 그 경계를 특정 Client의 모델 용량 기준으로 잡아둔 것은 ADR-003·028의
+원칙과 어긋난다.
+
+### 판정
+
+`mcp.max_response_bytes`의 목적을 **"응답을 소비하는 Agent의 컨텍스트 보호"에서 "서버 자신의 자원 보호
+(서킷브레이커)"로 재정의한다.** 값 자체도 이에 맞춰 상향한다.
+
+- ADR-017의 원래 배분표("Dataset 메타 + preview: 1,500 토큰")는 **DataLens 자신이 QueryForge를 호출할 때
+스스로 지켜야 하는 예산**으로 재해석한다. DataLens는 이미 `preview_rows` 요청 파라미터(001~005)로 이
+예산을 스스로 관리할 수 있다(예: 주로 `preview_rows=5` 근처로 요청). **QueryForge 서버가 이 예산을
+대신 강제하지 않는다.**
+- `mcp.max_response_bytes` 기본값을 32,768 → **10,485,760(10MB)**로 상향한다. 이 값은 Agent 컨텍스트
+크기와 무관하며, 순수하게 "단일 MCP 응답 하나가 서버 프로세스 메모리·네트워크를 위협하지 않는
+상한"이다. 정확한 값은 실측이 아니라 잠정치이며, 운영 중 조정 가능한 config 값이다.
+- HTTP bulk 경로(`/data/datasets/{id}/rows`)는 애초부터 이런 상한이 없었다(005). 이번 정정으로 MCP 경로도
+같은 철학(서버는 관대하게 서빙하고, 소비자가 자기 능력에 맞게 요청 크기를 조절한다)으로 통일된다.
+- Agent Loop 스텝 상한(3회)과 다른 ADR-017 항목(스키마 컨텍스트 2,500, 대화 이력 압축 등)은 이
+개정의 대상이 아니다 — 이들은 DataLens 자신의 Agent Loop 설계이지 QueryForge 서버 계약이 아니라는 점이
+이미 확인되었다.
+
+### 근거
+
+Preview 생성 비용은 서버 자원(Polars slicing, JSON 직렬화) 관점에서 저렴하다 — 늘어나는 자원 비용이
+거의 없는데 상한만 낮게 잡아 둘 이유가 없다. 진짜 비용은 그 응답을 "읽는" 쪽에서 발생하며, 그건
+QueryForge가 통제할 수도 없고 통제해서도 안 되는 영역이다(Claude/GPT 같은 대형 컨텍스트 Client에게는
+32KB가 오히려 불필요하게 인색한 제약이었다).
+
+### 함께 갱신되는 사항
+
+`preview.max_cell_bytes`(1,024) < `mcp.max_response_bytes` 교차 검증(코드)은 여전히 성립한다.
+`tests/contract/test_s1_contract.py`의 고정값 assert도 새 값으로 갱신한다.
+
+---
+
+## 현재 재검토 항목
+
+| 항목 | 상태 |
+|---|---|
+| MySQL 외 Database Adapter | v1 범위 밖. Adapter 계약을 유지하고 별도 구현 시 재검토 |
+| Transform process isolation | 인터페이스만 존재하며 thread isolation이 기본 |
+| 공유/object Dataset Store와 다중 worker | v1 범위 밖. 현재 workers=1 고정 |
+| 외부 Semantic Provider | 선택 확장. Core는 Catalog와 구조화 계약만으로 동작 |
+| Controlled Mutation | 미구현·비노출. 별도 ADR, credential, policy, approval 계약 없이는 추가하지 않음 |
 
 ---
 
@@ -1175,3 +1251,8 @@ Vector Similarity → Candidate → 구조화 검증 → QuerySpec → QueryForg
 | 0.1 | 2026-08-10 | 초안. ADR-001~019 등록 |
 | 0.2 | 2026-08-10 | ADR-005 확정 (MySQL 8.x). 액션 아이템 #1 해소 |
 | 0.3 | 2026-08-10 | Semantic 제안 검토(SEM-REVIEW-001) 반영. ADR-020~027 신규 등록. ADR-009 개정(Domain Pack SoT 유지), ADR-010 개정(3분할 및 게이트 명시). 액션 아이템 #4 해소, #8~12 신규 등록 |
+| 0.4 | 2026-08-21 | ADR-028 추가. 독립 제품·Capability/session/policy/type mapping/lifecycle/Future Mutation 경계 반영 |
+| 0.5 | 2026-08-21 | ADR-006 개정, ADR-029~032 통합. 영속 DatasetStore, lifecycle 분리, serialization, capability detection, shutdown, retry, Query Cost Guard 반영 |
+| 0.6 | 2026-08-26 | 공식 MCP SDK session, 독립 versioned image 배포, 현재 구현·재검토 항목 반영 |
+| 0.7 | 2026-08-30 | ADR-017 개정 — mcp.max_response_bytes 재정의(Agent 컨텍스트 보호 → 서버 자원 보호), 기본값 32,768 → 10,485,760 |
+| 0.8 | 2026-09-08 | Phase 0 consistency gate. DataLens의 QueryForge wheel runtime 의존 제거, 현재 Dataset/Preview 계약 반영, 세 Session 및 Agent/deadline 소유권 명확화 |

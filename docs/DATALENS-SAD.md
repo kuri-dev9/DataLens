@@ -3,9 +3,9 @@
 | 항목 | 내용 |
 |---|---|
 | 문서 ID | DataLens-SAD |
-| 버전 | 0.2 |
-| 최종 수정 | 2026-08-10 |
-| 선행 문서 | GLOSSARY, ADR (ADR-001 ~ ADR-027), DB_PoC, DB_PoC_Relationship |
+| 버전 | 0.4 |
+| 최종 수정 | 2026-09-08 |
+| 선행 문서 | GLOSSARY, ADR (ADR-001 ~ ADR-027), DB.sql, DB_PoC, DB_PoC_Relationship |
 | 후속 문서 | QueryForge-DDD |
 
 ## 문서 사용법
@@ -77,9 +77,32 @@ PoC 검증이 1차 목표이나, **PoC 종료 후에도 계속 사용·판매 �
 ### 2.3 전제 조건
 
 1. 대상 DB는 관계형이며 읽기 전용 계정을 발급받을 수 있다.
-2. 대상 테이블은 시간 기준으로 파티셔닝되어 있다.
+2. 대상 **Fact** 테이블은 시간 기준으로 파티셔닝되어 있다. **Master 테이블은 비파티션이다** (2.4 참조).
 3. 운영 환경은 인터넷 접근이 불가능한 폐쇄망이다.
 4. 추론 하드웨어는 NVIDIA A2 15.3GB × 2 (서버당 1장), 시스템 RAM 128GB (ADR-001).
+
+### 2.4 대상 스키마 실측 제약 (`docs/DB.sql`, 2026-08-10)
+
+원본 DDL 439개 테이블 분석 결과다. **가정이 아니라 실측이며, 설계는 이 제약 위에서 이루어진다.**
+대상 DB는 외부 자산이므로 이 중 어느 것도 고치지 않는다(P-8, N-7).
+
+| # | 제약 | 설계 대응 |
+|---|---|---|
+| SC-1 | **시간 컬럼이 4중복** — `EVENT_TIME`(datetime, 파티션 키) 외에 `CDATE`/`CHOUR`/`CTIME`(varchar)가 Core Fact 7개 전부에 존재 | 시간 범위는 **파티션 키에만** 유효. 보조 시간 컬럼 단독 범위 지정은 `MISSING_TIME_RANGE` 거부 (ADR-016 개정, N-21) |
+| SC-2 | **Core 11개에 PK 없음** (439개 중 PK 보유 7개는 전부 관리용 `CM_*`) | 식별자 판정에서 PK를 쓸 수 없음. 명명 패턴 + Domain Pack `declared_role`이 유일 방어선 (ADR-022 보강) |
+| SC-3 | **Core 11개에 보조 인덱스 없음** (439개 중 2개뿐) | 파티션 내부는 전량 스캔. 최대 조회 범위를 **파티션 수 기준**으로 산정하며 인덱스를 전제하지 않음 |
+| SC-4 | **Core에 FK 없음** (439개 중 3건, Core 무관) | `relationships.yaml`이 조건부가 아니라 **무조건 필수 산출물** (ADR-009 예측 확인) |
+| SC-5 | **문자셋 `utf8mb3`** (439/439), 콜레이션 미명시 | 4바이트 문자 없음 가정. **일본어 정렬을 DB 콜레이션에 의존하지 않고 Polars에서 처리** |
+| SC-6 | **DB 전체 439개 테이블** (Core는 11개) | `list_tables`를 Domain Pack allowlist로 제한 (ADR-017 개정, N-22) |
+| SC-7 | **조인 컬럼 길이 불일치** — `NODE_ID varchar(30)` ↔ `EQUIP_ID varchar(4)`, `NODE_TYPE(4)` ↔ `EQUIP_TYPE(6)` | 임의 변환·zero-padding·대소문자 변환 금지(N-23). 인덱스 부재와 겹쳐 양쪽 스캔이므로 Master 조인은 사전 축소 후 수행 |
+| SC-8 | **컬럼명 오타 4건** — `DATA_SUCESS_CNT`, `IMS_SUCESS_CNT`, `EX_DATA_SUCESS_CNT`, `EX_IMS_SUCESS_CNT` | 모델이 `SUCCESS`로 "교정"하면 `UNKNOWN_COLUMN`. `did_you_mean` 힌트(17.2)로 1회 복구되게 한다. 팩 alias에 오타형을 정식 명칭으로 등록 |
+| SC-9 | **`MAXVALUE` 파티션 없음** | 마지막 파티션 상한 초과 범위는 0행. "데이터 없음"과 "적재 범위 초과"를 구분해 안내 |
+
+#### SC-1이 가장 위험한 이유
+
+`CDATE = '20240529'`는 사람이 보기에 완벽히 합리적인 조건이고 **결과도 정확하다.** 틀리는 것은
+성능뿐인데, PoC 데이터 140행에서는 성능 차이가 관측되지 않는다. **개발 중에는 절대 드러나지 않다가
+운영에서 터지는 결함**이므로 규칙(ADR-016 개정)과 테스트(`EXPLAIN` 프루닝 검증) 양쪽으로 막는다.
 
 ---
 
@@ -168,7 +191,7 @@ U5: "그중 문제가 큰 링크의 원인은?"
 | ID | 요구사항 | 인수 기준 요약 |
 |---|---|---|
 | FR-010 | 사용자 발화로부터 수행할 작업을 판단한다 | Tool 선택 정확도를 golden set으로 측정 |
-| FR-011 | Agent는 Tool을 반복 호출할 수 있다 | 스텝 상한 3회, 초과 시 명확화 질문 반환 (ADR-017) |
+| FR-011 | Agent는 Tool을 반복 호출할 수 있다 | Phase 0 기본 Tool 호출 상한 3회(설정 가능), 초과 시 명확화 질문 반환 (ADR-017) |
 | FR-012 | Agent는 구조화된 Query/Transform Specification을 생성한다 | JSON Schema 강제 디코딩 (ADR-002) |
 | FR-013 | Agent는 지시 표현을 이전 Dataset/엔티티로 해소한다 | 결정적 해소 우선, 실패 시 LLM 해소 |
 | FR-014 | Agent는 오류 응답을 받아 1회 자가 교정을 시도한다 | 교정 실패 시 사용자에게 원인 설명 |
@@ -251,7 +274,7 @@ flowchart LR
         MCPC[MCP Client]
         QF[QueryForge<br/>MCP Server]
         CAT[(Catalog Snapshot)]
-        DSM[(Dataset Manager<br/>in-memory Polars)]
+        DSM[(Persistent Local DatasetStore<br/>Parquet + SQLite + hot cache)]
     end
 
     subgraph SRV1["서버 #1 — 추론"]
@@ -361,7 +384,10 @@ stateDiagram-v2
 | Execute | `query`, `transform`, `describe` | |
 | Recover | Execute와 동일 | 1회 한정 |
 
-**총 Tool 호출 스텝 상한 3회**(ADR-017). 근거는 스텝당 신뢰도가 곱으로 감쇠하기 때문이다.
+**Phase 0의 총 Tool 호출 상한 기본값은 3회**다(ADR-017). 이 값은
+`DATALENS_AGENT_MAX_TOOL_CALLS`로 관리하며 QueryForge 제품의 영구 Architecture 제약이 아니다.
+향후 `schema → relationship → query → describe` 같은 정상 workflow의 실측 결과에 따라 조정할 수 있다.
+근거는 스텝당 신뢰도가 곱으로 감쇠하기 때문이다.
 스텝당 95%라도 8스텝이면 약 66%로 떨어진다. 스텝 수를 줄이는 것이 곧 정확도 설계다.
 
 ### 8.3 구조화 출력 강제
@@ -372,7 +398,9 @@ Specification 생성은 프롬프트로 형식을 부탁하지 않고 **JSON Sch
 ### 8.4 응답 생성 규칙
 
 1. **수치는 Dataset 값만 인용한다.** LLM이 숫자를 생성하지 않는다.
-2. 인용 가능한 값은 preview 5행과 summary에 한정된다. 그 외는 "표를 확인하세요"로 유도한다.
+2. 인용 가능한 값은 DataLens가 컨텍스트 예산에 맞춰 요청한 preview와 summary에 한정된다. 기본
+   `preview_rows`는 5이며 실제 반환량은 serialization/byte budget에 따라 더 작을 수 있다. 그 외는
+   "표를 확인하세요"로 유도한다.
 3. 업무적 판단(좋다/나쁘다)은 Domain Pack에 판단 기준이 선언된 경우에만 수행한다.
 4. 불확실한 경우 단정하지 않고 근거를 함께 제시한다.
 5. **해석 공개 의무 (ADR-020).** Domain Pack에 선언되지 않은 용어를 해석했거나,
@@ -411,11 +439,12 @@ MCP는 **판단 엔진이 아니라 기능 제공 규약**이다.
 |---|---|
 | 역할 | Agent가 사용할 수 있는 데이터 기능을 표준 인터페이스로 노출 |
 | Transport | Streamable HTTP (ADR-003) |
-| Tool 개수 | 5개 고정 (ADR-017) |
+| Tool 개수 | Phase 0 allowlist는 v1 Read Tool 5개 (ADR-017) |
 | 인증 | 내부망 전용 + 공유 시크릿 헤더 (ADR-011) |
 
-Tool 개수를 고정하는 이유는 로컬 모델의 Tool 선택 정확도가 Tool 개수에 민감하기 때문이다.
-기능 추가는 새 Tool이 아니라 **기존 Tool의 operation 확장**으로 처리한다.
+Phase 0 allowlist를 좁게 유지하는 이유는 로컬 모델의 Tool 선택 정확도와 보안 표면이 Tool 개수에
+민감하기 때문이다. 5개는 현재 QueryForge v1 Read contract의 동결 대상이며 영구 불변조건은 아니다.
+Tool 추가·변경에는 별도 호환성·보안 검토가 필요하다.
 
 MCP를 HTTP로 둔 결과, QueryForge는 DataLens 없이도 다른 클라이언트가 사용할 수 있는
 독립 제품이 된다. 이것이 재사용성 목표의 구조적 근거다.
@@ -502,9 +531,15 @@ PoC는 정적 API Key 헤더 인증이며, 사용자별 DB 권한 매핑은 범�
 
 ### 12.2 상태 모델
 
+여기서 `Session`은 외부 API가 발급하는 **DataLens Application Session**이다. 내부에는 별도의
+QueryForge Application Session ID를 1:1 mapping하여 Dataset namespace 접근에 사용한다. 공식 MCP SDK가
+관리하는 MCP Transport Session은 재연결 시 교체될 수 있으며 어느 Application Session의 소유권 ID도
+아니다. 외부 `session_id`에는 DataLens Session ID만 노출한다.
+
 ```
 Session
 ├── session_id
+├── queryforge_session_id  내부 mapping, 외부 노출 금지
 ├── locale               ko | ja (서버 설정에서 파생)
 ├── timezone
 ├── created_at / last_active_at
@@ -554,6 +589,7 @@ DatasetRef                (DataLens는 메타만 보유. 실데이터는 QueryFo
 ### 12.4 세션 저장
 
 in-memory 기본, SQLite 영속화 선택(ADR-008). 세션 TTL 초과 시 QueryForge에 Dataset 해제를 통지한다.
+이때 release에는 외부 DataLens Session ID가 아니라 mapping된 QueryForge Application Session ID를 사용한다.
 
 ---
 
@@ -792,7 +828,7 @@ sequenceDiagram
     Q->>DB: SELECT (MAX_EXECUTION_TIME)
     DB-->>Q: rows
     Q->>Q: Dataset 등록 (ds_000001)
-    Q-->>M: dataset_id, schema, row_count, preview(5), summary
+    Q-->>M: dataset_id, schema, row_count, preview, summary
     M-->>AG: MCP Response
     AG->>L: 응답 문장 생성
     L-->>AG: answer
@@ -1018,7 +1054,7 @@ DB에 저장된 문자열이 LLM 프롬프트에 들어간다. 해당 값이 지
 | DBMS | MySQL → PostgreSQL 등 | `DatabaseAdapter` |
 | 도메인 | 통신 → 타 도메인 | Domain Pack |
 | 의미 지식 | 사전 → RAG | `SemanticProvider` |
-| Dataset 저장 | in-memory → spill | `DatasetStore` |
+| Dataset 저장 | Persistent Local DatasetStore → shared/object store | QueryForge `DatasetStore` |
 | 세션 저장 | in-memory → SQLite/외부 | `SessionStore` |
 | 로케일 | ko → ja → 기타 | `locales/<CC>.yaml` |
 
@@ -1028,7 +1064,7 @@ DB에 저장된 문자열이 LLM 프롬프트에 들어간다. 해당 값이 지
 
 1. **리포지토리 물리 분리** — QueryForge는 독립 semver·독립 CI (ADR-019)
 2. **도메인 용어 CI 검사** — QueryForge 리포에서 도메인 용어 검출 시 빌드 실패 (ADR-009)
-3. **wheel 의존** — DataLens가 QueryForge를 버전 핀으로 의존
+3. **MCP contract 의존** — 별도 deployable인 QueryForge의 versioned Streamable HTTP contract를 검증
 
 1인 개발 체제에는 리뷰어가 없다. 자동 검사가 유일한 방어선이다.
 
@@ -1082,6 +1118,8 @@ DB에 저장된 문자열이 LLM 프롬프트에 들어간다. 해당 값이 지
 7. **식별자 컬럼 집계 시도가 전건 거부됨** (ADR-022)
 8. **Pack 미선언 용어를 해석한 응답에 해석 근거가 전건 표시됨** (ADR-020, 8.4 규칙 5)
 9. **복합 키 관계로 `PM_EPC_KPI_1M` ↔ `CM_EPC_INFO` Join이 동작** (ADR-027 R-1)
+10. **보조 시간 컬럼만으로 지정한 시간 범위가 전건 거부됨** (N-21, 2.4 SC-1)
+11. **`list_tables`가 Domain Pack allowlist 범위만 반환** (N-22)
 
 > 3.1의 제약표에 따라, **엔티티 비교·선택 경로(구 U2 형태)는 실데이터가 아닌 fixture로 검증한다.**
 > 다중 장비 데이터가 확보되면 판정 기준 1에 복원한다(ADR 액션 아이템 #10).
@@ -1115,8 +1153,8 @@ DB에 저장된 문자열이 LLM 프롬프트에 들어간다. 해당 값이 지
 | Constrained decoding | 프롬프트 지시 | 형식 오류를 디코더 레벨에서 구조적으로 제거 | ADR-002 |
 | Polars | pandas | 표현식 기반 안전 변환, 성능, LazyFrame 최적화 | QueryForge-DDD |
 | sqlglot | 정규식 검사 | AST 기반 금지 구문 탐지, 순수 Python(폐쇄망 적합) | ADR-007 |
-| in-memory Dataset | Parquet spill | RAM 128GB, 세션 수 적음. 구현·검증 비용 대비 이득 없음 | ADR-006 |
-| 단일 워커 | 멀티 워커 | in-process Dataset 정합성. 조기 분산화는 검증 부담만 증가 | ADR-004 |
+| Persistent Local DatasetStore | in-memory-only / shared object store | 재기동 복원과 lifecycle 분리, 현재 단일 노드 규모에 적합 | ADR-006 |
+| 단일 워커 | 멀티 워커 | 로컬 DatasetStore coordination과 검증 단순화. 조기 분산화는 검증 부담만 증가 | ADR-004 |
 | Domain Pack | Core 설정 분기 | 범용성과 정확도를 동시에 만족하는 유일한 구조 | ADR-009 |
 | 국가 코드 단일 env | 개별 언어/TZ 설정 | 설정 누락으로 인한 불일치 원천 차단 | ADR-015 |
 | docker-compose | k8s | 폐쇄망 단일 서버 규모에 적합, 반입·설치 단순 | ADR-014 |
@@ -1238,7 +1276,7 @@ flowchart TB
 | N-2 | LLM이 생성한 임의 Python/Polars 코드 실행 | 안전성 |
 | N-3 | 정규식만으로 SQL 검사 | 우회 가능. AST 필수 |
 | N-4 | 전체 스키마를 한 번에 LLM에 주입 | 컨텍스트 폭증 |
-| N-5 | Dataset 전체 행을 MCP Response에 포함 | 컨텍스트 폭증. preview 5행 고정 |
+| N-5 | Dataset 전체 행을 MCP Response에 포함 | 컨텍스트 폭증. DataLens가 `preview_rows`로 필요한 표본만 요청 |
 | N-6 | 대화 원문 무제한 누적 | 컨텍스트 예산 초과 |
 | N-7 | 대상 DB에 DDL·인덱스·파티션·통계 조작 | 외부 자산 |
 | N-8 | 시간 범위 조건 없는 대용량 테이블 조회 | 운영 DB 부하 |
@@ -1246,7 +1284,7 @@ flowchart TB
 | N-10 | 응답 언어를 사용자 발화로부터 추론 | 로케일 정책 위반 |
 | N-11 | LLM이 수치를 생성 | 신뢰성. Dataset 값만 인용 |
 | N-12 | Tool 개수 임의 증설 | 로컬 모델 선택 정확도 저하 |
-| N-13 | 멀티 워커 기동 | in-process Dataset 정합성 파괴 |
+| N-13 | coordination 없는 멀티 워커 기동 | Persistent Local DatasetStore의 단일-writer/정합성 계약 위반 |
 | N-14 | 카탈로그 자동 갱신 | 운영 중 예기치 않은 동작 변화 |
 | N-15 | 학습된 Semantic의 자동 승격 | 의미 오류는 fail-closed로 잡히지 않음. 사람 승인 필수 (ADR-020) |
 | N-16 | 실행 성공·반복 사용을 의미 정확성의 증거로 사용 | 의미 오류는 항상 에러 없이 실행됨. 무상관 신호 (ADR-020) |
@@ -1254,6 +1292,9 @@ flowchart TB
 | N-18 | 프로파일링 목적의 대용량 테이블 전체 스캔 | 외부 자산 부하. 파티션 한정 + CLI 전용 (ADR-023) |
 | N-19 | 라이선스 미확인 외부 소스 코드의 복사·이식 | 상용 납품 리스크 (ADR-025) |
 | N-20 | 평가 실행에 세션 학습·Candidate 반영 | 결과 재현성 파괴 (ADR-026) |
+| N-21 | 보조 시간 컬럼(`CDATE`/`CHOUR`/`CTIME`)만으로 시간 범위 지정 | 파티션 프루닝 미적용. 결과는 맞고 성능만 틀려 탐지가 어렵다 (ADR-016 개정, 2.4 SC-1) |
+| N-22 | `list_tables`가 Domain Pack 미선언 테이블 반환 | 439개 테이블. 컨텍스트 예산 초과 + 접근 표면 확대 (ADR-017 개정) |
+| N-23 | 조인 시 임의 타입 변환·zero-padding·대소문자 변환 | 근거 없는 값 변형. 컬럼 길이가 실제로 다르다 (2.4 SC-7) |
 
 ---
 
@@ -1261,20 +1302,21 @@ flowchart TB
 
 ADR의 액션 아이템 요약표를 참조한다.
 
-**해소됨**: MySQL 버전(8.x 확정), 테이블 수(Core 11개 확정 — `DB_PoC.md`).
+**해소됨**: MySQL 버전(8.x), 테이블 수(Core 11개 — `DB_PoC.md`),
+FK 제약(Core에 없음 — `DB.sql`), 문자셋(`utf8mb3` — `DB.sql`).
 
 **S0 내 확인 필요:**
 
-1. **TOOL-002 응답에 관계 상태·문맥전파 유형 필드가 필요한지** — Tool Schema 동결 전에 판단해야 한다 (ADR-027)
+1. ~~TOOL-002 응답 필드~~ **해소 — QueryForge-DDD 7.1에서 5개 필드 확정 및 동결**
 2. **WrenAI 등 외부 참조 대상의 파일별 라이선스** — 구현 착수 전 (ADR-025)
 
 **S1 착수 전 확인 필요:**
 
-3. FK 제약 설정 여부 — `relationships.yaml` 필수 여부
-4. 일자 경계 / 적재 타임존 — "어제" 해석의 정확성
-5. 읽기 전용 계정 발급 가능 여부
-6. **다중 장비(PGW/SGW) 실데이터 확보 가능 여부** — 엔티티 비교 시나리오의 검증 범위를 결정한다 (3.1 제약표)
-7. **PoC 환경의 기본 조회 기간 설정** — 현재 데이터가 2024-05-29~30이므로 "어제" 기본값은 0행을 반환한다
+3. 일자 경계 / 적재 타임존 — "어제" 해석의 정확성
+4. 읽기 전용 계정 발급 가능 여부
+5. **다중 장비(PGW/SGW) 실데이터 확보 가능 여부** — 엔티티 비교 시나리오의 검증 범위를 결정한다 (3.1 제약표)
+6. **PoC 환경의 기본 조회 기간 설정** — 현재 데이터가 2024-05-29~30이므로 "어제" 기본값은 0행을 반환한다
+7. **운영 파티션 단위(시간 vs 일)** — 표본은 시간 단위 명명. `partitions.yaml`의 최대 조회 범위 기본값을 좌우한다 (ADR-016 개정)
 
 ---
 
@@ -1284,3 +1326,5 @@ ADR의 액션 아이템 요약표를 참조한다.
 |---|---|---|
 | 0.1 | 2026-08-10 | 초안. FR/NFR/UC 등록, 아키텍처 및 플로우 확정 |
 | 0.2 | 2026-08-10 | Semantic 제안 검토(SEM-REVIEW-001) 반영. 3.1 대표 시나리오를 실데이터 기준으로 개정 및 제약표 추가, 8.4 해석 공개 규칙, 14.3~14.4 Semantic 경계·Clarify-Confirm-Log, 15.4~15.5 Vector 분할·Interaction Log, 23.4 판정 기준 3건 추가, P-11~13 / N-15~20 등록 |
+| 0.3 | 2026-08-10 | `DB.sql` DDL 실측 반영. 2.4 대상 스키마 실측 제약(SC-1~SC-9) 신설, 2.3 전제조건 정정(Master 비파티션), N-21~23 및 판정 기준 10·11 추가, 부록 A 갱신 |
+| 0.4 | 2026-09-08 | Phase 0 consistency gate. QueryForge 독립 MCP dependency, Persistent Local DatasetStore, request-scoped Preview, 세 Session, config-driven Agent limit와 deadline 소유권 반영 |
