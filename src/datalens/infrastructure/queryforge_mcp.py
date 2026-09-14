@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import time
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from copy import deepcopy
-from typing import Any
+from typing import Any, AsyncIterator
 from urllib.parse import quote
 
 import httpx
@@ -38,9 +38,6 @@ class McpQueryForgeClient:
         self._data_base_url = data_base_url.rstrip("/") if data_base_url else None
         self._allowed_tools = allowed_tools
         self._default_timeout = default_timeout_seconds
-        self._stack: AsyncExitStack | None = None
-        self._session: ClientSession | None = None
-        self._connect_lock = asyncio.Lock()
         self._discovery_lock = asyncio.Lock()
         self._tools: tuple[QueryForgeToolDefinition, ...] = ()
         self._data_client = data_client or httpx.AsyncClient(headers={"x-api-key": api_key})
@@ -52,12 +49,14 @@ class McpQueryForgeClient:
 
     async def connect(self, timeout_seconds: float | None = None) -> None:
         timeout = timeout_seconds or self._default_timeout
-        async with self._connect_lock:
-            if self._closed:
-                raise QueryForgeUnavailable("QueryForge client is closed")
-            if self._session is not None:
-                return
-            stack = AsyncExitStack()
+        async with self._session_scope(timeout):
+            return
+
+    @asynccontextmanager
+    async def _session_scope(self, timeout: float) -> AsyncIterator[ClientSession]:
+        if self._closed:
+            raise QueryForgeUnavailable("QueryForge client is closed")
+        async with AsyncExitStack() as stack:
             try:
                 client = await stack.enter_async_context(
                     httpx.AsyncClient(headers={"x-api-key": self._api_key})
@@ -68,37 +67,31 @@ class McpQueryForgeClient:
                 session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
                 await asyncio.wait_for(session.initialize(), timeout)
             except Exception as exc:
-                await stack.aclose()
                 raise QueryForgeUnavailable("QueryForge MCP initialization failed") from exc
-            self._stack = stack
-            self._session = session
+            yield session
 
     async def close(self) -> None:
-        async with self._connect_lock:
-            if self._closed:
-                return
-            self._closed = True
-            stack, self._stack, self._session, self._tools = self._stack, None, None, ()
-            try:
-                if stack is not None:
-                    await stack.aclose()
-            finally:
-                if self._owns_data_client:
-                    await self._data_client.aclose()
+        if self._closed:
+            return
+        self._closed = True
+        self._tools = ()
+        if self._owns_data_client:
+            await self._data_client.aclose()
 
     async def discover_tools(
         self, timeout_seconds: float | None = None, *, refresh: bool = False
     ) -> tuple[QueryForgeToolDefinition, ...]:
         timeout = timeout_seconds or self._default_timeout
-        await self.connect(timeout)
         async with self._discovery_lock:
             if self._tools and not refresh:
                 return deepcopy(self._tools)
-            assert self._session is not None
             try:
-                listed = await asyncio.wait_for(self._session.list_tools(), timeout)
+                async with self._session_scope(timeout) as session:
+                    listed = await asyncio.wait_for(session.list_tools(), timeout)
             except Exception as exc:
                 self._tools = ()
+                if isinstance(exc, QueryForgeUnavailable):
+                    raise
                 raise QueryForgeUnavailable("QueryForge tool discovery failed") from exc
             discovered = tuple(
                 QueryForgeToolDefinition(
@@ -129,23 +122,25 @@ class McpQueryForgeClient:
         if timeout_seconds <= 0:
             raise TimeoutError("QueryForge deadline exhausted")
         deadline = time.monotonic() + timeout_seconds
-        await self.connect(min(timeout_seconds, self._default_timeout))
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError("QueryForge deadline exhausted")
-        assert self._session is not None
         payload = deepcopy(arguments)
         if application_session_id is not None:
             payload["session_id"] = application_session_id
         try:
-            called = await asyncio.wait_for(
-                self._session.call_tool(name, payload), remaining
-            )
+            async with self._session_scope(min(timeout_seconds, self._default_timeout)) as session:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("QueryForge deadline exhausted")
+                called = await asyncio.wait_for(session.call_tool(name, payload), remaining)
         except asyncio.TimeoutError as exc:
             self._tools = ()
             raise TimeoutError("QueryForge call timed out") from exc
+        except TimeoutError:
+            self._tools = ()
+            raise
         except Exception as exc:
             self._tools = ()
+            if isinstance(exc, QueryForgeUnavailable):
+                raise
             raise QueryForgeUnavailable("QueryForge tool call failed") from exc
         structured = deepcopy(called.structuredContent or {})
         if not isinstance(structured, dict):

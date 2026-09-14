@@ -16,6 +16,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+tests/
 
 # Local configuration
 .env
