@@ -4,6 +4,13 @@
 세션 종속 리소스는 모두 `/v1/sessions/{session_id}/` 아래에 있다. 세션 ID를 쿼리
 파라미터로 받지 않는다. Dataset과 카탈로그 경로는 Ollama나 다른 LLM을 호출하지 않는다.
 
+## CORS
+
+허용 Origin은 `DATALENS_CORS_ORIGINS`의 쉼표 구분 목록으로 설정하며 기본값은 PoC용
+`*`이다. 브라우저 프리플라이트 `OPTIONS`는 API Key 없이 처리된다. 허용 메서드는
+`GET`, `POST`, `DELETE`, `OPTIONS`이고 허용 요청 헤더는 `x-api-key`, `content-type`,
+`accept`다. 일반 JSON 및 SSE 응답 모두 `Access-Control-Allow-Origin`을 포함한다.
+
 ## Dataset 행 조회
 
 ```http

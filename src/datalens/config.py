@@ -38,7 +38,13 @@ class Settings(BaseSettings):
     ollama_top_p: float = Field(0.95, ge=0, le=1)
     ollama_top_k: int = Field(64, gt=0)
     enable_thinking: bool = False
+    cors_origins: str = "*"
     api_key: SecretStr
+
+    @property
+    def allowed_cors_origins(self) -> tuple[str, ...]:
+        origins = tuple(item.strip() for item in self.cors_origins.split(",") if item.strip())
+        return origins or ("*",)
 
     @property
     def timezone(self) -> str:

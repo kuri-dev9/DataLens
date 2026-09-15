@@ -42,6 +42,8 @@ SESSION_PATTERN = re.compile(r"^dls_[A-Za-z0-9_-]{20,64}$")
 DATA_PAGE_DEFAULT = 100
 DATA_PAGE_MAX = 1000
 LOG = logging.getLogger("datalens.http")
+CORS_METHODS = "GET, POST, DELETE, OPTIONS"
+CORS_HEADERS = "x-api-key, content-type, accept"
 
 
 class MessageHandler(Protocol):
@@ -203,6 +205,51 @@ class ApiKeyMiddleware:
             await error_response(request, "DL_UNAUTHORIZED", "Unauthorized", 401)(scope, receive, send)
             return
         await self.app(scope, receive, send)
+
+
+class CorsMiddleware:
+    def __init__(self, app: Any, origins: tuple[str, ...]) -> None:
+        self.app = app
+        self._origins = frozenset(origins)
+
+    def _allowed_origin(self, origin: str) -> str | None:
+        if "*" in self._origins:
+            return "*"
+        return origin if origin in self._origins else None
+
+    @staticmethod
+    def _headers(origin: str) -> list[tuple[bytes, bytes]]:
+        return [
+            (b"access-control-allow-origin", origin.encode()),
+            (b"access-control-allow-headers", CORS_HEADERS.encode()),
+            (b"access-control-allow-methods", CORS_METHODS.encode()),
+        ]
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope, receive)
+        origin = request.headers.get("origin", "")
+        allowed = self._allowed_origin(origin) if origin else None
+        if request.method == "OPTIONS":
+            headers = {
+                "Access-Control-Allow-Origin": allowed,
+                "Access-Control-Allow-Headers": CORS_HEADERS,
+                "Access-Control-Allow-Methods": CORS_METHODS,
+            } if allowed else {}
+            await Response(status_code=204, headers=headers)(scope, receive, send)
+            return
+
+        async def send_with_cors(message: dict) -> None:
+            if message["type"] == "http.response.start" and allowed:
+                headers = list(message.get("headers", [])) + self._headers(allowed)
+                if allowed != "*":
+                    headers.append((b"vary", b"Origin"))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_cors)
 
 
 def build_app(
@@ -643,4 +690,5 @@ def build_app(
     )
     app.add_middleware(ApiKeyMiddleware, api_key=settings.api_key.get_secret_value())
     app.add_middleware(RequestIdMiddleware)
+    app.add_middleware(CorsMiddleware, origins=settings.allowed_cors_origins)
     return app
