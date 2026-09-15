@@ -406,7 +406,7 @@ data: {"returned":323,"total":323}
 | — | `DL_AGENT_LIMIT` | Agent 스텝 한도 초과 | 질문을 더 구체적으로 안내 |
 | — | `DL_AGENT_INVALID_TOOL` | LLM이 잘못된 도구 호출 | 재시도 |
 | — | `DL_AGENT_NOT_READY` | Agent 미준비 | 재시도 |
-| — | `DL_QUERY_REJECTED` | 쿼리가 정책상 거부됨 | 사유 표시. 재시도 무의미 |
+| — | `DL_QUERY_REJECTED` | QueryForge가 요청을 거부함 | `details.upstream_code`에 따라 안내. `retryable` 반영 |
 | — | `DL_UPSTREAM_INVALID_RESPONSE` | 업스트림 응답 형식 오류 | 재시도 |
 | — | `DL_SESSION_CLEANUP_FAILED` | 세션 정리 실패 | 무시 가능 |
 
@@ -418,6 +418,26 @@ data: {"returned":323,"total":323}
 3. DL_SESSION_BUSY     → 입력창 비활성화, 진행 중 요청 완료까지 대기
 4. 그 외               → error.message를 그대로 표시하지 말고 코드별 안내 문구로 변환
 ```
+
+`DL_QUERY_REJECTED`는 QueryForge의 안전한 교정 정보를 다음 구조로 보존한다.
+
+```json
+{
+  "code": "DL_QUERY_REJECTED",
+  "message": "The data request was rejected",
+  "retryable": true,
+  "details": {
+    "upstream_code": "MISSING_PARTITION_SCOPE",
+    "hint": "<QueryForge 교정 힌트>",
+    "table": "example_table"
+  }
+}
+```
+
+- `MISSING_PARTITION_SCOPE`, `INVALID_PARTITION_SCOPE`: "조회 범위 지정에 문제가 있습니다"
+- `TABLE_NOT_ALLOWED` 등 정책 오류: "허용되지 않은 데이터 요청입니다"
+- 그 외 또는 `upstream_code` 없음: "데이터 요청을 처리하지 못했습니다"
+- `details`에는 교정용 구조 필드만 포함되며 SQL 원문, 접속 문자열, 비밀번호, 행 데이터는 포함하지 않는다.
 
 ---
 

@@ -52,7 +52,10 @@ class AgentPolicyError(AgentError):
 
 
 class AgentQueryRejected(AgentError):
-    pass
+    def __init__(self, failure: QueryForgeFailure | str | None = None) -> None:
+        normalized = failure if isinstance(failure, QueryForgeFailure) else None
+        super().__init__(normalized.code if normalized else str(failure or "QUERYFORGE_REJECTED"))
+        self.failure = normalized
 
 
 class AgentInternalError(AgentError):
@@ -215,11 +218,13 @@ class BoundedAgent:
                 if not result.ok:
                     failure = result.error
                     if self._recoverable(failure):
-                        recovery_count = self._claim_recovery(recovery_count)
-                        messages.append(self._recovery_message(call.name, failure.code, self._failure_hint(failure)))
+                        if recovery_count >= self._recovery_budget:
+                            raise AgentQueryRejected(failure)
+                        recovery_count += 1
+                        messages.append(self._queryforge_recovery_message(call.name, failure))
                         should_retry = True
                         break
-                    raise AgentQueryRejected(failure.code if failure else "QUERYFORGE_REJECTED")
+                    raise AgentQueryRejected(failure)
                 messages.append(
                     ProviderMessage(
                         "tool",
@@ -266,11 +271,7 @@ class BoundedAgent:
 
     @classmethod
     def _recoverable(cls, failure: QueryForgeFailure | None) -> bool:
-        if failure is None or failure.code not in cls._RECOVERABLE_CODES:
-            return False
-        if failure.code in {"UNKNOWN_COLUMN", "UNKNOWN_TABLE"}:
-            return len(failure.candidates) == 1
-        return True
+        return failure is not None and failure.retryable
 
     @staticmethod
     def _failure_hint(failure: QueryForgeFailure) -> str:
@@ -283,6 +284,22 @@ class BoundedAgent:
         return ProviderMessage(
             "tool",
             json.dumps({"ok": False, "error": {"code": code, "detail": detail}}, ensure_ascii=False),
+            tool_name=tool_name,
+        )
+
+    @staticmethod
+    def _queryforge_recovery_message(
+        tool_name: str, failure: QueryForgeFailure
+    ) -> ProviderMessage:
+        error = {
+            "code": failure.code,
+            "retryable": failure.retryable,
+            "hint": failure.hint,
+            "details": deepcopy(failure.safe_metadata),
+        }
+        return ProviderMessage(
+            "tool",
+            json.dumps({"ok": False, "error": error}, ensure_ascii=False, separators=(",", ":")),
             tool_name=tool_name,
         )
 

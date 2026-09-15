@@ -62,5 +62,37 @@ def test_ui_ac2_through_ac10_use_only_documented_paths_and_stream_contract() -> 
 def test_ui_error_messages_do_not_render_raw_server_message() -> None:
     source = DEMO.read_text()
     assert "errorMessages" in source
-    assert "error.message" not in source
+    assert ".textContent=error.message" not in source
     assert "payload?.error?.message" not in source
+
+
+def test_dbg_ac1_through_ac5_debug_console_contract() -> None:
+    source = DEMO.read_text()
+    for required in (
+        'id="debugConsole"', "collapsed", 'storageKey("debug")', "debugLogs.unshift",
+        "received_at", "elapsed_ms", "ttft_ms", "total_ms", "token_count",
+        "tokens_per_second", "maskedHeaders", '.slice(0,6)', "navigator.clipboard.writeText",
+        "token 이벤트", "최종 응답 원문", "retryable", "details", '"ping"',
+    ):
+        assert required in source
+
+
+def test_fix_ac1_through_ac4_partial_response_is_preserved_on_stream_failure() -> None:
+    source = DEMO.read_text()
+    assert 'if(name==="error")streamError=data' in source
+    assert 'if(!doneData)throw Object.assign(new Error("STREAM_INTERRUPTED")' in source
+    assert 'const partial=tokenCount>0||Boolean(answer.querySelector(".dataset"))' in source
+    assert 'badge.textContent=error.name==="AbortError"?"응답을 취소했습니다":"응답이 중단되었습니다"' in source
+    assert 'addError(error,lastRetry,partial)' in source
+    assert 'answer.remove();progress.remove()' in source  # 세션 재생성 경로에만 사용
+    assert 'code==="DL_AGENT_LIMIT"&&partial?"답변 생성이 중단되었습니다. 이어서 질문해 주세요."' in source
+
+
+def test_msg_ac1_query_rejection_message_uses_upstream_code() -> None:
+    source = DEMO.read_text()
+    assert "details?.upstream_code" in source
+    assert '"MISSING_PARTITION_SCOPE","INVALID_PARTITION_SCOPE"' in source
+    assert '"TABLE_NOT_ALLOWED","COLUMN_NOT_ALLOWED","POLICY_VIOLATION"' in source
+    assert "조회 범위 지정에 문제가 있습니다." in source
+    assert "허용되지 않은 데이터 요청입니다." in source
+    assert "데이터 요청을 처리하지 못했습니다." in source

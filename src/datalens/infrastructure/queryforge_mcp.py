@@ -21,6 +21,12 @@ from datalens.ports.queryforge import (
 
 
 DEFAULT_ALLOWED_TOOLS = frozenset({"schema", "relationship", "query", "transform", "describe"})
+SENSITIVE_ERROR_KEYS = frozenset(
+    {
+        "authorization", "connection", "connection_string", "data", "dsn", "password",
+        "preview", "row_data", "rows", "secret", "sql", "token",
+    }
+)
 
 
 class McpQueryForgeClient:
@@ -249,11 +255,7 @@ class McpQueryForgeClient:
         details = raw.get("details") if isinstance(raw.get("details"), dict) else {}
         raw_candidates = details.get("candidates", details.get("did_you_mean", []))
         candidates = raw_candidates if isinstance(raw_candidates, list) else []
-        safe = {
-            key: deepcopy(value)
-            for key, value in details.items()
-            if key in {"candidates", "did_you_mean", "expected_format", "supported_tools", "feature"}
-        }
+        safe = McpQueryForgeClient._safe_error_details(details)
         return QueryForgeFailure(
             code=str(raw.get("code", "UNKNOWN")),
             message=str(raw.get("message", "QueryForge rejected the request")),
@@ -262,3 +264,15 @@ class McpQueryForgeClient:
             candidates=tuple(deepcopy(candidates)),
             safe_metadata=safe,
         )
+
+    @staticmethod
+    def _safe_error_details(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: McpQueryForgeClient._safe_error_details(nested)
+                for key, nested in value.items()
+                if str(key).lower() not in SENSITIVE_ERROR_KEYS
+            }
+        if isinstance(value, list):
+            return [McpQueryForgeClient._safe_error_details(item) for item in value]
+        return deepcopy(value)

@@ -147,7 +147,23 @@ def agent_error_response(request: Request, exc: Exception, session_id: str) -> J
     if isinstance(exc, AgentInvalidUpstreamResponse):
         return error_response(request, "DL_UPSTREAM_INVALID_RESPONSE", "Upstream service returned an invalid response", 502, session_id=session_id)
     if isinstance(exc, AgentQueryRejected):
-        return error_response(request, "DL_QUERY_REJECTED", "The data request was rejected", 422, session_id=session_id)
+        failure = exc.failure
+        details = None
+        if failure is not None:
+            details = {
+                "upstream_code": failure.code,
+                "hint": failure.hint,
+                **failure.safe_metadata,
+            }
+        return error_response(
+            request,
+            "DL_QUERY_REJECTED",
+            "The data request was rejected",
+            422,
+            retryable=failure.retryable if failure is not None else False,
+            details=details,
+            session_id=session_id,
+        )
     return error_response(request, "DL_INTERNAL_ERROR", "Internal error", 500, session_id=session_id)
 
 
@@ -411,8 +427,8 @@ def build_app(
             return error_response(request, "DL_UPSTREAM_UNAVAILABLE", "Upstream service is unavailable", 503, retryable=True, session_id=session_id)
         except AgentInvalidUpstreamResponse:
             return error_response(request, "DL_UPSTREAM_INVALID_RESPONSE", "Upstream service returned an invalid response", 502, session_id=session_id)
-        except AgentQueryRejected:
-            return error_response(request, "DL_QUERY_REJECTED", "The data request was rejected", 422, session_id=session_id)
+        except AgentQueryRejected as exc:
+            return agent_error_response(request, exc, session_id)
         except AgentInternalError:
             return error_response(request, "DL_INTERNAL_ERROR", "Internal error", 500, session_id=session_id)
         except Exception:

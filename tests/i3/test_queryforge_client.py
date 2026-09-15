@@ -149,8 +149,12 @@ async def test_structured_error_is_preserved_and_unsafe_details_removed() -> Non
                 "retryable": True,
                 "details": {
                     "did_you_mean": ["event_time"],
+                    "table": "events",
+                    "expected_kind": "time_range",
                     "sql": "SELECT secret FROM private_table",
                     "password": "do-not-leak",
+                    "connection_string": "mysql://user:password@private/db",
+                    "rows": [{"secret": "do-not-leak"}],
                 },
                 "hint": "choose one suggested column",
             },
@@ -164,7 +168,11 @@ async def test_structured_error_is_preserved_and_unsafe_details_removed() -> Non
     assert result.error.retryable is True
     assert result.error.candidates == ("event_time",)
     assert result.error.hint == "choose one suggested column"
-    assert set(result.error.safe_metadata) == {"did_you_mean"}
+    assert result.error.safe_metadata == {
+        "did_you_mean": ["event_time"],
+        "table": "events",
+        "expected_kind": "time_range",
+    }
 
 
 @pytest.mark.anyio

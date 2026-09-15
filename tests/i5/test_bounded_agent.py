@@ -148,6 +148,11 @@ async def test_loc_ac2_ac3_sessions_select_prompts_independently() -> None:
     assert "사용하세요" in ko_prompt
     assert "使用してください" in ja_prompt
     assert ko_prompt != ja_prompt
+    for prompt in (ko_prompt, ja_prompt):
+        assert "partition_scope" in prompt
+        assert '"kind":"time_range"' in prompt
+        assert '"kind":"not_partitioned"' in prompt
+        assert "partitioned" in prompt
 
 
 @pytest.mark.anyio
@@ -273,8 +278,39 @@ async def test_single_candidate_queryforge_error_is_recovered() -> None:
 
 
 @pytest.mark.anyio
+async def test_err_ac_n3_retryable_partition_error_is_returned_to_model_and_retried() -> None:
+    failure = QueryForgeFailure(
+        "MISSING_PARTITION_SCOPE",
+        "partition scope mismatch",
+        True,
+        hint='Use {"kind":"not_partitioned"}',
+        safe_metadata={"table": "PM_CEI_PGW_5M", "expected_kind": "not_partitioned"},
+    )
+    rejected = QueryForgeResult(False, "Q" * 22, {"ok": False}, failure)
+    query = {
+        "source": {"table": "PM_CEI_PGW_5M"},
+        "select": [{"column": "DATA_CONN_ATTEMPT_CNT"}],
+        "partition_scope": {"kind": "not_partitioned"},
+    }
+    provider = FakeProvider([calling("query", query), calling("query", query), assistant("완료")])
+    qf = FakeQueryForge([rejected, ok_query()])
+    result = await BoundedAgent(provider, qf, max_tool_calls=3, recovery_budget=1).run(
+        session(), "조회", time.monotonic() + 2
+    )
+    payload = __import__("json").loads(provider.messages[1][-1].content)
+    assert result.recovery_count == 1
+    assert len(qf.calls) == 2
+    assert payload["error"] == {
+        "code": "MISSING_PARTITION_SCOPE",
+        "retryable": True,
+        "hint": 'Use {"kind":"not_partitioned"}',
+        "details": {"table": "PM_CEI_PGW_5M", "expected_kind": "not_partitioned"},
+    }
+
+
+@pytest.mark.anyio
 async def test_multiple_candidates_are_not_recovered() -> None:
-    failure = QueryForgeFailure("UNKNOWN_COLUMN", "bad", True, candidates=("a", "b"))
+    failure = QueryForgeFailure("UNKNOWN_COLUMN", "bad", False, candidates=("a", "b"))
     rejected = QueryForgeResult(False, "Q" * 22, {"ok": False}, failure)
     with pytest.raises(AgentQueryRejected):
         await BoundedAgent(FakeProvider([calling("schema", {"action": "list_tables"})]), FakeQueryForge([rejected]), max_tool_calls=3, recovery_budget=1).run(session(), "x", time.monotonic() + 2)

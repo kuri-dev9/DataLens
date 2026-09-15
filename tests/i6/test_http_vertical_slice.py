@@ -29,6 +29,7 @@ from datalens.application.sessions import SessionService
 from datalens.infrastructure.session_store import InMemorySessionStore
 from datalens.infrastructure.queryforge_mcp import DEFAULT_ALLOWED_TOOLS, McpQueryForgeClient
 from datalens.ports.llm import AssistantTurn, ToolCall
+from datalens.ports.queryforge import QueryForgeFailure
 
 
 HEADERS = {"x-api-key": "data-secret"}
@@ -426,6 +427,36 @@ def test_turn_lock_is_released_after_error(settings) -> None:
         first = client.post(f"/v1/sessions/{session_id}/messages", headers=HEADERS, json={"message": "x"})
         second = client.post(f"/v1/sessions/{session_id}/messages", headers=HEADERS, json={"message": "x"})
     assert first.status_code == second.status_code == 422
+
+
+def test_err_ac_n1_n2_n4_query_rejection_preserves_safe_hint_and_retryable(settings) -> None:
+    failure = QueryForgeFailure(
+        "MISSING_PARTITION_SCOPE",
+        "internal upstream message",
+        True,
+        hint='Use {"kind":"not_partitioned"}',
+        safe_metadata={"table": "PM_CEI_PGW_5M", "expected_kind": "not_partitioned"},
+    )
+    app, _ = wired(settings, FakeAgent(AgentQueryRejected(failure)))
+    with TestClient(app) as client:
+        session_id = create(client)
+        response = client.post(
+            f"/v1/sessions/{session_id}/messages", headers=HEADERS, json={"message": "조회"}
+        )
+    assert response.status_code == 422
+    assert response.json()["error"] == {
+        "code": "DL_QUERY_REJECTED",
+        "message": "The data request was rejected",
+        "retryable": True,
+        "details": {
+            "upstream_code": "MISSING_PARTITION_SCOPE",
+            "hint": 'Use {"kind":"not_partitioned"}',
+            "table": "PM_CEI_PGW_5M",
+            "expected_kind": "not_partitioned",
+        },
+    }
+    assert "internal upstream message" not in response.text
+    assert "SELECT " not in response.text
 
 
 @pytest.mark.parametrize(
