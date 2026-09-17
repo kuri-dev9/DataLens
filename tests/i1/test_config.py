@@ -9,16 +9,18 @@ from datalens.config import Settings
 def test_config_defaults_and_explicit_secrets() -> None:
     settings = Settings(api_key="api-secret", queryforge_api_key="qf-secret")
     assert settings.http_port == 8000
-    assert settings.request_deadline_seconds == 120
+    assert settings.request_deadline_seconds == 240
     assert settings.session_ttl_seconds == 1800
     assert settings.country == "KR"
     assert settings.timezone == "Asia/Seoul"
     assert settings.default_locale == "ko"
     assert settings.ollama_num_ctx == 8192
-    assert settings.ollama_temperature == 1.0
+    assert settings.ollama_temperature == 0.2
     assert settings.ollama_top_p == 0.95
     assert settings.ollama_top_k == 64
     assert settings.enable_thinking is False
+    assert settings.agent_max_tool_calls == 8
+    assert settings.agent_recovery_budget == 3
     assert "api-secret" not in repr(settings)
     assert "qf-secret" not in repr(settings)
 

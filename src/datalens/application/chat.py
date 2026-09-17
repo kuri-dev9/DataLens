@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable, Protocol
 from datalens.application.agent import AgentResult
 from datalens.application.sessions import SessionService
 from datalens.domain.session import Session
+from datalens.observability import bind_request_id, reset_request_id
 
 
 class Agent(Protocol):
@@ -26,7 +27,11 @@ class ChatApplicationService:
 
     async def handle(self, session: Session, message: str, request_id: str, deadline: float) -> dict:
         started = time.monotonic()
-        result = await self._agent.run(session, message, deadline)
+        context = bind_request_id(request_id)
+        try:
+            result = await self._agent.run(session, message, deadline)
+        finally:
+            reset_request_id(context)
         committed = self._sessions.commit(result.updated_session)
         logging.getLogger("datalens.agent").info(
             "agent_turn_completed",
@@ -64,7 +69,11 @@ class ChatApplicationService:
         event_sink: Callable[[str, dict[str, Any]], Awaitable[None]],
     ) -> dict:
         started = time.monotonic()
-        result = await self._agent.run(session, message, deadline, event_sink)
+        context = bind_request_id(request_id)
+        try:
+            result = await self._agent.run(session, message, deadline, event_sink)
+        finally:
+            reset_request_id(context)
         committed = self._sessions.commit(result.updated_session)
         duration_ms = int((time.monotonic() - started) * 1000)
         logging.getLogger("datalens.agent").info(

@@ -215,6 +215,8 @@ class OllamaProvider:
         if first and message.role == "system" and self._enable_thinking:
             content = f"<|think|>{content}"
         converted: dict[str, Any] = {"role": message.role, "content": content}
+        if message.role == "tool" and message.tool_name:
+            converted["tool_name"] = message.tool_name
         if message.tool_calls:
             converted["tool_calls"] = [
                 {"function": {"name": call.name, "arguments": deepcopy(call.arguments)}}

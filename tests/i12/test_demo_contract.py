@@ -91,8 +91,17 @@ def test_fix_ac1_through_ac4_partial_response_is_preserved_on_stream_failure() -
 def test_msg_ac1_query_rejection_message_uses_upstream_code() -> None:
     source = DEMO.read_text()
     assert "details?.upstream_code" in source
-    assert '"MISSING_PARTITION_SCOPE","INVALID_PARTITION_SCOPE"' in source
-    assert '"TABLE_NOT_ALLOWED","COLUMN_NOT_ALLOWED","POLICY_VIOLATION"' in source
+    assert "MISSING_PARTITION_SCOPE:" in source and "INVALID_PARTITION_SCOPE:" in source
+    assert "PARTITION_SCOPE_TOO_WIDE:" in source
+    assert "TABLE_NOT_ALLOWED:" in source and "POLICY_VIOLATION:" in source
     assert "조회 범위 지정에 문제가 있습니다." in source
+    assert "조회 기간이 보유 구간을 벗어났습니다." in source
     assert "허용되지 않은 데이터 요청입니다." in source
     assert "데이터 요청을 처리하지 못했습니다." in source
+
+
+def test_msg_failed_step_is_rendered_for_the_user() -> None:
+    source = DEMO.read_text()
+    assert "metadata?.failed_step" in source
+    assert "번째 도구 호출" in source
+    assert "failureTrace(error)" in source

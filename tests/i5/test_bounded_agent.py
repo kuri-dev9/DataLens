@@ -309,11 +309,102 @@ async def test_err_ac_n3_retryable_partition_error_is_returned_to_model_and_retr
 
 
 @pytest.mark.anyio
-async def test_multiple_candidates_are_not_recovered() -> None:
+async def test_log_ac3_tool_call_records_masked_model_arguments_and_recovery(caplog) -> None:
+    failure = QueryForgeFailure(
+        "MISSING_PARTITION_SCOPE", "bad", True,
+        hint='Use {"kind":"not_partitioned"}',
+        safe_metadata={"table": "records", "expected_kind": "not_partitioned"},
+    )
+    rejected = QueryForgeResult(False, "Q" * 22, {"ok": False}, failure)
+    arguments = {
+        "source": {"table": "records"},
+        "select": [{"column": "amount"}],
+        "partition_scope": {"kind": "time_range", "from": "private-from", "to": "private-to"},
+    }
+    provider = FakeProvider([calling("query", arguments), calling("query", {**arguments, "partition_scope": {"kind": "not_partitioned"}}), assistant("완료")])
+    with caplog.at_level("DEBUG", logger="datalens.agent"):
+        await BoundedAgent(provider, FakeQueryForge([rejected, ok_query()]), max_tool_calls=3, recovery_budget=1).run(session(), "조회", time.monotonic() + 2)
+
+    calls = [record for record in caplog.records if record.message == "tool_call"]
+    assert len(calls) == 2
+    assert calls[0].arguments["source"] == {"table": "records"}
+    assert calls[0].arguments["partition_scope"]["from"] == "***"
+    assert calls[0].error_code == "MISSING_PARTITION_SCOPE"
+    assert calls[0].hint == 'Use {"kind":"not_partitioned"}'
+    assert calls[0].recovery_attempt is True
+    assert not hasattr(calls[1], "preview") and calls[1].ok is True
+
+
+@pytest.mark.anyio
+async def test_non_retryable_failure_still_allows_self_correction() -> None:
+    # retryable=False여도 인자를 고치면 통과할 수 있는 실패는 모델에게 되돌려준다.
     failure = QueryForgeFailure("UNKNOWN_COLUMN", "bad", False, candidates=("a", "b"))
     rejected = QueryForgeResult(False, "Q" * 22, {"ok": False}, failure)
-    with pytest.raises(AgentQueryRejected):
-        await BoundedAgent(FakeProvider([calling("schema", {"action": "list_tables"})]), FakeQueryForge([rejected]), max_tool_calls=3, recovery_budget=1).run(session(), "x", time.monotonic() + 2)
+    provider = FakeProvider(
+        [
+            calling("query", {"source": {"table": "events"}, "select": [{"column": "x"}], "partition_scope": {"kind": "not_partitioned"}}),
+            calling("query", {"source": {"table": "events"}, "select": [{"column": "a"}], "partition_scope": {"kind": "not_partitioned"}}),
+            assistant("완료"),
+        ]
+    )
+    result = await BoundedAgent(provider, FakeQueryForge([rejected, ok_query()]), max_tool_calls=4, recovery_budget=2).run(session(), "조회", time.monotonic() + 2)
+    assert result.recovery_count == 1
+    assert any("UNKNOWN_COLUMN" in item.content for item in provider.messages[-1] if item.role == "tool")
+
+
+@pytest.mark.anyio
+async def test_terminal_failure_is_rejected_without_retry() -> None:
+    failure = QueryForgeFailure("TABLE_NOT_ALLOWED", "denied", False)
+    rejected = QueryForgeResult(False, "Q" * 22, {"ok": False}, failure)
+    qf = FakeQueryForge([rejected])
+    with pytest.raises(AgentQueryRejected) as raised:
+        await BoundedAgent(FakeProvider([calling("schema", {"action": "list_tables"})]), qf, max_tool_calls=3, recovery_budget=3).run(session(), "x", time.monotonic() + 2)
+    assert raised.value.failure.code == "TABLE_NOT_ALLOWED"
+    assert len(qf.calls) == 1
+
+
+@pytest.mark.anyio
+async def test_failure_without_structured_error_keeps_a_diagnosable_code() -> None:
+    # QueryForge가 error 객체 없이 실패를 돌려줘도 details가 비지 않아야 한다.
+    rejected = QueryForgeResult(False, "Q" * 22, {"ok": False}, None)
+    with pytest.raises(AgentQueryRejected) as raised:
+        await BoundedAgent(FakeProvider([calling("schema", {"action": "list_tables"})]), FakeQueryForge([rejected]), max_tool_calls=3, recovery_budget=3).run(session(), "x", time.monotonic() + 2)
+    assert raised.value.failure is not None
+    assert raised.value.failure.code == "UPSTREAM_UNSTRUCTURED_ERROR"
+
+
+@pytest.mark.anyio
+async def test_describe_table_partition_metadata_reaches_the_model() -> None:
+    partitioned = QueryForgeResult(
+        True,
+        "Q" * 22,
+        {
+            "ok": True,
+            "session_id": "Q" * 22,
+            "action": "describe_table",
+            "table": "PM_CEI_PGW_5M",
+            "partitioned": True,
+            "partition": {"keys": ["STAT_TIME"], "key_kind": "time", "max_range_days": 31},
+            "primary_key": ["STAT_TIME"],
+            "columns": [{"name": "STAT_TIME", "type": "datetime"}],
+            "warnings": [],
+        },
+    )
+    provider = FakeProvider([calling("schema", {"action": "list_tables"}), assistant("확인했습니다")])
+    await BoundedAgent(provider, FakeQueryForge([partitioned]), max_tool_calls=3, recovery_budget=1).run(session(), "구조", time.monotonic() + 2)
+    tool_message = provider.messages[-1][-1]
+    assert tool_message.role == "tool"
+    assert '"STAT_TIME"' in tool_message.content
+    assert '"partitioned":true' in tool_message.content
+
+
+@pytest.mark.anyio
+async def test_session_context_carries_the_current_date() -> None:
+    provider = FakeProvider([assistant("안녕하세요")])
+    await BoundedAgent(provider, FakeQueryForge(), max_tool_calls=3, recovery_budget=1, timezone="Asia/Seoul").run(session(), "오늘", time.monotonic() + 2)
+    context = provider.messages[0][1].content
+    assert '"timezone": "Asia/Seoul"' in context
+    assert '"today"' in context and '"now"' in context
 
 
 @pytest.mark.anyio
@@ -341,3 +432,47 @@ async def test_provider_failure_does_not_change_session() -> None:
     with pytest.raises(AgentUpstreamUnavailable):
         await BoundedAgent(FakeProvider([LLMUnavailable("down")]), FakeQueryForge(), max_tool_calls=3, recovery_budget=1).run(original, "x", time.monotonic() + 2)
     assert original.turn_state == ()
+
+
+@pytest.mark.anyio
+async def test_latest_partition_rejection_is_recovered_with_upper_bound() -> None:
+    # 재현 시나리오: "마지막 일자 데이터"를 요청하면 모델이 오늘 날짜를 찍고,
+    # QueryForge가 적재된 파티션 범위 밖이라며 거부한다. upper_bound가 모델에 도달해야 복구된다.
+    failure = QueryForgeFailure(
+        "PARTITION_SCOPE_TOO_WIDE",
+        "requested range is outside the loaded partition range",
+        True,
+        safe_metadata={"reason": "outside_loaded_partition_range", "upper_bound": "2026-09-10T00:00:00", "column": "STAT_TIME"},
+    )
+    rejected = QueryForgeResult(False, "Q" * 22, {"ok": False}, failure)
+    base = {"source": {"table": "PM_CEI_PGW_5M"}, "select": [{"column": "PGW_NAME"}]}
+    provider = FakeProvider(
+        [
+            calling("query", {**base, "partition_scope": {"kind": "time_range", "column": "STAT_TIME", "from": "2026-09-17T00:00:00", "to": "2026-09-17T23:59:59"}}),
+            calling("query", {**base, "partition_scope": {"kind": "time_range", "column": "STAT_TIME", "from": "2026-09-09T00:00:00", "to": "2026-09-09T23:59:59"}}),
+            assistant("PGW별 트래픽량입니다"),
+        ]
+    )
+    result = await BoundedAgent(provider, FakeQueryForge([rejected, ok_query()]), max_tool_calls=8, recovery_budget=3).run(session(), "PGW별 트래픽량", time.monotonic() + 2)
+    assert result.answer == "PGW별 트래픽량입니다"
+    assert result.recovery_count == 1
+    recovery = [item.content for item in provider.messages[-1] if item.role == "tool"][0]
+    assert "2026-09-10T00:00:00" in recovery and "outside_loaded_partition_range" in recovery
+
+
+@pytest.mark.anyio
+async def test_failure_keeps_earlier_datasets_and_reports_the_failed_step() -> None:
+    failure = QueryForgeFailure("TABLE_NOT_ALLOWED", "denied", False)
+    rejected = QueryForgeResult(False, "Q" * 22, {"ok": False}, failure)
+    provider = FakeProvider(
+        [
+            calling("query", {"source": {"table": "events"}, "select": [{"column": "a"}], "partition_scope": {"kind": "not_partitioned"}}),
+            calling("query", {"source": {"table": "secret"}, "select": [{"column": "a"}], "partition_scope": {"kind": "not_partitioned"}}),
+        ]
+    )
+    with pytest.raises(AgentQueryRejected) as raised:
+        await BoundedAgent(provider, FakeQueryForge([ok_query(), rejected]), max_tool_calls=8, recovery_budget=3).run(session(), "조회", time.monotonic() + 2)
+    exc = raised.value
+    assert [dataset.dataset_id for dataset in exc.datasets] == ["ds_000000001"]
+    assert exc.failed_step == {"index": 2, "tool": "query", "upstream_code": "TABLE_NOT_ALLOWED"}
+    assert exc.tool_calls == 2

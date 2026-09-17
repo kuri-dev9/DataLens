@@ -242,7 +242,7 @@ async def test_tool_identity_is_preserved_in_followup_payload() -> None:
     finally:
         await client.aclose()
     assert captured[0]["messages"][0]["tool_calls"][0]["function"]["name"] == "schema"
-    assert captured[0]["messages"][1] == {"role": "tool", "content": '{"ok":true}'}
+    assert captured[0]["messages"][1] == {"role": "tool", "content": '{"ok":true}', "tool_name": "schema"}
 
 
 @pytest.mark.anyio

@@ -19,22 +19,22 @@ class Settings(BaseSettings):
     http_host: str = "0.0.0.0"
     http_port: int = Field(8000, ge=1, le=65535)
     log_level: Literal["critical", "error", "warning", "info", "debug"] = "info"
-    request_deadline_seconds: float = Field(120.0, gt=0)
+    request_deadline_seconds: float = Field(240.0, gt=0)
     session_ttl_seconds: float = Field(1800.0, gt=0)
     country: Literal["KR", "JP"] = "KR"
     queryforge_endpoint: AnyHttpUrl = "http://127.0.0.1:8080/mcp"
     queryforge_data_base_url: AnyHttpUrl = "http://127.0.0.1:8080"
     queryforge_api_key: SecretStr
     queryforge_timeout_seconds: float = Field(5.0, gt=0)
-    agent_max_tool_calls: int = Field(3, gt=0)
-    agent_recovery_budget: int = Field(1, ge=0)
+    agent_max_tool_calls: int = Field(8, gt=0)
+    agent_recovery_budget: int = Field(3, ge=0)
     agent_preview_rows: int = Field(5, ge=1, le=100)
     llm_provider: Literal["ollama"] = "ollama"
     ollama_base_url: AnyHttpUrl = "http://127.0.0.1:11434"
     ollama_model: str = Field("gemma4:26b", min_length=1, max_length=128)
     ollama_request_timeout_seconds: float = Field(120.0, gt=0)
     ollama_num_ctx: int = Field(8192, gt=0)
-    ollama_temperature: float = Field(1.0, ge=0)
+    ollama_temperature: float = Field(0.2, ge=0)
     ollama_top_p: float = Field(0.95, ge=0, le=1)
     ollama_top_k: int = Field(64, gt=0)
     enable_thinking: bool = False

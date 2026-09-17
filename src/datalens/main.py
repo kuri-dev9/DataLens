@@ -42,6 +42,7 @@ def create_app():
         max_tool_calls=settings.agent_max_tool_calls,
         recovery_budget=settings.agent_recovery_budget,
         preview_rows=settings.agent_preview_rows,
+        timezone=settings.timezone,
     )
     chat = ChatApplicationService(sessions, agent)
     return build_app(
@@ -57,7 +58,7 @@ def create_app():
 
 def main() -> None:
     settings = get_settings()
-    configure_logging()
+    configure_logging(settings.log_level.upper())
     uvicorn.run(
         create_app(),
         host=settings.http_host,

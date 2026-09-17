@@ -77,12 +77,21 @@ def error_response(
     retryable: bool = False,
     session_id: str | None = None,
     details: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+    datasets: list[dict[str, Any]] | None = None,
+    warnings: list[Any] | None = None,
 ) -> JSONResponse:
     payload = {
             "request_id": request.state.request_id,
             "status": "failed",
             "error": {"code": code, "message": message, "retryable": retryable, "details": details},
         }
+    if metadata is not None:
+        payload["metadata"] = metadata
+    if datasets is not None:
+        payload["datasets"] = datasets
+    if warnings is not None:
+        payload["warnings"] = warnings
     if session_id is not None:
         payload["session_id"] = session_id
     return JSONResponse(payload, status_code=status)
@@ -133,19 +142,34 @@ def sse_response(events: AsyncIterator[bytes]) -> StreamingResponse:
     )
 
 
-def agent_error_response(request: Request, exc: Exception, session_id: str) -> JSONResponse:
+def agent_error_response(request: Request, exc: Exception, session_id: str, started: float | None = None) -> JSONResponse:
+    failed_step = getattr(exc, "failed_step", None)
+    metadata = {
+        "duration_ms": int((time.monotonic() - started) * 1000) if started is not None else 0,
+        "tool_calls": getattr(exc, "tool_calls", 0),
+        "recovery_count": getattr(exc, "recovery_count", 0),
+        "stop_reason": "failed",
+        "failed_step": failed_step,
+    }
+    # 실패 전에 확보한 데이터셋은 그대로 돌려준다.
+    datasets = [dataset.public() for dataset in getattr(exc, "datasets", ())]
+    warnings = list(getattr(exc, "warnings", ()))
+
+    def failed(code: str, message: str, status: int, *, retryable: bool = False, details: dict[str, Any] | None = None) -> JSONResponse:
+        enriched = {**(details or {}), "failed_step": failed_step} if failed_step else details
+        return error_response(request, code, message, status, retryable=retryable, details=enriched, session_id=session_id, metadata=metadata, datasets=datasets, warnings=warnings)
     if isinstance(exc, AgentNotReady):
-        return error_response(request, "DL_AGENT_NOT_READY", "Agent is not available", 503, retryable=True, session_id=session_id)
+        return failed("DL_AGENT_NOT_READY", "Agent is not available", 503, retryable=True)
     if isinstance(exc, AgentLimitError):
-        return error_response(request, "DL_AGENT_LIMIT", "Agent execution limit reached", 422, session_id=session_id)
+        return failed("DL_AGENT_LIMIT", "Agent execution limit reached", 422)
     if isinstance(exc, AgentPolicyError):
-        return error_response(request, "DL_AGENT_INVALID_TOOL", "Agent requested an invalid tool", 422, session_id=session_id)
+        return failed("DL_AGENT_INVALID_TOOL", "Agent requested an invalid tool", 422)
     if isinstance(exc, AgentTimeoutError):
-        return error_response(request, "DL_UPSTREAM_TIMEOUT", "Request processing timed out", 504, retryable=True, session_id=session_id)
+        return failed("DL_UPSTREAM_TIMEOUT", "Request processing timed out", 504, retryable=True)
     if isinstance(exc, AgentUpstreamUnavailable):
-        return error_response(request, "DL_UPSTREAM_UNAVAILABLE", "Upstream service is unavailable", 503, retryable=True, session_id=session_id)
+        return failed("DL_UPSTREAM_UNAVAILABLE", "Upstream service is unavailable", 503, retryable=True)
     if isinstance(exc, AgentInvalidUpstreamResponse):
-        return error_response(request, "DL_UPSTREAM_INVALID_RESPONSE", "Upstream service returned an invalid response", 502, session_id=session_id)
+        return failed("DL_UPSTREAM_INVALID_RESPONSE", "Upstream service returned an invalid response", 502)
     if isinstance(exc, AgentQueryRejected):
         failure = exc.failure
         details = None
@@ -155,16 +179,14 @@ def agent_error_response(request: Request, exc: Exception, session_id: str) -> J
                 "hint": failure.hint,
                 **failure.safe_metadata,
             }
-        return error_response(
-            request,
+        return failed(
             "DL_QUERY_REJECTED",
             "The data request was rejected",
             422,
             retryable=failure.retryable if failure is not None else False,
             details=details,
-            session_id=session_id,
         )
-    return error_response(request, "DL_INTERNAL_ERROR", "Internal error", 500, session_id=session_id)
+    return failed("DL_INTERNAL_ERROR", "Internal error", 500)
 
 
 class RequestIdMiddleware:
@@ -365,6 +387,7 @@ def build_app(
             return error_response(request, "DL_SESSION_NOT_FOUND", "Session not found", 404)
         except SessionBusy:
             return error_response(request, "DL_SESSION_BUSY", "Session is processing another turn", 409, retryable=True, session_id=session_id)
+        turn_started = time.monotonic()
         if wants_sse(request):
             async def events() -> AsyncIterator[bytes]:
                 queue: asyncio.Queue[tuple[str, dict[str, Any]] | None] = asyncio.Queue()
@@ -387,7 +410,7 @@ def build_app(
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
-                        await emit("error", json.loads(agent_error_response(request, exc, session_id).body))
+                        await emit("error", json.loads(agent_error_response(request, exc, session_id, turn_started).body))
                     finally:
                         sessions.end_turn(session_id)
                         await queue.put(None)
@@ -415,23 +438,18 @@ def build_app(
             result = await handler.handle(session, parsed.message, request.state.request_id, deadline)
             sessions.touch(session_id)
             return JSONResponse(result)
-        except AgentNotReady:
-            return error_response(request, "DL_AGENT_NOT_READY", "Agent is not available", 503, retryable=True, session_id=session_id)
-        except AgentLimitError:
-            return error_response(request, "DL_AGENT_LIMIT", "Agent execution limit reached", 422, session_id=session_id)
-        except AgentPolicyError:
-            return error_response(request, "DL_AGENT_INVALID_TOOL", "Agent requested an invalid tool", 422, session_id=session_id)
-        except AgentTimeoutError:
-            return error_response(request, "DL_UPSTREAM_TIMEOUT", "Request processing timed out", 504, retryable=True, session_id=session_id)
-        except AgentUpstreamUnavailable:
-            return error_response(request, "DL_UPSTREAM_UNAVAILABLE", "Upstream service is unavailable", 503, retryable=True, session_id=session_id)
-        except AgentInvalidUpstreamResponse:
-            return error_response(request, "DL_UPSTREAM_INVALID_RESPONSE", "Upstream service returned an invalid response", 502, session_id=session_id)
-        except AgentQueryRejected as exc:
-            return agent_error_response(request, exc, session_id)
-        except AgentInternalError:
-            return error_response(request, "DL_INTERNAL_ERROR", "Internal error", 500, session_id=session_id)
-        except Exception:
+        except (
+            AgentNotReady,
+            AgentLimitError,
+            AgentPolicyError,
+            AgentTimeoutError,
+            AgentUpstreamUnavailable,
+            AgentInvalidUpstreamResponse,
+            AgentQueryRejected,
+            AgentInternalError,
+        ) as exc:
+            return agent_error_response(request, exc, session_id, turn_started)
+        except Exception as exc:
             LOG.error(
                 "message_handler_failed",
                 extra={
@@ -442,7 +460,7 @@ def build_app(
                     "error_code": "DL_INTERNAL_ERROR",
                 },
             )
-            return error_response(request, "DL_INTERNAL_ERROR", "Internal error", 500, session_id=session_id)
+            return agent_error_response(request, exc, session_id, turn_started)
         finally:
             sessions.end_turn(session_id)
 

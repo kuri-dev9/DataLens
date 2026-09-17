@@ -437,7 +437,7 @@ def test_err_ac_n1_n2_n4_query_rejection_preserves_safe_hint_and_retryable(setti
         hint='Use {"kind":"not_partitioned"}',
         safe_metadata={"table": "PM_CEI_PGW_5M", "expected_kind": "not_partitioned"},
     )
-    app, _ = wired(settings, FakeAgent(AgentQueryRejected(failure)))
+    app, _ = wired(settings, FakeAgent(AgentQueryRejected(failure, tool_calls=2, recovery_count=1)))
     with TestClient(app) as client:
         session_id = create(client)
         response = client.post(
@@ -455,6 +455,10 @@ def test_err_ac_n1_n2_n4_query_rejection_preserves_safe_hint_and_retryable(setti
             "expected_kind": "not_partitioned",
         },
     }
+    assert response.json()["metadata"]["stop_reason"] == "failed"
+    assert response.json()["metadata"]["duration_ms"] >= 0
+    assert response.json()["metadata"]["tool_calls"] == 2
+    assert response.json()["metadata"]["recovery_count"] == 1
     assert "internal upstream message" not in response.text
     assert "SELECT " not in response.text
 
@@ -495,3 +499,24 @@ def test_lifecycle_closes_provider_resource(settings) -> None:
     with TestClient(build_app(settings, readiness=ReadyProbe(), closeables=(resource,))):
         assert resource.closed is False
     assert resource.closed is True
+
+
+def test_err_partial_datasets_and_failed_step_survive_a_rejection(settings) -> None:
+    failure = QueryForgeFailure("PARTITION_SCOPE_TOO_WIDE", "out of range", True, hint="narrow the range")
+    rejected = AgentQueryRejected(failure, tool_calls=3, recovery_count=1)
+    rejected.datasets = (DatasetReference("ds_000000001", row_count=2),)
+    rejected.warnings = ({"code": "RESULT_TRUNCATED"},)
+    rejected.failed_step = {"index": 3, "tool": "query", "upstream_code": "PARTITION_SCOPE_TOO_WIDE"}
+    app, _ = wired(settings, FakeAgent(rejected))
+    with TestClient(app) as client:
+        session_id = create(client)
+        response = client.post(
+            f"/v1/sessions/{session_id}/messages", headers=HEADERS, json={"message": "어제 트래픽"}
+        )
+    body = response.json()
+    assert response.status_code == 422
+    assert [dataset["dataset_id"] for dataset in body["datasets"]] == ["ds_000000001"]
+    assert body["warnings"] == [{"code": "RESULT_TRUNCATED"}]
+    assert body["metadata"]["failed_step"] == {"index": 3, "tool": "query", "upstream_code": "PARTITION_SCOPE_TOO_WIDE"}
+    assert body["error"]["details"]["upstream_code"] == "PARTITION_SCOPE_TOO_WIDE"
+    assert body["error"]["details"]["failed_step"]["tool"] == "query"
