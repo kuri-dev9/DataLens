@@ -105,6 +105,8 @@ class AgentResult:
     tool_calls: int
     recovery_count: int
     updated_session: Session
+    # 성공한 도구 호출만 담는다. 다음 번 같은 질문에서 탐색을 건너뛰기 위한 재료다.
+    plan: tuple[dict[str, Any], ...] = ()
 
 
 class BoundedAgent:
@@ -151,6 +153,7 @@ class BoundedAgent:
         message: str,
         deadline: float,
         event_sink: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
+        hints: str | None = None,
     ) -> AgentResult:
         self._remaining(deadline)
         try:
@@ -158,7 +161,8 @@ class BoundedAgent:
         except (TimeoutError, QueryForgeUnavailable) as exc:
             raise AgentUpstreamUnavailable("QueryForge capability discovery failed") from exc
         tool_map = {tool.name: tool for tool in tools}
-        messages = self._context(session, message)
+        messages = self._context(session, message, hints)
+        plan: list[dict[str, Any]] = []
         tool_count = 0
         recovery_count = 0
         qf_session_id = session.queryforge_session_id
@@ -209,6 +213,7 @@ class BoundedAgent:
                         tool_calls=tool_count,
                         recovery_count=recovery_count,
                         updated_session=updated,
+                        plan=tuple(plan),
                     )
 
                 messages.append(ProviderMessage("assistant", turn.content or "", turn.tool_calls))
@@ -300,6 +305,7 @@ class BoundedAgent:
                         raise AgentQueryRejected(failure, tool_calls=tool_count, recovery_count=recovery_count)
                     self._log_tool_call(session, tool_count, call.name, tool_arguments, True, elapsed_ms, False)
                     step.clear()
+                    plan.append({"tool": call.name, "intent": deepcopy(intent)})
                     bounded = self._bounded_tool_result(result)
                     if event_sink is not None:
                         await event_sink(
@@ -584,7 +590,7 @@ class BoundedAgent:
             preview=tuple(item for item in preview[: self._preview_rows] if isinstance(item, dict)),
         )
 
-    def _context(self, session: Session, message: str) -> list[ProviderMessage]:
+    def _context(self, session: Session, message: str, hints: str | None = None) -> list[ProviderMessage]:
         now = datetime.now(ZoneInfo(self._timezone))
         state = {
             "now": now.isoformat(timespec="seconds"),
@@ -598,6 +604,8 @@ class BoundedAgent:
             ProviderMessage("system", load_system_prompt(session.locale)),
             ProviderMessage("system", f"DataLens session context: {json.dumps(state, ensure_ascii=False)}"),
         ]
+        if hints:
+            messages.append(ProviderMessage("system", f"DataLens memory:\n{hints}"))
         for item in session.turn_state[-6:]:
             role = item.get("role")
             content = item.get("content")

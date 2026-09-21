@@ -38,6 +38,15 @@ class Settings(BaseSettings):
     ollama_top_p: float = Field(0.95, ge=0, le=1)
     ollama_top_k: int = Field(64, gt=0)
     enable_thinking: bool = False
+    memory_enabled: bool = True
+    memory_path: str = "/var/lib/datalens/memory.sqlite3"
+    embedding_model: str = Field("bge-m3", min_length=1, max_length=128)
+    memory_recipe_limit: int = Field(3, ge=0, le=10)
+    memory_term_limit: int = Field(5, ge=0, le=20)
+    memory_threshold: float = Field(0.55, ge=0, le=1)
+    memory_merge_threshold: float = Field(0.93, ge=0, le=1)
+    memory_max_recipes: int = Field(500, gt=0)
+    memory_timeout_seconds: float = Field(5.0, gt=0)
     cors_origins: str = "*"
     api_key: SecretStr
 

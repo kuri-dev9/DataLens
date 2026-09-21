@@ -14,6 +14,11 @@ describe_table 応答の partition に data_range（または upper_bound）が�
 保有区間が不明な状態で照会結果が0件なら、結果を捏造せず、その期間にデータが無いことを伝え、照会可能な期間をユーザーに確認してください。
 PARTITION_SCOPE_TOO_WIDE と outside_loaded_partition_range が返ったら、details の upper_bound 直前の区間に絞って再照会してください。
 
+[記憶の活用]
+DataLens memory が与えられたら、そこから始めてください。過去の解法に出たテーブルと列が質問に合えば、schema 探索を省いて直接 query を呼んでください。
+期間や対象は今回の質問に合わせて変えてください。過去の値をそのままコピーしないでください。
+ツールが UNKNOWN_TABLE や UNKNOWN_COLUMN で拒否したら記憶が古いということなので、schema で確認してから進めてください。
+
 [query 引数の書き方]
 select には列名のみを入れてください。{"column":"PGW_ID"} の形式です。SUM(X) AS Y のような SQL 式は拒否されます。
 集計は aggregations に {"function":"sum","column":"DATA_CEI_VALUE","alias":"TOTAL"} の形式で入れてください。function は小文字です。

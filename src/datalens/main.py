@@ -7,7 +7,10 @@ from datalens.application.agent import BoundedAgent
 from datalens.application.chat import ChatApplicationService
 from datalens.application.sessions import SessionService
 from datalens.config import get_settings
+from datalens.application.memory import MemoryService
 from datalens.infrastructure.ollama import OllamaProvider
+from datalens.infrastructure.ollama_embeddings import OllamaEmbedder
+from datalens.infrastructure.sqlite_memory import SqliteMemoryStore
 from datalens.infrastructure.queryforge_mcp import McpQueryForgeClient
 from datalens.infrastructure.session_cleanup import QueryForgeSessionCleanup
 from datalens.infrastructure.session_store import InMemorySessionStore
@@ -44,7 +47,19 @@ def create_app():
         preview_rows=settings.agent_preview_rows,
         timezone=settings.timezone,
     )
-    chat = ChatApplicationService(sessions, agent)
+    memory = None
+    if settings.memory_enabled:
+        memory = MemoryService(
+            SqliteMemoryStore(settings.memory_path),
+            OllamaEmbedder(settings.ollama_url(), settings.embedding_model),
+            recipe_limit=settings.memory_recipe_limit,
+            term_limit=settings.memory_term_limit,
+            threshold=settings.memory_threshold,
+            merge_threshold=settings.memory_merge_threshold,
+            max_recipes=settings.memory_max_recipes,
+            timeout_seconds=settings.memory_timeout_seconds,
+        )
+    chat = ChatApplicationService(sessions, agent, memory)
     return build_app(
         settings,
         session_service=sessions,
@@ -52,6 +67,7 @@ def create_app():
         llm_readiness=provider,
         message_handler=chat,
         queryforge_client=queryforge,
+        memory=memory,
         closeables=(provider,),
     )
 

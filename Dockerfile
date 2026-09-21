@@ -18,7 +18,8 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
 RUN groupadd --system datalens \
-    && useradd --system --gid datalens --home-dir /nonexistent --no-create-home datalens
+    && useradd --system --gid datalens --home-dir /nonexistent --no-create-home datalens \
+    && install -d -o datalens -g datalens /var/lib/datalens
 COPY --from=builder /wheels /wheels
 RUN python -m pip install --no-index --find-links=/wheels datalens==0.1.0 \
     && rm -rf /wheels

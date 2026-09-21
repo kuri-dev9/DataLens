@@ -133,3 +133,10 @@ def test_progress_trace_stays_one_line_per_step() -> None:
     assert "row.title=" in source
     assert "white-space:nowrap" in source and "text-overflow:ellipsis" in source
     assert 'what.textContent=`${label} → ${briefly(data.error?.code||"실패")}${retry}`' in source
+
+
+def test_memory_recall_is_shown_in_the_trace() -> None:
+    source = DEMO.read_text()
+    assert 'if(name==="memory")renderMemory(trace,data)' in source
+    assert "기억 참고:" in source
+    assert "과거 풀이 " in source and "용어 " in source

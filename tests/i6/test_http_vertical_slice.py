@@ -40,7 +40,7 @@ class FakeAgent:
         self.outcome = outcome
         self.calls = []
 
-    async def run(self, session, message, deadline, event_sink=None):
+    async def run(self, session, message, deadline, event_sink=None, hints=None):
         self.calls.append((session, message, deadline))
         if isinstance(self.outcome, Exception):
             raise self.outcome
@@ -535,7 +535,7 @@ def test_dataset_rows_are_reachable_while_the_turn_is_still_running(settings) ->
     bound: list[str | None] = []
 
     class Agent:
-        async def run(self, session, message, deadline, event_sink=None):
+        async def run(self, session, message, deadline, event_sink=None, hints=None):
             await event_sink(QUERYFORGE_SESSION_EVENT, {"application_session_id": "Q" * 22})
             bound.append(sessions.require(created.session_id).queryforge_session_id)
             await event_sink("dataset", {"dataset_id": "ds_000000001"})

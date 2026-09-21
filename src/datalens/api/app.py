@@ -8,7 +8,7 @@ import re
 import secrets
 import time
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Protocol
+from typing import Any, AsyncIterator, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.applications import Starlette
@@ -32,6 +32,7 @@ from datalens.application.agent import (
     AgentTimeoutError,
     AgentUpstreamUnavailable,
 )
+from datalens.application.memory import MemoryService
 from datalens.config import Settings
 from datalens.infrastructure.queryforge_mcp import McpQueryForgeClient
 from datalens.ports.queryforge import QueryForgeClient, QueryForgeHttpResult, QueryForgeUnavailable
@@ -61,6 +62,15 @@ class Readiness(Protocol):
 class MessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     message: str = Field(min_length=1, max_length=8192)
+
+
+class GlossaryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    term: str = Field(min_length=1, max_length=128)
+    locale: Literal["ko", "ja"] | None = None
+    table: str | None = Field(default=None, max_length=128)
+    columns: list[str] = Field(default_factory=list, max_length=30)
+    note: str | None = Field(default=None, max_length=512)
 
 
 class CreateSessionRequest(BaseModel):
@@ -298,6 +308,7 @@ def build_app(
     llm_readiness: Readiness | None = None,
     message_handler: MessageHandler | None = None,
     queryforge_client: QueryForgeClient | None = None,
+    memory: MemoryService | None = None,
     closeables: tuple[Any, ...] = (),
 ) -> Starlette:
     store = InMemorySessionStore(settings.session_ttl_seconds, settings.default_locale)
@@ -319,7 +330,7 @@ def build_app(
             with contextlib.suppress(Exception):
                 await sessions.shutdown_cleanup()
             closed: set[int] = set()
-            for resource in (*closeables, llm, queryforge):
+            for resource in (*closeables, *( (memory,) if memory is not None else () ), llm, queryforge):
                 if id(resource) in closed:
                     continue
                 closed.add(id(resource))
@@ -346,6 +357,7 @@ def build_app(
                 "checks": {
                     "queryforge": {"status": "ok" if queryforge_available else "unavailable"},
                     "llm": {"status": "ok" if llm_available else "unavailable"},
+                    "memory": {"status": "disabled" if memory is None else ("ok" if await memory.ready(settings.queryforge_timeout_seconds) else "unavailable")},
                 },
             },
             status_code=200 if available else 503,
@@ -467,6 +479,57 @@ def build_app(
     async def delete_session(request: Request) -> Response:
         await sessions.reap_expired()
         await sessions.delete(request.path_params["session_id"])
+        return Response(status_code=204)
+
+    def memory_unavailable(request: Request) -> JSONResponse:
+        return error_response(request, "DL_MEMORY_DISABLED", "Memory is not enabled", 503)
+
+    async def memory_recipes(request: Request) -> JSONResponse:
+        if memory is None:
+            return memory_unavailable(request)
+        locale = request.query_params.get("locale")
+        if locale not in {None, "ko", "ja"}:
+            return error_response(request, "DL_INVALID_LOCALE", "Unsupported locale", 400)
+        limit = min(int(request.query_params.get("limit", 50) or 50), 200)
+        recipes = memory.list_recipes(locale, limit=limit)
+        return JSONResponse({"recipes": [recipe.public() for recipe in recipes]})
+
+    async def memory_delete_recipe(request: Request) -> Response:
+        if memory is None:
+            return memory_unavailable(request)
+        memory.delete_recipe(request.path_params["recipe_id"])
+        return Response(status_code=204)
+
+    async def memory_terms(request: Request) -> JSONResponse:
+        if memory is None:
+            return memory_unavailable(request)
+        if request.method == "GET":
+            locale = request.query_params.get("locale")
+            if locale not in {None, "ko", "ja"}:
+                return error_response(request, "DL_INVALID_LOCALE", "Unsupported locale", 400)
+            limit = min(int(request.query_params.get("limit", 100) or 100), 500)
+            return JSONResponse({"terms": [entry.public() for entry in memory.list_terms(locale, limit=limit)]})
+        try:
+            parsed = GlossaryRequest.model_validate(await request.json())
+        except (ValueError, ValidationError):
+            return error_response(request, "DL_INVALID_REQUEST", "Invalid glossary request", 400)
+        entry = await memory.upsert_term(
+            parsed.term,
+            parsed.locale or settings.default_locale,
+            table=parsed.table,
+            columns=parsed.columns,
+            note=parsed.note,
+        )
+        if entry is None:
+            return error_response(
+                request, "DL_MEMORY_UNAVAILABLE", "Memory backend is unavailable", 503, retryable=True
+            )
+        return JSONResponse(entry.public(), status_code=201)
+
+    async def memory_delete_term(request: Request) -> Response:
+        if memory is None:
+            return memory_unavailable(request)
+        memory.delete_term(request.path_params["term_id"])
         return Response(status_code=204)
 
     def queryforge_session(
@@ -719,6 +782,10 @@ def build_app(
             Route("/v1/sessions/{session_id:str}/datasets/{dataset_id:str}/meta", dataset_meta, methods=["GET"]),
             Route("/v1/sessions/{session_id:str}/catalog/tables", catalog_tables, methods=["GET"]),
             Route("/v1/sessions/{session_id:str}/catalog/tables/{table:str}/columns", catalog_columns, methods=["GET"]),
+            Route("/v1/memory/recipes", memory_recipes, methods=["GET"]),
+            Route("/v1/memory/recipes/{recipe_id:int}", memory_delete_recipe, methods=["DELETE"]),
+            Route("/v1/memory/terms", memory_terms, methods=["GET", "POST"]),
+            Route("/v1/memory/terms/{term_id:int}", memory_delete_term, methods=["DELETE"]),
         ],
         lifespan=lifespan,
     )
