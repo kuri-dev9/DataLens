@@ -3,12 +3,36 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 | UI 개발 담당자 |
-| 작성 | 2026-09-14 (첫 서버 배포 리허설 직후) |
-| 서버 | `http://192.168.100.223:18121` |
+| 작성 | 2026-09-14 · 개정 2026-09-21 (진행 표시·학습 기능 반영) |
+| 서버 | `<BASE_URL>` — 별도 전달. 문서·코드에 적어두지 마세요 |
 | 상세 스펙 | `docs/API.md`, `DATALENS-API-FOR-AI.md` |
+| 로컬 개발 | `python3 scripts/mock_server.py` — 서버 접속 없이 개발 가능 |
 
 이 문서는 **읽고 판단하기 위한 것**입니다. 실제 구현에 필요한 정확한 스키마는
 `DATALENS-API-FOR-AI.md`를 코딩 에이전트에게 주세요.
+
+## 0. 서버 없이 먼저 시작하세요
+
+실제 서버 없이 UI를 완성할 수 있습니다. 목 서버가 같은 계약으로 응답합니다.
+
+```sh
+python3 scripts/mock_server.py          # http://localhost:18121
+```
+
+설치할 패키지가 없습니다(표준 라이브러리만 사용). 데모 화면도 같이 서빙하므로
+`http://localhost:18121/demo/` 를 열고 Base URL에 `http://localhost:18121`,
+API key에 `dev-key`를 넣으면 바로 동작합니다.
+
+질문 내용으로 시나리오를 고릅니다.
+
+| 질문에 포함 | 재현되는 흐름 |
+|---|---|
+| (아무 말) | schema → query → dataset → 토큰 스트리밍 → `done` |
+| `실패` | 도구 호출 중단 → `DL_AGENT_LIMIT` + `failed_step` |
+| `기억` | `memory` 이벤트로 탐색을 건너뛰는 흐름 |
+
+`--delay 5` 로 실제 서버의 느린 응답을 흉내 낼 수 있습니다. 실제 도구 호출 한
+건은 15~20초이므로, 로딩 UI는 그 속도로 확인해 보세요.
 
 ---
 
@@ -109,25 +133,95 @@ SQL로 바꿉니다. 그래서 잘못된 쿼리나 위험한 쿼리가 실행될
 **① 19초 동안 아무것도 안 나옵니다.**
 
 스트리밍을 쓴다고 바로 글자가 나오는 게 아닙니다. LLM이 질문을 읽고 생각하는
-시간(약 19초)이 먼저 있고, 그다음부터 글자가 흐릅니다. **이 19초를 메울 화면이 반드시
-필요합니다.** 진행 상황을 보여줄 재료는 서버가 줍니다 (`tool_call` 이벤트).
+시간(약 19초)이 먼저 있고, 그다음부터 글자가 흐릅니다. 도구 호출이 여러 번이면
+첫 글자까지 2분 넘게 걸리기도 합니다. **이 시간을 메울 화면이 반드시 필요합니다.**
+
+진행 상황은 서버가 `tool_call` 이벤트로 전부 알려줍니다. 각 이벤트에 무엇을 하려는지
+(`intent`), 어떻게 됐는지(`result` 또는 `error`), 다시 시도하는지(`recovery`)가 들어 있어
+그대로 한 줄씩 쌓으면 됩니다.
 
 ```
-[  ] 질문을 이해하는 중...          ← start 이벤트 직후
-[▸] 테이블 정보를 조회하는 중...    ← tool_call 이벤트
-[▸] 데이터를 가져오는 중...         ← tool_call 이벤트
-안녕하세요, 조회 결과는...          ← token 이벤트 시작
+↺ 기억 참고: 과거 풀이 1건 — "PGW별 사용량 구해줄래?" (0.89)
+✓ 1. 테이블 목록 → 테이블 50개 · 일부 잘림
+✓ 2. PM_CEI_PGW_5M 구조 → 컬럼 90개
+✗ 3. PM_CEI_PGW_5M 조회 → INVALID_TOOL_ARGUMENTS · 재시도 1/5
+▸ 4. PM_CEI_PGW_5M 조회 · PGW_ID별 (2025-02-04)
 ```
+
+`demo/datalens-demo.html`의 `renderTrace()`가 이 렌더링의 참조 구현입니다.
+
+**실패해도 이 줄들은 지우지 마세요.** 어디까지 갔고 무엇이 막혔는지가 사용자에게
+가장 중요한 정보입니다. 오류 응답의 `metadata.failed_step`에 중단 지점이
+`{index, tool, upstream_code, intent}`로 들어 있습니다.
 
 **② 타임아웃을 넉넉히 잡으세요.**
 
-기본 HTTP 타임아웃(보통 30초)으로는 끊깁니다. **최소 120초, 권장 300초**로 설정하세요.
-복잡한 질문은 LLM이 여러 번 왕복해서 1분 넘게 걸립니다.
+기본 HTTP 타임아웃(보통 30초)으로는 끊깁니다. **최소 180초, 권장 300초**로 설정하세요.
+실측에서 도구 호출 9회짜리 질문이 187초 걸렸습니다. 서버는 15초마다 `: ping`
+주석 줄을 보내 연결을 유지하므로, SSE 파서가 주석 줄을 건너뛰도록 해야 합니다.
+
+**②-1 실패해도 앞서 나온 결과는 살아 있습니다.**
+
+오류 응답에도 `datasets`와 `warnings`가 그대로 들어옵니다. 토큰이 일부라도 왔거나
+표가 하나라도 그려졌다면 지우지 말고 "응답이 중단되었습니다" 표시만 덧붙이세요.
 
 **③ 표는 기다릴 필요가 없습니다.**
 
 `dataset` 이벤트가 오면 그 즉시 `rows`를 호출해 표를 채우세요. LLM이 아직 문장을 쓰고
 있어도 상관없습니다. 사용자는 설명보다 숫자를 먼저 보고 싶어 하는 경우가 많습니다.
+
+---
+
+## 4-1. SSE 이벤트 표
+
+`POST /v1/sessions/{sid}/messages` 에 `accept: text/event-stream` 을 주면 아래 순서로
+옵니다. 모르는 이벤트 이름은 무시하세요 — 앞으로 늘어날 수 있습니다.
+
+| 이벤트 | 시점 | 쓰는 법 |
+|---|---|---|
+| `start` | 항상 첫 번째 | `request_id`, `session_id` 기록 |
+| `memory` | 과거 풀이를 참고할 때만 | 트레이스에 "기억 참고" 한 줄 |
+| `tool_call` | 도구 호출마다 여러 번 | 진행 트레이스 (아래 참조) |
+| `dataset` | 조회 결과가 생길 때 | 즉시 `rows` 호출해 표 렌더 |
+| `token` | 답변 생성 중 계속 | 말풍선에 이어붙이기 |
+| `done` | 정상 종료 | `metadata`로 소요 시간 표시 |
+| `error` | 실패 종료 | `error.code` + `metadata.failed_step` |
+| `: ping` | 15초마다 | 주석 줄. 건너뛰기 |
+
+`done` 또는 `error` 중 **하나만** 옵니다. 둘 다 안 왔는데 스트림이 끝나면 비정상
+종료이므로 "응답이 중단되었습니다"로 처리하세요.
+
+### `tool_call` 이벤트
+
+`status`가 세 가지입니다.
+
+```jsonc
+// 시작
+{"index":3, "tool":"query", "status":"started",
+ "intent":{"table":"PM_CEI_PGW_5M", "group_by":["PGW_ID"],
+           "aggregations":["sum(DATA_CEI_VALUE)"],
+           "partition_scope":{"kind":"time_range","column":"EVENT_TIME",
+                              "from":"2025-02-04T00:00:00","to":"2025-02-04T23:59:59"}}}
+
+// 성공
+{"index":3, "tool":"query", "status":"completed", "elapsed_ms":146,
+ "intent":{...}, "result":{"dataset_id":"ds_000000008", "row_count":128}}
+
+// 실패 (같은 index로 다시 오지 않습니다. 재시도는 다음 index로 옵니다)
+{"index":3, "tool":"query", "status":"rejected", "elapsed_ms":0,
+ "intent":{...},
+ "error":{"code":"INVALID_TOOL_ARGUMENTS", "detail":"aggregations/0: 'alias' is a required property"},
+ "recovery":{"attempt":1, "budget":5, "will_retry":true}}
+```
+
+`intent`는 도구마다 키가 다릅니다. `schema`는 `action`/`table`/`name_pattern`,
+`query`는 위 예시, `relationship`은 `from_table`/`to_table`입니다. **없는 키는 그냥
+없습니다.** 있는 것만 골라 문장으로 만드세요.
+
+`error.detail`은 모델용 원문이라 길 수 있습니다. 화면에는 `error.code`만 쓰고 원문은
+툴팁이나 접기로 두는 편이 읽기 좋습니다.
+
+`recovery.will_retry`가 `false`면 그 턴은 곧 `error`로 끝납니다.
 
 ---
 
@@ -232,7 +326,7 @@ API 키를 프론트엔드 코드에 넣지 마세요. 백엔드를 한 겹 두�
 
 ```bash
 KEY=<발급받은 키>
-B=http://192.168.100.223:18121
+B=<BASE_URL>          # 별도 전달받은 주소
 
 # 1. 세션 만들기
 SID=$(curl -s -X POST "$B/v1/sessions" -H "x-api-key: $KEY" \

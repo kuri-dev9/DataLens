@@ -5,7 +5,7 @@
 
 | 항목 | 값 |
 |---|---|
-| Base URL | `http://192.168.100.223:18121` |
+| Base URL | `<BASE_URL>` (별도 전달) |
 | 인증 | 모든 요청에 `x-api-key` 헤더 (`/v1/health` 제외) |
 | Content-Type | `application/json` |
 | 문자셋 | UTF-8 |

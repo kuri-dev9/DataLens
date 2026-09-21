@@ -34,13 +34,13 @@
     <form id="composer" class="composer"><input id="messageInput" autocomplete="off" placeholder="질문을 입력하세요"><button id="sendBtn" class="primary">전송</button><button id="cancelBtn" type="button" class="primary danger" hidden>취소</button></form>
     <div class="notice">PoC 데모: 이력은 브라우저 세션에만 저장되며 새로고침 시 유지, 탭을 닫으면 사라집니다. 실서비스에서는 서버 측 영속화가 필요합니다.</div>
   </aside>
-  <dialog id="settingsDialog"><form id="settingsForm" class="modal"><h2>DataLens 연결 설정</h2><p>API 키는 이 브라우저 탭의 sessionStorage에만 보관됩니다.</p><label class="field"><span>Base URL</span><input id="baseInput" type="url" required value="http://192.168.100.223:18121"></label><label class="field"><span>API key</span><input id="keyInput" type="password" required autocomplete="off"></label><div class="modal-actions"><button id="modalCancel" type="button" class="pill">취소</button><button class="primary">저장</button></div></form></dialog>
+  <dialog id="settingsDialog"><form id="settingsForm" class="modal"><h2>DataLens 연결 설정</h2><p>API 키는 이 브라우저 탭의 sessionStorage에만 보관됩니다.</p><label class="field"><span>Base URL</span><input id="baseInput" type="url" required placeholder="http://localhost:18121"></label><label class="field"><span>API key</span><input id="keyInput" type="password" required autocomplete="off"></label><div class="modal-actions"><button id="modalCancel" type="button" class="pill">취소</button><button class="primary">저장</button></div></form></dialog>
   <script>
   (() => {
     "use strict";
     // Agent 확장 지점: 탭마다 config/session/history/controller를 독립 보관한다.
     const agents = {
-      datalens: {id:"datalens", label:"DataLens", base:"http://192.168.100.223:18121", apiKey:"", locale:"ko", session:null, history:[], datasets:[], controller:null}
+      datalens: {id:"datalens", label:"DataLens", base:"", apiKey:"", locale:"ko", session:null, history:[], datasets:[], controller:null}
     };
     let active = agents.datalens, lastRetry = null, catalogRows = [], debugLogs = [], debugOpen = false, debugFrame = 0;
     const $ = id => document.getElementById(id);
@@ -106,7 +106,7 @@
     async function api(path, options={}, retry=true){const url=active.base+path,requestHeaders={...headers(),...(options.headers||{})},method=options.method||"GET";let requestBody=options.body??null;try{if(typeof requestBody==="string")requestBody=JSON.parse(requestBody);}catch{}const log=debugStart(method,url,requestHeaders,requestBody,"json");try{const response=await fetch(url,{...options,headers:requestHeaders});let body=null;if(response.headers.get("content-type")?.includes("json"))body=await response.json();const raw={status:response.status,headers:Object.fromEntries(response.headers.entries()),body};if(!response.ok){debugFinish(log,raw,body);const code=body?.error?.code;if(code==="DL_SESSION_NOT_FOUND"&&retry){await createSession();return api(path.replace(/\/v1\/sessions\/[^/]+/,`/v1/sessions/${active.session.session_id}`),options,false);}throw Object.assign(new Error(code||"HTTP_ERROR"),{payload:body,status:response.status});}debugFinish(log,raw);return body;}catch(error){if(!log.response)debugFinish(log,null,error?.payload||{code:error.message,message:error.message});throw error;}}
     async function createSession(){if(!active.apiKey){openSettings();throw new Error("NO_CONFIG");}const body=await api("/v1/sessions",{method:"POST",body:JSON.stringify({locale:active.locale})},false);active.session=body;save();updateExpiry();return body;}
     async function ensureSession(){if(!active.session||Date.parse(active.session.expires_at)<=Date.now())await createSession();return active.session;}
-    function openSettings(){ $("baseInput").value=active.base;$("keyInput").value=active.apiKey;$("settingsDialog").showModal(); }
+    function openSettings(){ $("baseInput").value=active.base||"";$("keyInput").value=active.apiKey;$("settingsDialog").showModal(); }
     function addBubble(role,text=""){const box=document.createElement("div");box.className=`bubble ${role}`;box.textContent=text;$("messages").append(box);$("chatView").scrollTop=$("chatView").scrollHeight;return box;}
     const upstreamMessages={MISSING_PARTITION_SCOPE:"조회 범위 지정에 문제가 있습니다.",INVALID_PARTITION_SCOPE:"조회 범위 지정에 문제가 있습니다.",PARTITION_SCOPE_TOO_WIDE:"조회 기간이 보유 구간을 벗어났습니다.",UNKNOWN_TABLE:"해당 테이블을 찾을 수 없습니다.",UNKNOWN_COLUMN:"해당 컬럼을 찾을 수 없습니다.",TABLE_NOT_ALLOWED:"허용되지 않은 데이터 요청입니다.",COLUMN_NOT_ALLOWED:"허용되지 않은 데이터 요청입니다.",POLICY_VIOLATION:"허용되지 않은 데이터 요청입니다.",RESULT_TOO_LARGE:"결과가 너무 많습니다. 조건을 좁혀 주세요.",QUERY_TIMEOUT:"조회 시간이 초과되었습니다."};
     const errorPayload=error=>error?.payload||error||{};
@@ -132,7 +132,7 @@
     $("composer").onsubmit=event=>{event.preventDefault();const text=$("messageInput").value.trim();if(!text)return;$("messageInput").value="";sendMessage(text)};$("cancelBtn").onclick=()=>active.controller?.abort();$("newBtn").onclick=()=>newConversation().catch(error=>addError(error,newConversation));$("catalogBtn").onclick=showCatalog;$("backBtn").onclick=showChat;$("catalogSearch").oninput=renderCatalog;
     $("debugToggle").onclick=()=>{debugOpen=!debugOpen;$("debugConsole").classList.toggle("collapsed",!debugOpen);$("debugToggle").setAttribute("aria-expanded",debugOpen);$("debugToggle").textContent=`${debugOpen?"▾":"▸"} 디버그 콘솔`;debugSave();};$("copyLogs").onclick=copyLogs;$("clearLogs").onclick=()=>{debugLogs=[];debugSave();debugRender();};
     async function setLocale(locale){if(active.locale===locale)return;active.locale=locale;active.session=null;updateLocale();save();try{await createSession();}catch(error){addError(error,()=>setLocale(locale));}}$("koBtn").onclick=()=>setLocale("ko");$("jaBtn").onclick=()=>setLocale("ja");
-    restore();if(!active.apiKey)openSettings();setInterval(updateExpiry,30000);
+    restore();if(!active.apiKey||!active.base)openSettings();setInterval(updateExpiry,30000);
   })();
   </script>
 </body>

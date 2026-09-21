@@ -1,3 +1,4 @@
+import re
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -140,3 +141,12 @@ def test_memory_recall_is_shown_in_the_trace() -> None:
     assert 'if(name==="memory")renderMemory(trace,data)' in source
     assert "기억 참고:" in source
     assert "과거 풀이 " in source and "용어 " in source
+
+
+def test_demo_ships_without_an_internal_address() -> None:
+    # UI 개발자에게 그대로 건네는 파일이다. 내부망 주소가 남아 있으면 안 된다.
+    source = DEMO.read_text()
+    assert not re.search(r"\b(?:10|192\.168|172\.(?:1[6-9]|2\d|3[01])|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7]))\.\d", source)
+    assert ".ts.net" not in source
+    assert 'base:""' in source  # 주소는 설정 창에서 입력받는다
+    assert 'if(!active.apiKey||!active.base)openSettings()' in source
