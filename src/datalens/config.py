@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     memory_enabled: bool = True
     memory_path: str = "/var/lib/datalens/memory.sqlite3"
     embedding_model: str = Field("bge-m3", min_length=1, max_length=128)
+    # 비워두면 LLM과 같은 Ollama를 쓴다. CPU 전용 인스턴스를 따로 띄웠다면 그 주소를 넣는다.
+    embedding_base_url: AnyHttpUrl | None = None
+    embedding_api: Literal["ollama", "openai"] = "ollama"
+    embedding_api_key: SecretStr | None = None
     memory_recipe_limit: int = Field(3, ge=0, le=10)
     memory_term_limit: int = Field(5, ge=0, le=20)
     memory_threshold: float = Field(0.55, ge=0, le=1)
@@ -71,6 +75,9 @@ class Settings(BaseSettings):
 
     def ollama_url(self) -> str:
         return str(self.ollama_base_url).rstrip("/")
+
+    def embedding_url(self) -> str:
+        return str(self.embedding_base_url).rstrip("/") if self.embedding_base_url else self.ollama_url()
 
 
 @lru_cache

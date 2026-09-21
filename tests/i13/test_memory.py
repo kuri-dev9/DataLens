@@ -6,7 +6,7 @@ import pytest
 
 from datalens.application.memory import MemoryService, plan_from_events, render_hints
 from datalens.domain.memory import GlossaryEntry, PlanStep, Recall, Recipe
-from datalens.infrastructure.ollama_embeddings import normalize
+from datalens.infrastructure.embeddings import normalize
 from datalens.infrastructure.sqlite_memory import SqliteMemoryStore
 from datalens.ports.memory import EmbeddingUnavailable
 
@@ -275,3 +275,84 @@ def test_memory_endpoints_report_when_memory_is_off() -> None:
         response = client.get("/v1/memory/recipes", headers={"x-api-key": "k"})
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "DL_MEMORY_DISABLED"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("api", "path", "body"),
+    [
+        ("ollama", "/api/embed", {"embeddings": [[3.0, 4.0]]}),
+        ("ollama", "/api/embed", {"embedding": [3.0, 4.0]}),
+        ("openai", "/v1/embeddings", {"data": [{"embedding": [3.0, 4.0]}]}),
+    ],
+)
+async def test_embedder_speaks_both_api_shapes(api, path, body) -> None:
+    import httpx
+
+    from datalens.infrastructure.embeddings import HttpEmbedder
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=body)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    embedder = HttpEmbedder("http://embed:11435/", "bge-m3", api=api, client=client)
+    vector = await embedder.embed("PGW 사용량", 5.0)
+    await client.aclose()
+
+    assert seen[0].url.path == path
+    assert vector == (0.6, 0.8)  # 저장 전 단위 벡터로 정규화된다
+
+
+@pytest.mark.anyio
+async def test_embedder_can_point_at_a_separate_server() -> None:
+    import httpx
+
+    from datalens.infrastructure.embeddings import HttpEmbedder
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"embeddings": [[1.0, 0.0]]})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    embedder = HttpEmbedder("http://cpu-ollama:11435", "bge-m3", api_key="secret", client=client)
+    await embedder.embed("질문", 5.0)
+    await client.aclose()
+
+    assert str(seen[0].url) == "http://cpu-ollama:11435/api/embed"
+    assert seen[0].headers["authorization"] == "Bearer secret"
+
+
+@pytest.mark.anyio
+async def test_embedder_reports_unavailable_instead_of_raising_transport_errors() -> None:
+    import httpx
+
+    from datalens.infrastructure.embeddings import HttpEmbedder
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route", request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    embedder = HttpEmbedder("http://down:11435", "bge-m3", client=client)
+    with pytest.raises(EmbeddingUnavailable):
+        await embedder.embed("질문", 5.0)
+    assert await embedder.ready(5.0) is False
+    await client.aclose()
+
+
+def test_embedding_url_falls_back_to_the_llm_host() -> None:
+    from datalens.config import Settings
+
+    shared = Settings(api_key="k", queryforge_api_key="q", ollama_base_url="http://gpu:11434")
+    assert shared.embedding_url() == "http://gpu:11434"
+    split = Settings(
+        api_key="k",
+        queryforge_api_key="q",
+        ollama_base_url="http://gpu:11434",
+        embedding_base_url="http://cpu:11435/",
+    )
+    assert split.embedding_url() == "http://cpu:11435"

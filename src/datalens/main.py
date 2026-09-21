@@ -9,7 +9,7 @@ from datalens.application.sessions import SessionService
 from datalens.config import get_settings
 from datalens.application.memory import MemoryService
 from datalens.infrastructure.ollama import OllamaProvider
-from datalens.infrastructure.ollama_embeddings import OllamaEmbedder
+from datalens.infrastructure.embeddings import HttpEmbedder
 from datalens.infrastructure.sqlite_memory import SqliteMemoryStore
 from datalens.infrastructure.queryforge_mcp import McpQueryForgeClient
 from datalens.infrastructure.session_cleanup import QueryForgeSessionCleanup
@@ -51,7 +51,12 @@ def create_app():
     if settings.memory_enabled:
         memory = MemoryService(
             SqliteMemoryStore(settings.memory_path),
-            OllamaEmbedder(settings.ollama_url(), settings.embedding_model),
+            HttpEmbedder(
+                settings.embedding_url(),
+                settings.embedding_model,
+                api=settings.embedding_api,
+                api_key=settings.embedding_api_key.get_secret_value() if settings.embedding_api_key else None,
+            ),
             recipe_limit=settings.memory_recipe_limit,
             term_limit=settings.memory_term_limit,
             threshold=settings.memory_threshold,
