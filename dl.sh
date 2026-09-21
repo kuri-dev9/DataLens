@@ -124,7 +124,7 @@ Usage: $0 <command> [args]
 운영
   preflight              설정 검증 (.env 필수값, compose 문법)
   up | down | restart    기동 / 정지 / 재시작
-  rebuild                재빌드 후 기동
+  rebuild [옵션|서비스]  재빌드 후 기동 (예: rebuild datalens, rebuild --pull)
   status | logs          컨테이너 상태 / 로그 follow
   health                 health + ready 확인
   smoke                  세션 생성 검증
@@ -171,7 +171,9 @@ case "${command}" in
   up) preflight; compose up -d --no-build ;;
   down) compose down ;;
   restart) compose restart ;;
-  rebuild) preflight; compose build --pull; compose up -d ;;
+  # --pull은 기본값이 아니다. 베이스 이미지를 매번 다시 받으면 Docker Hub rate limit(429)에 걸린다.
+  # 베이스 이미지를 갱신하려면 ./dl.sh rebuild --pull, 특정 서비스만 빌드하려면 ./dl.sh rebuild datalens
+  rebuild) preflight; shift; compose build "$@"; compose up -d ;;
   status) compose ps ;;
   logs) compose logs --tail=200 -f datalens ;;
   health) health ;;
