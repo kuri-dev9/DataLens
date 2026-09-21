@@ -20,7 +20,7 @@ def test_config_defaults_and_explicit_secrets() -> None:
     assert settings.ollama_top_k == 64
     assert settings.enable_thinking is False
     assert settings.agent_max_tool_calls == 12
-    assert settings.agent_recovery_budget == 3
+    assert settings.agent_recovery_budget == 5
     assert "api-secret" not in repr(settings)
     assert "qf-secret" not in repr(settings)
 

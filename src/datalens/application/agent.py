@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
 from jsonschema import Draft202012Validator
+from jsonschema.exceptions import relevance
 
 from datalens.domain.session import Session
 from datalens.prompts import load_system_prompt
@@ -346,9 +347,37 @@ class BoundedAgent:
         errors = sorted(Draft202012Validator(tool.input_schema).iter_errors(arguments), key=lambda error: list(error.path))
         if not errors:
             return None
-        error = errors[0]
-        path = "/".join(str(item) for item in error.absolute_path) or "$"
-        return f"{path}: {error.message}"[:512]
+        # oneOf/anyOf 스키마에서 최상위 오류는 "is not valid under any of the given schemas"
+        # 수준이라 모델이 무엇을 고쳐야 하는지 알 수 없다. 판별자가 맞는 가지까지 내려가
+        # 구체적인 오류를 앞세우고, 해당 위치의 기대 스키마를 함께 돌려준다.
+        primary = BoundedAgent._most_specific(max(errors, key=relevance))
+        ordered = [primary, *(item for item in errors if item is not primary)]
+        reported = [f"{BoundedAgent._error_path(item)}: {item.message}" for item in ordered[:3]]
+        detail = " | ".join(reported)
+        expected = json.dumps(primary.schema, ensure_ascii=False, separators=(",", ":"))
+        if len(expected) <= 400:
+            detail = f"{detail} | expected at {BoundedAgent._error_path(primary)}: {expected}"
+        return detail[:1024]
+
+    @staticmethod
+    def _error_path(error: Any) -> str:
+        return "/".join(str(item) for item in error.absolute_path) or "$"
+
+    @staticmethod
+    def _most_specific(error: Any) -> Any:
+        """판별자(const)가 어긋난 anyOf/oneOf 가지를 버리고 의도한 가지의 오류까지 내려간다."""
+        while error.context:
+            branches: dict[Any, list[Any]] = {}
+            for item in error.context:
+                branches.setdefault(item.schema_path[0] if item.schema_path else 0, []).append(item)
+            viable = {
+                key: items
+                for key, items in branches.items()
+                if not any(sub.validator in {"const", "enum"} for sub in items)
+            }
+            chosen = viable or branches
+            error = min(chosen.values(), key=len)[0]
+        return error
 
     def _claim_recovery(self, current: int) -> int:
         if current >= self._recovery_budget:

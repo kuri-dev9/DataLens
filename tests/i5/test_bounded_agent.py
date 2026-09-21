@@ -497,3 +497,66 @@ async def test_queryforge_session_is_announced_before_the_turn_commits() -> None
     session_index = next(index for index, (name, _) in enumerate(events) if name == "_queryforge_session")
     assert announced == [{"application_session_id": "Q" * 22}]
     assert session_index < dataset_index
+
+
+PARTITION_QUERY_TOOL = QueryForgeToolDefinition(
+    "query",
+    "query",
+    {
+        "type": "object",
+        "required": ["source", "select", "partition_scope"],
+        "properties": {
+            "source": {"type": "object", "required": ["table"], "properties": {"table": {"type": "string"}}},
+            "select": {"type": "array", "items": {"type": "object", "required": ["column"], "properties": {"column": {"type": "string"}}}},
+            "aggregations": {
+                "type": "array",
+                "items": {"type": "object", "required": ["function", "column", "alias"], "properties": {
+                    "function": {"enum": ["sum", "mean"]}, "column": {"type": "string"}, "alias": {"type": "string"}}},
+            },
+            "partition_scope": {"anyOf": [
+                {"type": "object", "required": ["kind", "column", "from", "to"], "properties": {"kind": {"const": "time_range"}, "column": {"type": "string"}, "from": {"type": "string"}, "to": {"type": "string"}}},
+                {"type": "object", "required": ["kind", "column", "values"], "properties": {"kind": {"const": "key_filter"}, "column": {"type": "string"}, "values": {"type": "array"}}},
+                {"type": "object", "required": ["kind"], "properties": {"kind": {"const": "not_partitioned"}}},
+            ]},
+        },
+    },
+)
+
+
+def test_validation_detail_names_the_missing_field_inside_anyof() -> None:
+    # anyOf 최상위 오류("is not valid under any of the given schemas")만 주면 모델이 고칠 수 없다.
+    detail = BoundedAgent._validate(
+        PARTITION_QUERY_TOOL,
+        {
+            "source": {"table": "PM_CEI_PGW_5M"},
+            "select": [{"column": "PGW_NAME"}],
+            "partition_scope": {"kind": "time_range", "column": "EVENT_TIME", "from": "2025-02-04T00:00:00"},
+        },
+    )
+    assert detail is not None
+    assert detail.startswith("partition_scope: 'to' is a required property")
+
+
+def test_validation_detail_reports_the_intended_branch_not_the_discriminator() -> None:
+    detail = BoundedAgent._validate(
+        PARTITION_QUERY_TOOL,
+        {"source": {"table": "T"}, "select": [{"column": "A"}], "partition_scope": {"kind": "key_filter", "column": "REGION"}},
+    )
+    assert detail is not None
+    assert detail.startswith("partition_scope: 'values' is a required property")
+    assert "not_partitioned" not in detail.split(" | ")[0]
+
+
+def test_validation_detail_includes_the_expected_schema_fragment() -> None:
+    detail = BoundedAgent._validate(
+        PARTITION_QUERY_TOOL,
+        {
+            "source": {"table": "T"},
+            "select": [{"column": "A"}],
+            "aggregations": [{"function": "sum", "column": "USER_CNT"}],
+            "partition_scope": {"kind": "not_partitioned"},
+        },
+    )
+    assert detail is not None
+    assert detail.startswith("aggregations/0: 'alias' is a required property")
+    assert "expected at aggregations/0:" in detail
