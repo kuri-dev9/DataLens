@@ -50,6 +50,37 @@ access. Completed `.env` files must remain server-side and uncommitted. Docker/C
 secret injection may be used instead, provided the same environment names reach the
 container.
 
+## CPU-only embedding server (optional)
+
+DataLens learns from successful turns and needs an embedding model to recall them.
+By default it reuses the LLM Ollama, which loads `bge-m3` onto the GPU. When GPU
+memory is tight, Ollama evicts the LLM to make room and reloads it on the next call;
+DataLens embeds twice per turn, so a tight GPU turns into two model reloads per turn.
+
+`docker-compose.embeddings.yml` runs a second Ollama with no GPU devices attached.
+This is physical isolation rather than a `CUDA_VISIBLE_DEVICES` convention, so the
+embedding model cannot reach the GPU regardless of the host configuration.
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.embeddings.yml up -d
+docker compose -f docker-compose.yml -f docker-compose.embeddings.yml \
+  exec ollama-embed ollama pull bge-m3
+```
+
+Then point DataLens at it. Both services share the Compose project network, so the
+service name resolves directly.
+
+```sh
+DATALENS_EMBEDDING_BASE_URL=http://ollama-embed:11434
+```
+
+`bge-m3` is a 568M-parameter model and each turn embeds two short strings, so CPU
+latency stays far below a single LLM round trip. An OpenAI-compatible server such as
+`llama-server --embeddings` works too; set `DATALENS_EMBEDDING_API=openai`.
+
+If the embedding server is unreachable, turns still complete without recall. Check
+`GET /v1/ready` — `checks.memory` reports `ok`, `unavailable`, or `disabled`.
+
 ## Deploy and check
 
 ```sh

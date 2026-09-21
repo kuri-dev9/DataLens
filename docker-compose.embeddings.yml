@@ -1,0 +1,40 @@
+# CPU 전용 임베딩 서버.
+#
+# GPU 장치를 컨테이너에 붙이지 않으므로 bge-m3가 GPU에 올라갈 수 없다.
+# CUDA_VISIBLE_DEVICES 같은 환경변수에 기대지 않는 물리적 격리다.
+# LLM이 쓰는 GPU Ollama는 그대로 두고, 26B 모델이 쫓겨나는 일을 막는다.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.embeddings.yml up -d
+#   docker compose -f docker-compose.yml -f docker-compose.embeddings.yml \
+#     exec ollama-embed ollama pull bge-m3
+#
+# 그 다음 .env 에:
+#   DATALENS_EMBEDDING_BASE_URL=http://ollama-embed:11434
+services:
+  ollama-embed:
+    image: ${DATALENS_EMBEDDING_IMAGE:-ollama/ollama:latest}
+    restart: unless-stopped
+    environment:
+      # 작은 모델이니 계속 상주시켜 매 턴 콜드 스타트를 없앤다.
+      OLLAMA_KEEP_ALIVE: "-1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_NUM_PARALLEL: "2"
+    volumes:
+      - ollama-embed:/root/.ollama
+    ports:
+      # 디버깅용. DataLens는 컨테이너 네트워크로 직접 붙으므로 노출이 필수는 아니다.
+      - "127.0.0.1:${DATALENS_EMBEDDING_PORT:-11435}:11434"
+    deploy:
+      resources:
+        limits:
+          cpus: "${DATALENS_EMBEDDING_CPUS:-4}"
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    stop_grace_period: 10s
+
+volumes:
+  ollama-embed:

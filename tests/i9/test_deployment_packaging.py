@@ -55,3 +55,19 @@ def test_compose_persists_learned_memory() -> None:
     assert re.search(r"^volumes:\n  datalens-memory:", source, re.MULTILINE)
     dockerfile = (ROOT / "Dockerfile").read_text()
     assert "install -d -o datalens -g datalens /var/lib/datalens" in dockerfile
+
+
+def test_embedding_compose_never_grants_gpu_access() -> None:
+    # bge-m3를 GPU에서 떼어놓는 것이 이 파일의 존재 이유다.
+    source = (ROOT / "docker-compose.embeddings.yml").read_text()
+    assert "ollama-embed" in source
+    for grant in ("devices:", "nvidia", "gpu", "runtime: nvidia", "NVIDIA_VISIBLE_DEVICES"):
+        assert grant not in source
+    assert 'OLLAMA_KEEP_ALIVE: "-1"' in source  # 매 턴 콜드 스타트를 피한다
+
+
+def test_embedding_compose_merges_with_the_base_stack() -> None:
+    source = (ROOT / "docker-compose.embeddings.yml").read_text()
+    assert services_of(source) == ["ollama-embed"]
+    assert re.search(r"^volumes:\n  ollama-embed:", source, re.MULTILINE)
+    assert "docker-compose.yml -f docker-compose.embeddings.yml" in source
