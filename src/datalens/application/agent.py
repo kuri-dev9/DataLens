@@ -109,6 +109,12 @@ class AgentResult:
 
 class BoundedAgent:
     # 모델이 인자를 고쳐도 결과가 달라지지 않는 실패. 그 외는 도구 결과로 되돌려 자기수정시킨다.
+    _SUMMARY_KEYS = {
+        "schema": ("action", "table", "name_pattern", "limit"),
+        "relationship": ("from_table", "to_table", "max_depth"),
+        "describe": ("dataset_id", "level"),
+        "transform": ("dataset_id",),
+    }
     _TERMINAL_CODES = frozenset(
         {
             "UNAUTHORIZED",
@@ -213,6 +219,16 @@ class BoundedAgent:
                     tool_count += 1
                     step.clear()
                     step.update({"index": tool_count, "tool": call.name})
+                    # 무엇을 하려는 단계인지 먼저 알린다. 인자 검증에서 걸러지는 호출도
+                    # 사용자 화면에서는 하나의 시도로 보여야 한다.
+                    intent = self._call_summary(call.name, call.arguments)
+                    if intent:
+                        step["intent"] = deepcopy(intent)
+                    if event_sink is not None:
+                        await event_sink(
+                            "tool_call",
+                            {"index": tool_count, "tool": call.name, "status": "started", "intent": intent},
+                        )
                     definition = tool_map.get(call.name)
                     if definition is None:
                         raise AgentPolicyError("LLM requested a tool outside the allowlist")
@@ -220,16 +236,23 @@ class BoundedAgent:
                     if validation_error is not None:
                         self._log_tool_call(session, tool_count, call.name, call.arguments, False, 0, recovery_count < self._recovery_budget, code="INVALID_TOOL_ARGUMENTS", details={"reason": "schema_validation_failed"})
                         step["upstream_code"] = "INVALID_TOOL_ARGUMENTS"
+                        step["detail"] = validation_error
+                        if event_sink is not None:
+                            await event_sink(
+                                "tool_call",
+                                {
+                                    "index": tool_count, "tool": call.name, "status": "rejected",
+                                    "elapsed_ms": 0, "intent": intent,
+                                    "error": {"code": "INVALID_TOOL_ARGUMENTS", "detail": validation_error},
+                                    "recovery": self._recovery_state(recovery_count, True),
+                                },
+                            )
                         recovery_count = self._claim_recovery(recovery_count)
                         messages.append(self._recovery_message(call.name, "INVALID_TOOL_ARGUMENTS", validation_error))
                         should_retry = True
                         break
                     tool_arguments = self._bounded_arguments(call.name, call.arguments)
                     tool_started = time.monotonic()
-                    if event_sink is not None:
-                        await event_sink(
-                            "tool_call", {"index": tool_count, "tool": call.name, "status": "started"}
-                        )
                     try:
                         result = await self._queryforge.call_tool(
                             call.name,
@@ -247,21 +270,26 @@ class BoundedAgent:
                         # 턴이 끝나기 전에도 dataset을 조회할 수 있도록 즉시 알린다.
                         await event_sink(QUERYFORGE_SESSION_EVENT, {"application_session_id": qf_session_id})
                     elapsed_ms = int((time.monotonic() - tool_started) * 1000)
-                    if event_sink is not None:
-                        await event_sink(
-                            "tool_call",
-                            {
-                                "index": tool_count,
-                                "tool": call.name,
-                                "status": "completed",
-                                "elapsed_ms": elapsed_ms,
-                            },
-                        )
                     if not result.ok:
                         failure = self._failure_of(result)
                         step["upstream_code"] = failure.code
+                        step["detail"] = failure.hint or failure.message
                         will_recover = self._recoverable(failure) and recovery_count < self._recovery_budget
                         self._log_tool_call(session, tool_count, call.name, tool_arguments, False, elapsed_ms, will_recover, failure=failure)
+                        if event_sink is not None:
+                            await event_sink(
+                                "tool_call",
+                                {
+                                    "index": tool_count, "tool": call.name, "status": "rejected",
+                                    "elapsed_ms": elapsed_ms, "intent": intent,
+                                    "error": {
+                                        "code": failure.code,
+                                        "detail": failure.hint or failure.message,
+                                        "details": deepcopy(failure.safe_metadata),
+                                    },
+                                    "recovery": self._recovery_state(recovery_count, will_recover),
+                                },
+                            )
                         if self._recoverable(failure):
                             if recovery_count >= self._recovery_budget:
                                 raise AgentQueryRejected(failure, tool_calls=tool_count, recovery_count=recovery_count)
@@ -272,10 +300,20 @@ class BoundedAgent:
                         raise AgentQueryRejected(failure, tool_calls=tool_count, recovery_count=recovery_count)
                     self._log_tool_call(session, tool_count, call.name, tool_arguments, True, elapsed_ms, False)
                     step.clear()
+                    bounded = self._bounded_tool_result(result)
+                    if event_sink is not None:
+                        await event_sink(
+                            "tool_call",
+                            {
+                                "index": tool_count, "tool": call.name, "status": "completed",
+                                "elapsed_ms": elapsed_ms, "intent": intent,
+                                "result": self._result_summary(bounded),
+                            },
+                        )
                     messages.append(
                         ProviderMessage(
                             "tool",
-                            json.dumps(self._bounded_tool_result(result), ensure_ascii=False, separators=(",", ":")),
+                            json.dumps(bounded, ensure_ascii=False, separators=(",", ":")),
                             tool_name=call.name,
                         )
                     )
@@ -358,6 +396,71 @@ class BoundedAgent:
         if len(expected) <= 400:
             detail = f"{detail} | expected at {BoundedAgent._error_path(primary)}: {expected}"
         return detail[:1024]
+
+    def _recovery_state(self, recovery_count: int, will_retry: bool) -> dict[str, Any]:
+        return {"attempt": recovery_count + 1, "budget": self._recovery_budget, "will_retry": will_retry}
+
+    @classmethod
+    def _call_summary(cls, tool_name: str, arguments: Any) -> dict[str, Any]:
+        """무엇을 하려는 호출인지 사용자에게 보여줄 최소 요약. 행 데이터는 담지 않는다."""
+        if not isinstance(arguments, dict):
+            return {}
+        if tool_name == "query":
+            return cls._query_summary(arguments)
+        keys = cls._SUMMARY_KEYS.get(tool_name, ())
+        return {key: arguments[key] for key in keys if isinstance(arguments.get(key), (str, int, bool))}
+
+    @staticmethod
+    def _query_summary(arguments: dict[str, Any]) -> dict[str, Any]:
+        summary: dict[str, Any] = {}
+        source = arguments.get("source")
+        if isinstance(source, dict) and isinstance(source.get("table"), str):
+            summary["table"] = source["table"]
+        select = arguments.get("select")
+        if isinstance(select, list):
+            columns = [item["column"] for item in select if isinstance(item, dict) and isinstance(item.get("column"), str)]
+            if columns:
+                summary["select"] = columns[:10]
+        aggregations = arguments.get("aggregations")
+        if isinstance(aggregations, list):
+            rendered = [
+                f"{item.get('function')}({item.get('column')})" if item.get("column") else str(item.get("function"))
+                for item in aggregations
+                if isinstance(item, dict)
+            ]
+            if rendered:
+                summary["aggregations"] = rendered[:10]
+        group_by = arguments.get("group_by")
+        if isinstance(group_by, list):
+            grouped = [item for item in group_by if isinstance(item, str)]
+            if grouped:
+                summary["group_by"] = grouped[:10]
+        scope = arguments.get("partition_scope")
+        if isinstance(scope, dict):
+            rendered_scope = {
+                key: scope[key]
+                for key in ("kind", "column", "from", "to")
+                if isinstance(scope.get(key), (str, int))
+            }
+            if rendered_scope:
+                summary["partition_scope"] = rendered_scope
+        return summary
+
+    @staticmethod
+    def _result_summary(bounded: dict[str, Any]) -> dict[str, Any]:
+        summary: dict[str, Any] = {}
+        for key in ("action", "table", "dataset_id", "row_count"):
+            if isinstance(bounded.get(key), (str, int)):
+                summary[key] = bounded[key]
+        for key in ("tables", "columns", "relationships"):
+            value = bounded.get(key)
+            if isinstance(value, list):
+                summary[f"{key}_count"] = len(value)
+        if bounded.get("partitioned") is not None:
+            summary["partitioned"] = bool(bounded["partitioned"])
+        if bounded.get("truncated"):
+            summary["truncated"] = True
+        return summary
 
     @staticmethod
     def _error_path(error: Any) -> str:

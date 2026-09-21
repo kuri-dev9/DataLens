@@ -78,12 +78,13 @@ class FakeProvider:
 
 
 class FakeQueryForge:
-    def __init__(self, results=()) -> None:
+    def __init__(self, results=(), tools=None) -> None:
         self.results = deque(results)
         self.calls = []
+        self.tools = tools
 
     async def discover_tools(self, timeout_seconds=None):
-        return (SCHEMA_TOOL, QUERY_TOOL)
+        return self.tools or (SCHEMA_TOOL, QUERY_TOOL)
 
     async def call_tool(self, name, arguments, *, application_session_id, timeout_seconds):
         self.calls.append((name, arguments, application_session_id, timeout_seconds))
@@ -475,7 +476,11 @@ async def test_failure_keeps_earlier_datasets_and_reports_the_failed_step() -> N
         await BoundedAgent(provider, FakeQueryForge([ok_query(), rejected]), max_tool_calls=8, recovery_budget=3).run(session(), "조회", time.monotonic() + 2)
     exc = raised.value
     assert [dataset.dataset_id for dataset in exc.datasets] == ["ds_000000001"]
-    assert exc.failed_step == {"index": 2, "tool": "query", "upstream_code": "TABLE_NOT_ALLOWED"}
+    assert exc.failed_step["index"] == 2
+    assert exc.failed_step["tool"] == "query"
+    assert exc.failed_step["upstream_code"] == "TABLE_NOT_ALLOWED"
+    # 어떤 조회를 하려다 막혔는지까지 남아야 사용자가 위치를 짚을 수 있다.
+    assert exc.failed_step["intent"]["table"] == "secret"
     assert exc.tool_calls == 2
 
 
@@ -596,3 +601,64 @@ async def test_untruncated_results_carry_no_truncation_notice() -> None:
     payload = json.loads(next(item.content for item in provider.messages[-1] if item.role == "tool"))
     assert payload.get("truncated") is not True
     assert payload["warnings"] == []
+
+
+@pytest.mark.anyio
+async def test_progress_events_describe_intent_result_and_recovery() -> None:
+    events: list[tuple[str, dict]] = []
+
+    async def sink(event, data):
+        events.append((event, data))
+
+    bad_scope = {"source": {"table": "PM_CEI_PGW_5M"}, "select": [{"column": "PGW_NAME"}], "partition_scope": {"kind": "time_range"}}
+    good = {
+        "source": {"table": "PM_CEI_PGW_5M"},
+        "select": [{"column": "PGW_NAME"}],
+        "partition_scope": {"kind": "time_range", "column": "EVENT_TIME", "from": "2025-02-04T00:00:00", "to": "2025-02-04T23:59:59"},
+    }
+    provider = FakeProvider([calling("query", bad_scope), calling("query", good), assistant("완료")])
+    queryforge = FakeQueryForge([ok_query()], tools=(SCHEMA_TOOL, PARTITION_QUERY_TOOL))
+    await BoundedAgent(provider, queryforge, max_tool_calls=8, recovery_budget=5).run(session(), "조회", time.monotonic() + 2, sink)
+
+    calls = [data for name, data in events if name == "tool_call"]
+    # 인자 검증에서 걸러진 호출도 사용자 화면에서는 하나의 시도로 보여야 한다.
+    started, rejected, retried, completed = calls
+    assert (started["status"], started["index"]) == ("started", 1)
+    assert started["intent"]["table"] == "PM_CEI_PGW_5M"
+    assert started["intent"]["partition_scope"] == {"kind": "time_range"}
+
+    assert rejected["status"] == "rejected"
+    assert rejected["error"]["code"] == "INVALID_TOOL_ARGUMENTS"
+    assert "is a required property" in rejected["error"]["detail"]
+    assert rejected["recovery"] == {"attempt": 1, "budget": 5, "will_retry": True}
+
+    assert (retried["status"], retried["index"]) == ("started", 2)
+    assert retried["intent"]["partition_scope"]["from"] == "2025-02-04T00:00:00"
+
+    assert completed["status"] == "completed"
+    assert completed["result"]["dataset_id"] == "ds_000000001"
+    assert completed["result"]["row_count"] == 1
+
+
+@pytest.mark.anyio
+async def test_rejected_event_carries_the_upstream_reason() -> None:
+    events: list[tuple[str, dict]] = []
+
+    async def sink(event, data):
+        events.append((event, data))
+
+    failure = QueryForgeFailure(
+        "PARTITION_SCOPE_TOO_WIDE", "out of range", True,
+        hint="narrow the range",
+        safe_metadata={"upper_bound": "2025-02-05T00:00:00"},
+    )
+    rejected = QueryForgeResult(False, "Q" * 22, {"ok": False}, failure)
+    arguments = {"source": {"table": "T"}, "select": [{"column": "A"}], "partition_scope": {"kind": "not_partitioned"}}
+    provider = FakeProvider([calling("query", arguments), calling("query", arguments), assistant("완료")])
+    await BoundedAgent(provider, FakeQueryForge([rejected, ok_query()]), max_tool_calls=8, recovery_budget=5).run(session(), "조회", time.monotonic() + 2, sink)
+
+    event = next(data for name, data in events if name == "tool_call" and data["status"] == "rejected")
+    assert event["error"]["code"] == "PARTITION_SCOPE_TOO_WIDE"
+    assert event["error"]["detail"] == "narrow the range"
+    assert event["error"]["details"]["upper_bound"] == "2025-02-05T00:00:00"
+    assert event["recovery"]["will_retry"] is True

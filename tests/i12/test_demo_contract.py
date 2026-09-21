@@ -105,3 +105,22 @@ def test_msg_failed_step_is_rendered_for_the_user() -> None:
     assert "metadata?.failed_step" in source
     assert "번째 도구 호출" in source
     assert "failureTrace(error)" in source
+
+
+def test_progress_trace_is_rendered_for_every_tool_call() -> None:
+    source = DEMO.read_text()
+    # 진행 트레이스는 시작/완료/실패를 모두 렌더링하고, 실패 시 사유와 재시도를 보여준다.
+    assert 'if(name==="tool_call"){renderTrace(trace,data)' in source
+    assert 'row.className="trace-step bad"' in source
+    assert "다시 시도 " in source
+    assert "더 시도하지 않음" in source
+    # 실패해도 어디까지 갔는지가 남아야 한다 — progress만 제거하고 trace는 유지한다.
+    assert "trace.remove()" not in source
+
+
+def test_progress_trace_names_what_each_step_tried() -> None:
+    source = DEMO.read_text()
+    for label in ("스키마 조회", "데이터 조회", "관계 탐색"):
+        assert label in source
+    assert "intent.partition_scope" in source or "intent.group_by" in source
+    assert "function intentText(" in source and "function resultText(" in source
