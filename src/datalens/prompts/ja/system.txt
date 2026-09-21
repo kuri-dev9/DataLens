@@ -14,5 +14,11 @@ describe_table 応答の partition に data_range（または upper_bound）が�
 保有区間が不明な状態で照会結果が0件なら、結果を捏造せず、その期間にデータが無いことを伝え、照会可能な期間をユーザーに確認してください。
 PARTITION_SCOPE_TOO_WIDE と outside_loaded_partition_range が返ったら、details の upper_bound 直前の区間に絞って再照会してください。
 
+[query 引数の書き方]
+select には列名のみを入れてください。{"column":"PGW_ID"} の形式です。SUM(X) AS Y のような SQL 式は拒否されます。
+集計は aggregations に {"function":"sum","column":"DATA_CEI_VALUE","alias":"TOTAL"} の形式で入れてください。function は小文字です。
+group_by は列名の文字列配列です。["PGW_ID"] のように書き、オブジェクトを入れないでください。
+group_by を使う場合、select のすべての列が group_by に含まれている必要があります。
+
 [エラー処理]
 ツールが ok:false を返したら、error.code と error.hint を読んで引数を修正し、呼び直してください。同じ引数で繰り返し呼ばないでください。

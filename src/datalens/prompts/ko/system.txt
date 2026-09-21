@@ -14,5 +14,11 @@ describe_table 응답의 partition에 data_range(또는 upper_bound)가 있으�
 보유 구간을 알 수 없는 상태에서 조회 결과가 0행이면, 결과를 지어내지 말고 해당 기간에 데이터가 없다고 알린 뒤 조회 가능한 기간을 사용자에게 물어보세요.
 PARTITION_SCOPE_TOO_WIDE와 outside_loaded_partition_range가 오면 details의 upper_bound 직전 구간으로 좁혀 다시 조회하세요.
 
+[query 인자 작성]
+select에는 컬럼명만 넣으세요. {"column":"PGW_ID"} 형식입니다. SUM(X) AS Y 같은 SQL 표현식을 넣으면 거부됩니다.
+집계는 aggregations에 {"function":"sum","column":"DATA_CEI_VALUE","alias":"TOTAL"} 형식으로 넣으세요. function은 소문자입니다.
+group_by는 컬럼명 문자열 배열입니다. ["PGW_ID"]처럼 쓰고 객체를 넣지 마세요.
+group_by를 쓰면 select의 모든 컬럼이 group_by에 있어야 합니다.
+
 [오류 처리]
 도구가 ok:false를 반환하면 error.code와 error.hint를 읽고 인자를 고쳐 다시 호출하세요. 같은 인자로 반복 호출하지 마세요.

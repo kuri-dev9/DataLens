@@ -543,7 +543,7 @@ class BoundedAgent:
         # 목록을 말없이 자르면 모델은 전부 봤다고 착각한다. 찾던 컬럼이 잘려나간 뒤에도
         # 같은 자리를 계속 뒤지게 되므로, 잘랐다는 사실과 좁히는 방법을 함께 알린다.
         notices: list[dict[str, Any]] = []
-        for key, limit in {"tables": 50, "columns": 120, "relationships": 20}.items():
+        for key, limit in {"tables": 200, "columns": 120, "relationships": 20}.items():
             value = bounded.get(key)
             if isinstance(value, list) and len(value) > limit:
                 notices.append(
