@@ -4,7 +4,7 @@ import time
 import logging
 from typing import Any, Awaitable, Callable, Protocol
 
-from datalens.application.agent import AgentResult
+from datalens.application.agent import QUERYFORGE_SESSION_EVENT, AgentResult
 from datalens.application.sessions import SessionService
 from datalens.domain.session import Session
 from datalens.observability import bind_request_id, reset_request_id
@@ -70,8 +70,18 @@ class ChatApplicationService:
     ) -> dict:
         started = time.monotonic()
         context = bind_request_id(request_id)
+
+        async def sink(event: str, data: dict[str, Any]) -> None:
+            # QueryForge 세션은 턴 커밋 전에 바인딩해야 dataset 조회가 404가 되지 않는다.
+            if event == QUERYFORGE_SESSION_EVENT:
+                application_session_id = data.get("application_session_id")
+                if application_session_id:
+                    self._sessions.bind_queryforge_session(session.session_id, application_session_id)
+                return
+            await event_sink(event, data)
+
         try:
-            result = await self._agent.run(session, message, deadline, event_sink)
+            result = await self._agent.run(session, message, deadline, sink)
         finally:
             reset_request_id(context)
         committed = self._sessions.commit(result.updated_session)

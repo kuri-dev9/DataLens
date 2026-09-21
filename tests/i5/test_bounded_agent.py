@@ -476,3 +476,24 @@ async def test_failure_keeps_earlier_datasets_and_reports_the_failed_step() -> N
     assert [dataset.dataset_id for dataset in exc.datasets] == ["ds_000000001"]
     assert exc.failed_step == {"index": 2, "tool": "query", "upstream_code": "TABLE_NOT_ALLOWED"}
     assert exc.tool_calls == 2
+
+
+@pytest.mark.anyio
+async def test_queryforge_session_is_announced_before_the_turn_commits() -> None:
+    events: list[tuple[str, dict]] = []
+
+    async def sink(event, data):
+        events.append((event, data))
+
+    provider = FakeProvider(
+        [
+            calling("query", {"source": {"table": "events"}, "select": [{"column": "a"}], "partition_scope": {"kind": "not_partitioned"}}),
+            assistant("완료"),
+        ]
+    )
+    await BoundedAgent(provider, FakeQueryForge([ok_query()]), max_tool_calls=8, recovery_budget=3).run(session(), "조회", time.monotonic() + 2, sink)
+    announced = [data for name, data in events if name == "_queryforge_session"]
+    dataset_index = next(index for index, (name, _) in enumerate(events) if name == "dataset")
+    session_index = next(index for index, (name, _) in enumerate(events) if name == "_queryforge_session")
+    assert announced == [{"application_session_id": "Q" * 22}]
+    assert session_index < dataset_index

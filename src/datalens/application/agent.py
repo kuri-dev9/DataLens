@@ -32,6 +32,8 @@ from datalens.observability import current_request_id, safe_log_value
 
 
 LOG = logging.getLogger("datalens.agent")
+# 애플리케이션 계층이 가로채는 내부 이벤트. SSE로 내보내지 않는다.
+QUERYFORGE_SESSION_EVENT = "_queryforge_session"
 
 
 class AgentError(RuntimeError):
@@ -238,7 +240,11 @@ class BoundedAgent:
                         raise AgentTimeoutError("QueryForge call deadline exceeded") from exc
                     except QueryForgeUnavailable as exc:
                         raise AgentUpstreamUnavailable("QueryForge call failed") from exc
+                    previous_qf_session_id = qf_session_id
                     qf_session_id = result.application_session_id or qf_session_id
+                    if event_sink is not None and qf_session_id != previous_qf_session_id:
+                        # 턴이 끝나기 전에도 dataset을 조회할 수 있도록 즉시 알린다.
+                        await event_sink(QUERYFORGE_SESSION_EVENT, {"application_session_id": qf_session_id})
                     elapsed_ms = int((time.monotonic() - tool_started) * 1000)
                     if event_sink is not None:
                         await event_sink(

@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     queryforge_data_base_url: AnyHttpUrl = "http://127.0.0.1:8080"
     queryforge_api_key: SecretStr
     queryforge_timeout_seconds: float = Field(5.0, gt=0)
-    agent_max_tool_calls: int = Field(8, gt=0)
+    agent_max_tool_calls: int = Field(12, gt=0)
     agent_recovery_budget: int = Field(3, ge=0)
     agent_preview_rows: int = Field(5, ge=1, le=100)
     llm_provider: Literal["ollama"] = "ollama"

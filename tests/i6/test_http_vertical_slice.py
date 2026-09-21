@@ -520,3 +520,37 @@ def test_err_partial_datasets_and_failed_step_survive_a_rejection(settings) -> N
     assert body["metadata"]["failed_step"] == {"index": 3, "tool": "query", "upstream_code": "PARTITION_SCOPE_TOO_WIDE"}
     assert body["error"]["details"]["upstream_code"] == "PARTITION_SCOPE_TOO_WIDE"
     assert body["error"]["details"]["failed_step"]["tool"] == "query"
+
+
+def test_dataset_rows_are_reachable_while_the_turn_is_still_running(settings) -> None:
+    # dataset 이벤트가 나간 시점에 이미 QueryForge 세션이 바인딩되어 있어야 한다.
+    from datalens.application.agent import QUERYFORGE_SESSION_EVENT
+    from datalens.application.chat import ChatApplicationService
+    from datalens.application.sessions import SessionService
+    from datalens.infrastructure.session_store import InMemorySessionStore
+
+    store = InMemorySessionStore(60)
+    sessions = SessionService(store)
+    created = store.create()
+    bound: list[str | None] = []
+
+    class Agent:
+        async def run(self, session, message, deadline, event_sink=None):
+            await event_sink(QUERYFORGE_SESSION_EVENT, {"application_session_id": "Q" * 22})
+            bound.append(sessions.require(created.session_id).queryforge_session_id)
+            await event_sink("dataset", {"dataset_id": "ds_000000001"})
+            return AgentResult("완료", (), (), 1, 0, sessions.require(created.session_id))
+
+    emitted: list[str] = []
+
+    async def sink(event, data):
+        emitted.append(event)
+
+    asyncio.run(
+        ChatApplicationService(sessions, Agent()).handle_stream(
+            created, "조회", "dlr_x", time.monotonic() + 5, sink
+        )
+    )
+    assert bound == ["Q" * 22]
+    assert QUERYFORGE_SESSION_EVENT not in emitted
+    assert "dataset" in emitted
