@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from collections import deque
 from dataclasses import replace
@@ -560,3 +561,38 @@ def test_validation_detail_includes_the_expected_schema_fragment() -> None:
     assert detail is not None
     assert detail.startswith("aggregations/0: 'alias' is a required property")
     assert "expected at aggregations/0:" in detail
+
+
+@pytest.mark.anyio
+async def test_truncated_columns_are_announced_to_the_model() -> None:
+    wide = QueryForgeResult(
+        True,
+        "Q" * 22,
+        {
+            "ok": True,
+            "session_id": "Q" * 22,
+            "action": "describe_table",
+            "table": "PM_CEI_PGW_5M",
+            "columns": [{"name": f"C{index}", "type": "int"} for index in range(200)],
+            "truncated": False,
+            "warnings": [],
+        },
+    )
+    provider = FakeProvider([calling("schema", {"action": "list_tables"}), assistant("확인")])
+    await BoundedAgent(provider, FakeQueryForge([wide]), max_tool_calls=3, recovery_budget=1).run(session(), "구조", time.monotonic() + 2)
+    payload = json.loads(next(item.content for item in provider.messages[-1] if item.role == "tool"))
+    assert len(payload["columns"]) == 120
+    assert payload["truncated"] is True
+    notice = next(item for item in payload["warnings"] if item["code"] == "DATALENS_TRUNCATED")
+    assert notice["field"] == "columns"
+    assert (notice["original_items"], notice["returned_items"]) == (200, 120)
+    assert "name_pattern" in notice["hint"]
+
+
+@pytest.mark.anyio
+async def test_untruncated_results_carry_no_truncation_notice() -> None:
+    provider = FakeProvider([calling("schema", {"action": "list_tables"}), assistant("확인")])
+    await BoundedAgent(provider, FakeQueryForge([ok_schema()]), max_tool_calls=3, recovery_budget=1).run(session(), "구조", time.monotonic() + 2)
+    payload = json.loads(next(item.content for item in provider.messages[-1] if item.role == "tool"))
+    assert payload.get("truncated") is not True
+    assert payload["warnings"] == []
