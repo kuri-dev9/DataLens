@@ -112,7 +112,7 @@ def test_progress_trace_is_rendered_for_every_tool_call() -> None:
     # 진행 트레이스는 시작/완료/실패를 모두 렌더링하고, 실패 시 사유와 재시도를 보여준다.
     assert 'if(name==="tool_call"){renderTrace(trace,data)' in source
     assert 'row.className="trace-step bad"' in source
-    assert "다시 시도 " in source
+    assert "재시도 ${data.recovery.attempt}/${data.recovery.budget}" in source
     assert "더 시도하지 않음" in source
     # 실패해도 어디까지 갔는지가 남아야 한다 — progress만 제거하고 trace는 유지한다.
     assert "trace.remove()" not in source
@@ -120,7 +120,16 @@ def test_progress_trace_is_rendered_for_every_tool_call() -> None:
 
 def test_progress_trace_names_what_each_step_tried() -> None:
     source = DEMO.read_text()
-    for label in ("스키마 조회", "데이터 조회", "관계 탐색"):
+    for label in ("테이블 목록", "구조", "조회", "관계 탐색"):
         assert label in source
-    assert "intent.partition_scope" in source or "intent.group_by" in source
+    assert "intent.partition_scope" in source and "intent.group_by" in source
     assert "function intentText(" in source and "function resultText(" in source
+
+
+def test_progress_trace_stays_one_line_per_step() -> None:
+    source = DEMO.read_text()
+    # 스키마 조각 같은 모델용 원문은 줄에 펼치지 않고 title 툴팁으로 보낸다.
+    assert "const briefly=" in source
+    assert "row.title=" in source
+    assert "white-space:nowrap" in source and "text-overflow:ellipsis" in source
+    assert 'what.textContent=`${label} → ${briefly(data.error?.code||"실패")}${retry}`' in source
