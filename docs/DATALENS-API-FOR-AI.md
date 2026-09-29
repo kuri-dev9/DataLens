@@ -136,11 +136,25 @@ content-type: application/json
     "duration_ms": 25654,
     "tool_calls": 2,
     "recovery_count": 0,
-    "stop_reason": "completed"
+    "stop_reason": "completed",
+    "grounding": {
+      "total": 5,
+      "grounded": 4,
+      "grounded_ratio": 0.8,
+      "ungrounded_ratio_pct": 20.0,
+      "max_deviation_pct": 4.065,
+      "ungrounded": [
+        {"value": "118", "nearest": 123.0, "deviation_pct": 4.065, "small_int": false}
+      ]
+    }
   },
   "error": null
 }
 ```
+
+`metadata.grounding`은 답변 속 수치가 이번 턴 도구 결과에 실제로 있었는지 재기만 한 결과다(ADR-034 1단계).
+`deviation_pct`는 최근접 근거값 대비 편차로, 0에 가까우면 반올림 표기 차이이고 크면 모델이 지어낸 값이다.
+**답변은 이 값에 따라 수정되거나 폐기되지 않는다.** 폐기는 분포가 쌓인 뒤 2단계에서 결정한다.
 
 **실패 시**
 

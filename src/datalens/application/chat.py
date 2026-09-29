@@ -68,6 +68,7 @@ class ChatApplicationService:
                 "recovery_count": result.recovery_count,
                 "stop_reason": "completed",
                 "memory": recall.public() if recall else None,
+                "grounding": result.grounding,
             },
             "error": None,
         }
@@ -125,6 +126,7 @@ class ChatApplicationService:
                 "recovery_count": result.recovery_count,
                 "stop_reason": "completed",
                 "memory": recall.public() if recall else None,
+                "grounding": result.grounding,
             },
         }
 

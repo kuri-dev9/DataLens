@@ -29,6 +29,7 @@ from datalens.ports.queryforge import (
     QueryForgeToolDefinition,
     QueryForgeUnavailable,
 )
+from datalens.application.grounding import collect_facts, safe_measure
 from datalens.observability import current_request_id, safe_log_value
 
 
@@ -107,6 +108,8 @@ class AgentResult:
     updated_session: Session
     # 성공한 도구 호출만 담는다. 다음 번 같은 질문에서 탐색을 건너뛰기 위한 재료다.
     plan: tuple[dict[str, Any], ...] = ()
+    # 답변 수치가 도구 결과에 있었는지 재기만 한 결과. 답변은 바꾸지 않는다 (ADR-034).
+    grounding: dict[str, Any] | None = None
 
 
 class BoundedAgent:
@@ -168,6 +171,19 @@ class BoundedAgent:
         qf_session_id = session.queryforge_session_id
         datasets: dict[str, DatasetReference] = {}
         warnings: list[Any] = []
+        # 모델이 실제로 받은 수치만 모은다. 여기 없는 수치는 모델이 지어낸 것이다.
+        facts: set[str] = set()
+        # 세션 상태(now/today/active_period)와 회상 힌트, 이전 턴 답변까지가 모델이 본 사실이다.
+        # 시스템 프롬프트 본문은 제외한다 — 예시 수치까지 근거로 인정하면 계측이 무의미해진다.
+        collect_facts(
+            [
+                item.content
+                for item in messages
+                if item.role == "assistant"
+                or (item.role == "system" and item.content.startswith("DataLens "))
+            ],
+            facts,
+        )
         active_table = session.active_table
         active_period = deepcopy(session.active_period)
         step: dict[str, Any] = {}
@@ -221,6 +237,7 @@ class BoundedAgent:
                     )
                     return AgentResult(
                         answer=answer,
+                        grounding=safe_measure(answer, facts),
                         datasets=tuple(datasets.values()),
                         warnings=tuple(warnings),
                         tool_calls=tool_count,
@@ -320,6 +337,7 @@ class BoundedAgent:
                     step.clear()
                     plan.append({"tool": call.name, "intent": deepcopy(intent)})
                     bounded = self._bounded_tool_result(result)
+                    collect_facts(bounded, facts)
                     if event_sink is not None:
                         await event_sink(
                             "tool_call",

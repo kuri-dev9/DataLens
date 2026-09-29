@@ -20,13 +20,18 @@ def test_build_context_excludes_secrets_and_local_artifacts() -> None:
 
 
 def services_of(source: str) -> list[str]:
-    block = source.split("services:", 1)[1].split("\nvolumes:", 1)[0]
+    block = source.split("services:", 1)[1]
+    for boundary in ("\nvolumes:", "\nnetworks:"):
+        block = block.split(boundary, 1)[0]
     return re.findall(r"^  ([a-z][a-z0-9_-]*):$", block, re.MULTILINE)
 
 
-def test_compose_owns_only_versioned_datalens_service() -> None:
+def test_compose_owns_versioned_datalens_service() -> None:
     source = (ROOT / "docker-compose.yml").read_text()
-    assert services_of(source) == ["datalens"]
+    # QueryForge는 운영 서버가 같은 스택으로 띄운다. 빌드 컨텍스트는 변수로 받아
+    # repo 밖 경로를 파일에 박지 않는다.
+    assert services_of(source) == ["queryforge", "datalens"]
+    assert "${QUERYFORGE_CONTEXT:-../QueryForge}" in source
     assert "datalens:0.1.0" in source
     assert "/v1/health" in source
     assert "/v1/ready" not in source
