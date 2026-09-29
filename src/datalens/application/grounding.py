@@ -13,7 +13,9 @@ from typing import Any
 
 LOG = logging.getLogger("datalens.grounding")
 
-_NUM = re.compile(r"-?\d+(?:\.\d+)?")
+# 하이픈 앞에 숫자가 오면 음수 부호가 아니라 구분자다. 이걸 놓치면
+# "2024-05-30"이 [2024, -05, -30]으로 쪼개져 날짜가 통째로 미검증이 된다.
+_NUM = re.compile(r"(?<!\d)-?\d+(?:\.\d+)?")
 # 스텝 번호·목록 번호처럼 본문 구조에서 나오는 작은 정수. 1단계에서는 세되 표시만 한다.
 _SMALL_INT_LIMIT = 12
 
@@ -36,16 +38,26 @@ def collect_facts(node: Any, sink: set[str]) -> None:
     elif isinstance(node, bool):
         return
     elif isinstance(node, (int, float)):
-        number = float(node)
-        sink.add(f"{number:g}")
-        sink.add(f"{round(number):g}")
-        sink.add(f"{number:.1f}")
-        sink.add(f"{number:.2f}")
-        sink.add(f"{abs(number):g}")
-        sink.add(f"{abs(number):.1f}")
-        sink.add(f"{abs(number):.2f}")
+        _register(float(node), sink)
     elif isinstance(node, str):
-        sink.update(numbers_in(node))
+        for token in numbers_in(node):
+            sink.add(token)
+            parsed = _as_float(token)
+            if parsed is not None:
+                # "05"와 "5"는 같은 값이다. 문자열에서 뽑은 숫자도 변형을 등록해야
+                # 날짜·코드 표기가 답변의 자연스러운 표기와 어긋나지 않는다.
+                _register(parsed, sink)
+
+
+def _register(number: float, sink: set[str]) -> None:
+    """같은 값의 표기 변형을 모두 등록한다 (455.10999999999996 ↔ 455.11)."""
+    sink.add(f"{number:g}")
+    sink.add(f"{round(number):g}")
+    sink.add(f"{number:.1f}")
+    sink.add(f"{number:.2f}")
+    sink.add(f"{abs(number):g}")
+    sink.add(f"{abs(number):.1f}")
+    sink.add(f"{abs(number):.2f}")
 
 
 def _as_float(text: str) -> float | None:

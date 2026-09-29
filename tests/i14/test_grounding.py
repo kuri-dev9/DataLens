@@ -120,6 +120,20 @@ def test_grd_ac8_deviation_separates_typo_from_fabrication() -> None:
     assert report["max_deviation_pct"] == far["deviation_pct"]
 
 
+def test_date_string_does_not_split_into_negative_numbers() -> None:
+    """실측 회귀: upper_bound "2024-05-30"이 [2024, -05, -30]으로 쪼개져
+    답변의 "2024년 5월 30일"이 통째로 미검증으로 잡히던 문제."""
+    facts: set[str] = set()
+    collect_facts({"upper_bound": "2024-05-30 12:00:00"}, facts)
+    assert measure("2024년 5월 30일 기준입니다", facts)["ungrounded"] == []
+
+
+def test_zero_padded_number_matches_bare_form() -> None:
+    facts: set[str] = set()
+    collect_facts({"code": "2024-05-30"}, facts)
+    assert "5" in facts and "05" in facts
+
+
 def test_small_int_is_measured_but_flagged() -> None:
     report = measure("1단계와 2단계", set())
     assert [item["small_int"] for item in report["ungrounded"]] == [True, True]
