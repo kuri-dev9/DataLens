@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 import uuid
@@ -8,6 +9,8 @@ from copy import deepcopy
 from typing import Any, Awaitable, Callable
 
 import httpx
+
+from datalens.observability import current_request_id
 
 from datalens.ports.llm import (
     AssistantTurn,
@@ -22,6 +25,9 @@ from datalens.ports.llm import (
 from datalens.ports.queryforge import QueryForgeToolDefinition
 
 
+LOG = logging.getLogger("datalens.llm")
+
+
 class OllamaProvider:
     def __init__(
         self,
@@ -29,6 +35,9 @@ class OllamaProvider:
         model: str,
         *,
         request_timeout_seconds: float,
+        idle_timeout_seconds: float = 120.0,
+        num_predict: int = 2048,
+        progress_interval_seconds: float = 15.0,
         num_ctx: int = 8192,
         temperature: float = 1.0,
         top_p: float = 0.95,
@@ -39,11 +48,16 @@ class OllamaProvider:
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._request_timeout = request_timeout_seconds
+        self._idle_timeout = idle_timeout_seconds
+        self._progress_interval = progress_interval_seconds
         self._options = {
             "num_ctx": num_ctx,
             "temperature": temperature,
             "top_p": top_p,
             "top_k": top_k,
+            # 생성 토큰 상한(ADR-033). 유휴 워치독이 못 잡는 "살아있지만 끝나지 않는"
+            # 생성(반복 루프)을 끊는 유일한 장치다. OutputPolicy가 있으면 그 값이 우선한다.
+            "num_predict": num_predict,
         }
         self._enable_thinking = enable_thinking
         self._client = client or httpx.AsyncClient()
@@ -56,54 +70,14 @@ class OllamaProvider:
         deadline: float,
         output_policy: OutputPolicy,
     ) -> AssistantTurn:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise LLMTimeout("LLM deadline exhausted before request")
-        timeout = min(self._request_timeout, remaining)
-        payload: dict[str, Any] = {
-            "model": self._model,
-            "stream": False,
-            "messages": [self._message(message, index == 0) for index, message in enumerate(messages)],
-            "tools": [self._tool(tool) for tool in tools],
-            "options": dict(self._options),
-        }
-        if output_policy.max_output_tokens is not None:
-            payload["options"]["num_predict"] = output_policy.max_output_tokens
-        try:
-            response = await self._client.post(
-                f"{self._base_url}/api/chat", json=payload, timeout=timeout
-            )
-            response.raise_for_status()
-        except httpx.TimeoutException as exc:
-            raise LLMTimeout("Ollama request timed out") from exc
-        except httpx.HTTPError as exc:
-            raise LLMUnavailable("Ollama request failed") from exc
-        try:
-            body = response.json()
-            message = body["message"]
-            if not isinstance(message, dict):
-                raise TypeError("message must be an object")
-            calls = tuple(self._tool_call(item) for item in message.get("tool_calls") or [])
-            content = message.get("content")
-            if content is not None and not isinstance(content, str):
-                raise TypeError("content must be a string")
-            if content is not None:
-                content = strip_thought_blocks(content)
-            if content is None and not calls:
-                raise ValueError("response has neither content nor tool calls")
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise LLMInvalidResponse("Ollama returned an invalid response") from exc
-        usage = TokenUsage(
-            prompt_tokens=self._optional_int(body.get("prompt_eval_count")),
-            completion_tokens=self._optional_int(body.get("eval_count")),
-        )
-        return AssistantTurn(
-            content=content,
-            tool_calls=calls,
-            stop_reason=str(body.get("done_reason") or ("tool_calls" if calls else "stop")),
-            usage=usage,
-            provider_request_id=str(body.get("id")) if body.get("id") is not None else None,
-        )
+        # 비스트리밍 HTTP 호출은 생성이 끝날 때까지 바이트가 오지 않아, read 타임아웃이
+        # 유휴 판정이 아니라 "총 시간 상한"으로 오작동한다(정당한 장시간 생성도 죽음).
+        # 유휴 기반 생존 판정(ADR-033)을 모든 경로에 동일하게 적용하기 위해
+        # 내부 전송은 스트리밍으로 통일한다.
+        async def discard(token: str) -> None:
+            return None
+
+        return await self.complete_stream(messages, tools, deadline, output_policy, discard)
 
     async def complete_stream(
         self,
@@ -112,9 +86,9 @@ class OllamaProvider:
         deadline: float,
         output_policy: OutputPolicy,
         on_token: Callable[[str], Awaitable[None]],
+        on_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> AssistantTurn:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        if deadline - time.monotonic() <= 0:
             raise LLMTimeout("LLM deadline exhausted before request")
         payload: dict[str, Any] = {
             "model": self._model,
@@ -129,12 +103,19 @@ class OllamaProvider:
         content_parts: list[str] = []
         calls: tuple[ToolCall, ...] = ()
         final: dict[str, Any] = {}
+        started = time.monotonic()
+        last_progress = started
+        chunk_count = 0
+        thinking_chunk_count = 0
+        outcome = "completed"
         try:
+            # 타임아웃은 유휴 판정(청크 간 간격)이다. 전역 deadline으로 자르지 않는다 —
+            # 청크가 흐르고 있는 생성은 deadline이 지나도 죽이지 않는다(ADR-033 WDG-AC-2).
             async with self._client.stream(
                 "POST",
                 f"{self._base_url}/api/chat",
                 json=payload,
-                timeout=min(self._request_timeout, remaining),
+                timeout=httpx.Timeout(self._idle_timeout),
             ) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():
@@ -142,7 +123,10 @@ class OllamaProvider:
                         continue
                     body = json.loads(line)
                     final = body
+                    chunk_count += 1
                     message = body.get("message") or {}
+                    if message.get("thinking"):
+                        thinking_chunk_count += 1
                     chunk = message.get("content") or ""
                     if not isinstance(chunk, str):
                         raise TypeError("content must be a string")
@@ -153,12 +137,47 @@ class OllamaProvider:
                     raw_calls = message.get("tool_calls") or []
                     if raw_calls:
                         calls = tuple(self._tool_call(item) for item in raw_calls)
+                    now = time.monotonic()
+                    if on_progress is not None and now - last_progress >= self._progress_interval:
+                        last_progress = now
+                        await on_progress(
+                            {
+                                "stage": "llm",
+                                "elapsed_ms": int((now - started) * 1000),
+                                "chunks": chunk_count,
+                                "thinking": thinking_chunk_count > 0,
+                            }
+                        )
         except httpx.TimeoutException as exc:
+            outcome = "timeout"
             raise LLMTimeout("Ollama request timed out") from exc
         except httpx.HTTPError as exc:
+            outcome = "unavailable"
             raise LLMUnavailable("Ollama request failed") from exc
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            outcome = "invalid_response"
             raise LLMInvalidResponse("Ollama returned an invalid streaming response") from exc
+        finally:
+            # 스트림이 어떻게 끝났든 "그동안 무엇이 흐르고 있었는지"를 남긴다.
+            # 화면에 ping만 보이는 턴이 죽은 행인지 비가시 생성(thinking·사고 블록)인지는
+            # 이 카운터 없이는 사후에 구분할 수 없다(실측 트레이스 2026-09-29).
+            LOG.info(
+                "llm_stream",
+                extra={
+                    "request_id": current_request_id(),
+                    "mode": "stream",
+                    "model": self._model,
+                    "outcome": outcome,
+                    "elapsed_ms": int((time.monotonic() - started) * 1000),
+                    "chunks": chunk_count,
+                    "thinking_chunks": thinking_chunk_count,
+                    "visible_chars": sum(len(part) for part in content_parts),
+                    "tool_call_count": len(calls),
+                    "prompt_eval_count": self._optional_int(final.get("prompt_eval_count")),
+                    "eval_count": self._optional_int(final.get("eval_count")),
+                    "done_reason": final.get("done_reason"),
+                },
+            )
         tail = sanitizer.finish()
         if tail:
             content_parts.append(tail)

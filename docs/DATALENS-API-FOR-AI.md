@@ -176,7 +176,7 @@ content-type: application/json
 
 `Accept: text/event-stream` 헤더를 추가한다. URL과 body는 동일하다.
 
-**이벤트 순서**: `start` → (`tool_call` 0회 이상) → (`token` 다수) → (`dataset` 0회 이상) → `done`
+**이벤트 순서**: `start` → (`tool_call` 0회 이상) → (`progress` 0회 이상) → (`token` 다수) → (`dataset` 0회 이상) → `done`
 오류 시 어느 지점에서든 `error` 후 종료.
 
 ```
@@ -188,6 +188,9 @@ data: {"index":1,"tool":"schema","status":"started"}
 
 event: tool_call
 data: {"index":1,"tool":"schema","status":"completed","elapsed_ms":1240}
+
+event: progress
+data: {"stage":"llm","elapsed_ms":15200,"chunks":34,"thinking":true}
 
 event: token
 data: {"text":"안녕하세요"}
@@ -205,7 +208,11 @@ data: {"status":"completed","metadata":{"duration_ms":25654,"tool_calls":2}}
 **처리 규칙**
 
 - `token.text`를 **줄바꿈 없이 이어붙인다.** 조각 단위이며 단어 중간에서 끊길 수 있다
-- `: ping` 으로 시작하는 줄은 주석이다. 무시한다 (15초 간격 keep-alive)
+- `: ping` 으로 시작하는 줄은 주석이다. 무시한다 (15초 간격 keep-alive). ping은 **연결**이
+  살아 있다는 뜻일 뿐이다 — **작업** 진행 여부는 `progress` 이벤트로 판단한다
+- `progress`는 LLM 생성이 15초를 넘길 때마다 온다. `thinking:true`면 모델이 화면에 보이지
+  않는 추론 중이라는 뜻이므로 "생각 중" 같은 표시로 사용자에게 알린다. 오래 걸려도 죽은 것이
+  아니다 — 서버는 활동이 있는 한 작업을 끊지 않고, 활동이 끊기면 `error`로 종료를 알린다
 - `tool_call`은 진행 표시에 사용한다. `status`가 `started`/`completed`로 두 번 온다
 - `dataset` 이벤트를 받으면 **즉시** §5 rows를 호출해 표를 채운다. `done`을 기다리지 않는다
 - `error` 이벤트의 data는 §3.1 실패 응답의 `error` 객체와 동일한 구조다

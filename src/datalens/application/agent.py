@@ -174,7 +174,12 @@ class BoundedAgent:
 
         try:
             while True:
+                # deadline은 신규 작업 마감이다: 여기(호출 사이)서만 검사하고,
+                # 진행 중인 생성은 프로바이더의 유휴 워치독만 끊을 수 있다(ADR-033).
                 self._remaining(deadline)
+                # LLM 호출 도중 끊기면 어느 단계에서 멈췄는지 failed_step으로 남는다.
+                step.clear()
+                step.update({"index": tool_count + 1, "tool": "llm"})
                 try:
                     if event_sink is not None and hasattr(self._provider, "complete_stream"):
                         turn = await self._provider.complete_stream(
@@ -183,15 +188,23 @@ class BoundedAgent:
                             deadline,
                             OutputPolicy(),
                             lambda text: event_sink("token", {"text": text}),
+                            lambda data: event_sink("progress", data),
                         )
                     else:
                         turn = await self._provider.complete(messages, tools, deadline, OutputPolicy())
                 except LLMTimeout as exc:
+                    step["upstream_code"] = "LLM_IDLE_TIMEOUT"
+                    step["detail"] = str(exc)
                     raise AgentTimeoutError("LLM deadline exceeded") from exc
                 except LLMUnavailable as exc:
+                    step["upstream_code"] = "LLM_UNAVAILABLE"
+                    step["detail"] = str(exc)
                     raise AgentUpstreamUnavailable("LLM provider failed") from exc
                 except LLMInvalidResponse as exc:
+                    step["upstream_code"] = "LLM_INVALID_RESPONSE"
+                    step["detail"] = str(exc)
                     raise AgentInvalidUpstreamResponse("LLM provider returned an invalid response") from exc
+                step.clear()
 
                 if not turn.tool_calls:
                     answer = (turn.content or "").strip()

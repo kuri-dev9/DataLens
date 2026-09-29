@@ -311,6 +311,12 @@ class Handler(BaseHTTPRequestHandler):
                 "preview": rows(5),
             },
         )
+        # 생성이 progress_interval(기본 15s)을 넘기면 실서버가 보내는 진행 표식(ADR-033).
+        # 목업은 흐름 확인용으로 답변 생성 직전에 한 번 흘린다.
+        self.emit(
+            "progress",
+            {"stage": "llm", "elapsed_ms": int((time.monotonic() - started) * 1000), "chunks": 24, "thinking": True},
+        )
         for piece in re.findall(r".{1,12}", ANSWER, re.DOTALL):
             self.emit("token", {"text": piece})
             time.sleep(self.delay / 40)

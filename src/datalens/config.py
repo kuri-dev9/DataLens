@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     ollama_base_url: AnyHttpUrl = "http://127.0.0.1:11434"
     ollama_model: str = Field("gemma4:26b", min_length=1, max_length=128)
     ollama_request_timeout_seconds: float = Field(120.0, gt=0)
+    # 유휴 판정 기준. 이 시간 동안 스트림 청크가 하나도 없을 때만 LLM 호출을 끊는다(ADR-033).
+    ollama_idle_timeout_seconds: float = Field(120.0, gt=0)
+    # 단일 생성의 토큰 상한. 반복 루프처럼 "살아있지만 끝나지 않는" 생성을 유일하게 끊는 장치다.
+    ollama_num_predict: int = Field(2048, gt=0)
+    # 생성 진행 중 progress 이벤트 발행 주기.
+    llm_progress_interval_seconds: float = Field(15.0, gt=0)
     ollama_num_ctx: int = Field(8192, gt=0)
     ollama_temperature: float = Field(0.2, ge=0)
     ollama_top_p: float = Field(0.95, ge=0, le=1)

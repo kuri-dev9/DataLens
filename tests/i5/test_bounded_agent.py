@@ -418,6 +418,52 @@ async def test_llm_and_queryforge_timeouts_are_normalized() -> None:
 
 
 @pytest.mark.anyio
+async def test_wdg_ac1_llm_idle_timeout_reports_failed_step_and_keeps_datasets() -> None:
+    # 유휴 워치독이 LLM 호출을 끊으면, 어느 단계에서 멈췄는지와 그때까지 확보한
+    # 부분 결과가 함께 남아야 한다(ADR-033 WDG-AC-1).
+    provider = FakeProvider(
+        [
+            calling("query", {"source": {"table": "events"}, "select": [{"column": "event_time"}], "partition_scope": {"kind": "latest"}}),
+            LLMTimeout("Ollama request timed out"),
+        ]
+    )
+    qf = FakeQueryForge([ok_query()])
+    with pytest.raises(AgentTimeoutError) as excinfo:
+        await BoundedAgent(provider, qf, max_tool_calls=3, recovery_budget=1).run(session(), "질문", time.monotonic() + 2)
+    exc = excinfo.value
+    assert exc.failed_step == {
+        "index": 2,
+        "tool": "llm",
+        "upstream_code": "LLM_IDLE_TIMEOUT",
+        "detail": "Ollama request timed out",
+    }
+    assert exc.datasets[0].dataset_id == "ds_000000001"
+
+
+@pytest.mark.anyio
+async def test_wdg_ac5_progress_events_are_forwarded_to_the_sink() -> None:
+    class ProgressProvider:
+        async def complete(self, messages, tools, deadline, output_policy):
+            raise AssertionError("streaming path must be used")
+
+        async def complete_stream(self, messages, tools, deadline, output_policy, on_token, on_progress=None):
+            await on_progress({"stage": "llm", "elapsed_ms": 15000, "chunks": 42, "thinking": True})
+            await on_token("답변")
+            return AssistantTurn("답변", (), "stop")
+
+    events = []
+
+    async def sink(event, data):
+        events.append((event, data))
+
+    result = await BoundedAgent(ProgressProvider(), FakeQueryForge(), max_tool_calls=3, recovery_budget=1).run(
+        session(), "질문", time.monotonic() + 2, sink
+    )
+    assert result.answer == "답변"
+    assert ("progress", {"stage": "llm", "elapsed_ms": 15000, "chunks": 42, "thinking": True}) in events
+
+
+@pytest.mark.anyio
 async def test_expired_before_llm_and_state_preserved_on_failure() -> None:
     original = session()
     provider = FakeProvider([assistant("never")])

@@ -136,6 +136,14 @@ def test_progress_trace_stays_one_line_per_step() -> None:
     assert 'what.textContent=`${label} → ${briefly(data.error?.code||"실패")}${retry}`' in source
 
 
+def test_wdg_ac5_progress_event_keeps_the_user_informed() -> None:
+    # 생성이 오래 걸릴 때 죽은 것처럼 보이지 않아야 한다(ADR-033).
+    source = DEMO.read_text()
+    assert 'name==="progress"' in source
+    assert "생각 중" in source
+    assert "초 경과" in source
+
+
 def test_memory_recall_is_shown_in_the_trace() -> None:
     source = DEMO.read_text()
     assert 'if(name==="memory")renderMemory(trace,data)' in source

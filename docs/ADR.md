@@ -1232,6 +1232,101 @@ QueryForge가 통제할 수도 없고 통제해서도 안 되는 영역이다(Cl
 
 ---
 
+## ADR-033 — 무응답 워치독: 활동 기반 생존 판정 (PRESTUDY C)
+
+**상태**: `ACCEPTED` (2026-09-29 감독자 승인 — 선택지 확정 내역은 아래 표)
+
+### 맥락
+
+실측 트레이스(2026-09-29, DATALENS-GRAPHIO-PRESTUDY §8): query 2회 rejected 후 **625초+ 동안
+SSE ping만 36회**. 설정상 전역 deadline 240초·LLM 타임아웃 120초가 모두 발동하지 않았다.
+
+코드 조사로 판정한 원인 (실서버 확증은 OBS 계측으로 진행):
+
+1. **httpx float timeout의 read 항목은 스트리밍 응답에서 "청크 읽기 1회마다" 적용된다.**
+   `ollama.py complete_stream`은 이 값 하나로 타임아웃을 걸므로, 청크가 흐르는 한 120초는
+   총 시간을 전혀 제한하지 않는다.
+2. 역으로, Ollama가 120초 이상 완전히 침묵했다면 `LLMTimeout`이 발동해 error 이벤트가
+   났을 것이다. 미발동 = 청크가 계속 도착 중 = **Ollama는 죽은 것이 아니라 생성 중이었다.**
+3. 그 생성물이 사용자에게 비가시였다: `complete_stream`은 `message.content`만 읽어
+   **`message.thinking` 필드를 무시**하고, content로 온 사고 블록은 `ThoughtStreamSanitizer`가
+   삼킨다 → token 이벤트 0건 → 화면에는 ping만.
+4. **생성 길이 상한이 없다.** `OutputPolicy.max_output_tokens` 기본값이 None이고 Agent가 항상
+   `OutputPolicy()`를 넘기므로 `num_predict`가 설정되지 않는다. 모델이 반복 루프에 빠지면
+   생성이 끝나지 않는다.
+5. 전역 deadline은 `agent.py _remaining()`이 LLM 호출 "사이"에서만 검사한다. 호출 도중은
+   무방비다.
+
+결함의 본질은 "타임아웃이 발동하지 않은 것"이 아니라 **①생성 상한 부재 ②진행 가시성 부재
+③'살아있음(유휴 아님)'과 '끝나야 함(총량 상한)'의 의미론 미정의**다.
+
+### 결정 — PRESTUDY C 원문(벽시계 하드킬)을 완화한다
+
+PRESTUDY C의 "어떤 하위 호출도 deadline을 넘겨 살아남을 수 없다"를 문자 그대로(벽시계 강제
+종료) 채택하지 않는다. **실제 데이터가 흐르고 있는 작업은 시간이 지났다는 이유만으로 죽이지
+않는다.** 대신 유한성은 다음 조합으로 보장한다 — 총 시간 상한 ≤ deadline + 마지막 생성의
+유계(토큰 상한 × 토큰당 시간, 유휴 시 idle_timeout):
+
+1. **유휴 워치독 — 죽음만 판정.** 스트림에서 `idle_timeout` 동안 청크가 0개일 때만
+   `LLMTimeout`으로 끊는다(진짜 행: 프로세스 사망·네트워크 단절 — graphio G-4/E-1). 끊을 때
+   error 이벤트 + `failed_step` 동봉, 부분 결과(datasets·warnings) 보존. thinking 청크
+   수신도 활동으로 계수한다.
+2. **진행 표식.** 생성이 진행 중인 동안 주기적으로 진행 이벤트를 SSE로 발행한다(경과 시간·
+   수신 청크 수·thinking 여부). `: ping`은 연결 생존 표시일 뿐 작업 생존 표시가 아니다.
+3. **생성 상한 — 시간이 아니라 토큰 기준.** `num_predict`를 설정한다. "살아있지만 영원히
+   안 끝남(반복 루프)"은 유휴 워치독이 못 잡는 유일한 케이스이며 토큰 상한만이 결정적으로
+   끊는다. 상한 도달(`done_reason=length`)은 오류가 아니라 정상 종료로 처리한다.
+4. **deadline 의미 재정의 — 킬 스위치가 아니라 신규 작업 마감.** deadline 초과 후 새 도구
+   호출·새 LLM 턴을 시작하지 않는다. 진행 중인 생성은 1·3이 유한성을 보장하므로 기다린다.
+5. (부수 결함) non-stream 경로(`complete`)는 응답이 끝날 때까지 바이트가 오지 않아 정당한
+   121초짜리 생성도 read 타임아웃에 죽는다 — 정반대 문제. 내부 호출의 스트리밍 통일을 함께
+   검토한다.
+
+### 확정된 선택 (2026-09-29 승인)
+
+| 항목 | 결정 |
+|---|---|
+| 진행 표식 채널 | 새 SSE 이벤트 `progress` 추가. data: `{stage:"llm", elapsed_ms, chunks, thinking}`. 기존 이벤트는 변경 없음(추가만). B 트랙의 "새 이벤트 금지"와 별개 결정 |
+| deadline 초과 시 동작 | (A) 채택 — deadline(`request_deadline_seconds`, 턴 전체 벽시계)은 호출 사이에서만 검사해 `AgentTimeoutError`(부분 결과 보존). **진행 중인 호출을 끊는 주체는 유휴 타임아웃뿐이다** — "hang에 의한 종료만 존재한다"는 감독자 지시. (B) 마무리 턴은 후속 개선 |
+| 기본값 | `ollama_idle_timeout_seconds` 120 · `ollama_num_predict` 2048 · `llm_progress_interval_seconds` 15 (전부 env로 조정 가능) |
+| 비스트리밍 경로 | 검토 결과 채택 — `complete()`도 내부 전송을 스트리밍으로 통일. 비스트리밍 HTTP는 read 타임아웃이 유휴 판정이 아니라 총 시간 상한으로 오작동하기 때문 |
+
+### 인수 기준
+
+```
+WDG (tests/i4/test_ollama_provider.py::test_wdg_ac2·ac3·ac5,
+     tests/i5/test_bounded_agent.py::test_wdg_ac1·ac5,
+     WDG-AC-4는 기존 test_expired_before_llm_and_state_preserved_on_failure가 검증):
+  WDG-AC-1  스트림에서 idle_timeout 동안 청크가 없으면 LLMTimeout으로 종료되고,
+            error 이벤트에 failed_step과 부분 결과(datasets·warnings)가 동봉된다
+  WDG-AC-2  청크가 idle_timeout 미만 간격으로 계속 도착하는 한, 전역 deadline이
+            지나도 진행 중인 생성은 중단되지 않는다
+  WDG-AC-3  num_predict 상한으로 생성이 끝나면(done_reason=length) 턴은 오류가
+            아니라 정상 마무리 경로를 탄다
+  WDG-AC-4  deadline 초과 후 Agent는 새 도구 호출·새 LLM 턴을 시작하지 않는다
+  WDG-AC-5  생성 진행 중 진행 이벤트가 주기적으로 발행된다(경과·청크 수·thinking 여부)
+OBS (구현·테스트 완료 — tests/i4/test_ollama_provider.py::test_obs_ac1~3):
+  OBS-AC-1  모든 LLM 완료 응답에서 prompt_eval_count·eval_count·done_reason·
+            elapsed_ms가 로깅된다 (PRESTUDY §3.E num_ctx 실측의 전제)
+  OBS-AC-2  스트림 소비 통계(청크 수·thinking 청크 수·가시 문자 수)가 로깅되어,
+            비가시 생성과 죽은 행을 사후에 구분할 수 있다
+  OBS-AC-3  스트림이 예외로 끝나도 그 시점까지의 통계가 outcome과 함께 로깅된다
+```
+
+### 근거
+
+죽은 행의 판별 기준은 시간 경과가 아니라 **활동 부재**다. 벽시계 하드킬은 정당한 장시간
+작업(느린 GPU, 큰 프롬프트 평가, 긴 정상 생성)을 원인 불문 죽이면서, 정작 이번 사건(활동은
+있는데 안 보이고 안 끝남)은 원인을 건드리지 못한다. 유휴 판정 + 토큰 상한 + 진행 가시화는
+세 결함 각각에 일대일로 대응하며, 어느 것도 살아있는 작업을 죽이지 않는다.
+
+### 함께 갱신되는 사항
+
+진행 이벤트 채택 시 docs/API.md · DATALENS-API-FOR-AI.md · scripts/mock_server.py ·
+demo/datalens-demo.html · tests/i12 계약 테스트 · UI-HANDOFF 실측표.
+
+---
+
 ## 현재 재검토 항목
 
 | 항목 | 상태 |
@@ -1256,3 +1351,4 @@ QueryForge가 통제할 수도 없고 통제해서도 안 되는 영역이다(Cl
 | 0.6 | 2026-08-26 | 공식 MCP SDK session, 독립 versioned image 배포, 현재 구현·재검토 항목 반영 |
 | 0.7 | 2026-08-30 | ADR-017 개정 — mcp.max_response_bytes 재정의(Agent 컨텍스트 보호 → 서버 자원 보호), 기본값 32,768 → 10,485,760 |
 | 0.8 | 2026-09-08 | Phase 0 consistency gate. DataLens의 QueryForge wheel runtime 의존 제거, 현재 Dataset/Preview 계약 반영, 세 Session 및 Agent/deadline 소유권 명확화 |
+| 0.9 | 2026-09-29 | ADR-033 신규·승인(ACCEPTED) — 무응답 워치독을 활동 기반 생존 판정으로 설계·구현. 실측 트레이스 원인 판정, OBS 계측, progress 이벤트, num_predict 상한, complete() 스트리밍 통일 |

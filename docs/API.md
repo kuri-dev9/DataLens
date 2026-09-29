@@ -112,13 +112,20 @@ x-api-key: <DataLens API key>
 기존 JSON 응답이다. SSE 응답은 `Cache-Control: no-cache`와
 `X-Accel-Buffering: no`를 포함하고, 장시간 이벤트가 없으면 15초마다 `: ping` 주석을 보낸다.
 
-메시지 스트림 이벤트는 `start`, `tool_call`, `token`, `dataset`, `done` 순서로 발생할 수
-있다. 오류는 기존 `DL_*` 본문을 담은 `error` 이벤트 후 종료된다. thinking 블록은 제거되어
-`token` 이벤트에 포함되지 않는다.
+메시지 스트림 이벤트는 `start`, `tool_call`, `progress`, `token`, `dataset`, `done` 순서로
+발생할 수 있다. 오류는 기존 `DL_*` 본문을 담은 `error` 이벤트 후 종료된다. thinking 블록은
+제거되어 `token` 이벤트에 포함되지 않는다.
+
+LLM 생성이 오래 걸리면(기본 15초 간격) `progress` 이벤트로 작업이 살아 있음을 알린다.
+`: ping` 주석은 연결 생존 표시일 뿐이므로, 작업 진행 여부는 `progress`로 판단해야 한다.
+`thinking`이 true면 모델이 화면에 보이지 않는 추론을 진행 중이라는 뜻이다.
 
 ```text
 event: start
 data: {"request_id":"dlr_...","session_id":"dls_..."}
+
+event: progress
+data: {"stage":"llm","elapsed_ms":15200,"chunks":34,"thinking":true}
 
 event: token
 data: {"text":"안녕하세요"}

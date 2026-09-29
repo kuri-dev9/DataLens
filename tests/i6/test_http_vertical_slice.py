@@ -109,7 +109,7 @@ class ToolCallingProvider:
             )
         return AssistantTurn("정상 완료", (), "stop")
 
-    async def complete_stream(self, messages, tools, deadline, output_policy, on_token):
+    async def complete_stream(self, messages, tools, deadline, output_policy, on_token, on_progress=None):
         turn = await self.complete(messages, tools, deadline, output_policy)
         if not turn.tool_calls:
             await on_token("정상 ")

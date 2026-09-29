@@ -76,6 +76,7 @@ class LLMProvider(Protocol):
         deadline: float,
         output_policy: OutputPolicy,
         on_token: Callable[[str], Awaitable[None]],
+        on_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> AssistantTurn: ...
 
     async def close(self) -> None: ...
