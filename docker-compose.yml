@@ -1,18 +1,57 @@
+name: ${COMPOSE_PROJECT_NAME:-probe-poc}
+
 services:
+  queryforge:
+    image: ${QUERYFORGE_IMAGE:-queryforge:local}
+    build:
+      context: ${QUERYFORGE_CONTEXT:-../QueryForge}
+      dockerfile: Dockerfile
+    container_name: pp-queryforge
+    restart: unless-stopped
+    env_file:
+      - path: ${DATALENS_ENV_FILE:-.env}
+        required: true
+    environment:
+      QUERYFORGE_HOST: 0.0.0.0
+      QUERYFORGE_PORT: "8080"
+    volumes:
+      - ./deploy/queryforge.yaml:/etc/queryforge/queryforge.yaml:ro
+      - qf_state:/var/lib/queryforge
+    ports:
+      # ADR-011 — 외부 노출 금지. 기본 바인드 호스트를 127.0.0.1에서 올리지 않는다.
+      - "${QUERYFORGE_BIND_HOST:-127.0.0.1}:${QUERYFORGE_BIND_PORT:-8080}:8080"
+    networks: [ppnet]
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    stop_grace_period: 30s
+
   datalens:
     image: ${DATALENS_IMAGE:-datalens:0.1.0}
     build:
       context: .
       dockerfile: Dockerfile
+    container_name: pp-datalens
     restart: unless-stopped
     env_file:
       - path: ${DATALENS_ENV_FILE:-.env}
         required: true
+    depends_on:
+      queryforge:
+        condition: service_healthy
+    extra_hosts:
+      # 호스트에서 도는 Ollama에 붙는다.
+      - "host.docker.internal:host-gateway"
     ports:
-      - "${DATALENS_BIND_PORT:-8000}:${DATALENS_HTTP_PORT:-8000}"
+      - "${DATALENS_BIND_HOST:-127.0.0.1}:${DATALENS_BIND_PORT:-8000}:${DATALENS_HTTP_PORT:-8000}"
     volumes:
       # 학습한 성공 플랜과 용어 사전. 컨테이너를 다시 만들어도 남아야 한다.
       - datalens-memory:/var/lib/datalens
+    networks: [ppnet]
     healthcheck:
       test: ["CMD", "python", "-c", "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.getenv('DATALENS_HTTP_PORT','8000')+'/v1/health', timeout=2)"]
       interval: 10s
@@ -21,5 +60,10 @@ services:
       start_period: 5s
     stop_grace_period: 40s
 
+networks:
+  ppnet:
+    driver: bridge
+
 volumes:
   datalens-memory:
+  qf_state:

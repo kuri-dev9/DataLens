@@ -20,3 +20,8 @@ build/
 # Local configuration
 .env
 .datalens/
+
+# Server-local deployment config
+deploy/
+exporting/
+docker-compose.override.yml
