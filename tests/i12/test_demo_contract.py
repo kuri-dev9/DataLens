@@ -144,6 +144,29 @@ def test_wdg_ac5_progress_event_keeps_the_user_informed() -> None:
     assert "초 경과" in source
 
 
+def test_ui_catalog_view_always_offers_a_way_back_to_chat() -> None:
+    source = DEMO.read_text()
+    # 같은 버튼으로 나올 수 있고(토글), 목록을 스크롤해도 상단 이동줄이 남고, Esc로도 복귀한다.
+    assert '?showChat():showCatalog()' in source
+    assert "catalog-head{display:flex;gap:8px;position:sticky" in source
+    assert 'event.key==="Escape"' in source
+
+
+def test_ui_altenter_inserts_newline_and_enter_sends() -> None:
+    source = DEMO.read_text()
+    assert '<textarea id="messageInput"' in source
+    assert "event.altKey" in source and "requestSubmit()" in source
+    # 한글 IME 조합 확정 Enter가 전송으로 새면 안 된다.
+    assert "event.isComposing" in source
+
+
+def test_ui_liveness_timer_ticks_while_waiting() -> None:
+    # 상태줄에 경과 초가 계속 흘러야 침묵 구간에서도 살아 있음이 보인다.
+    source = DEMO.read_text()
+    assert "초 경과" in source
+    assert "clearInterval(ticker)" in source
+
+
 def test_memory_recall_is_shown_in_the_trace() -> None:
     source = DEMO.read_text()
     assert 'if(name==="memory")renderMemory(trace,data)' in source
