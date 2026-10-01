@@ -16,6 +16,13 @@ LOG = logging.getLogger("datalens.grounding")
 # 하이픈 앞에 숫자가 오면 음수 부호가 아니라 구분자다. 이걸 놓치면
 # "2024-05-30"이 [2024, -05, -30]으로 쪼개져 날짜가 통째로 미검증이 된다.
 _NUM = re.compile(r"(?<!\d)-?\d+(?:\.\d+)?")
+# 날짜는 성분으로 쪼개지 않고 하나의 주장으로 센다. "2024년 5월 30일"이 3건으로
+# 분해되면 반복 인용 한 번에 비율이 왜곡된다(실측 2026-10-01: ungrounded 9건 중
+# 6건이 단일 날짜 주장의 반복 분해였다).
+_DATE = re.compile(
+    r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}"
+    r"|(?:\d{4}\s*년\s*)?\d{1,2}\s*월\s*\d{1,2}\s*일"
+)
 # 스텝 번호·목록 번호처럼 본문 구조에서 나오는 작은 정수. 1단계에서는 세되 표시만 한다.
 _SMALL_INT_LIMIT = 12
 
@@ -78,19 +85,76 @@ def _nearest(value: float, allowed: list[float]) -> tuple[float | None, float | 
     return nearest, round(abs(nearest - value) / scale * 100, 4)
 
 
+def _claims_in(answer: str) -> list[dict[str, Any]]:
+    """answer에서 주장(claim)을 뽑는다. 날짜 한 덩어리가 주장 하나다."""
+    claims: list[dict[str, Any]] = []
+    for match in _DATE.finditer(answer):
+        claims.append(
+            {"kind": "date", "value": match.group().strip(), "components": numbers_in(match.group()), "pos": match.start()}
+        )
+    # 날짜 구간을 같은 길이의 공백으로 치우고 남은 숫자만 일반 수치 주장으로 센다.
+    rest = _DATE.sub(lambda match: " " * len(match.group()), answer)
+    for match in _NUM.finditer(rest):
+        claims.append({"kind": "number", "value": match.group(), "pos": match.start()})
+    claims.sort(key=lambda claim: claim["pos"])
+    return claims
+
+
+def _claim_key(claim: dict[str, Any]) -> tuple[Any, ...]:
+    """동일 값의 반복 인용은 주장 하나다. "2024-05-30"과 "2024년 5월 30일"도 같은 주장이다."""
+    if claim["kind"] == "date":
+        return ("date", *(_normal(token) for token in claim["components"]))
+    return ("number", _normal(claim["value"]))
+
+
+def _normal(token: str) -> str:
+    parsed = _as_float(token)
+    return f"{parsed:g}" if parsed is not None else token
+
+
+def _in_facts(token: str, facts: set[str]) -> bool:
+    return token in facts or _normal(token) in facts
+
+
 def measure(answer: str, facts: set[str]) -> dict[str, Any]:
-    """answer의 수치를 근거 집합과 대조한다. answer는 건드리지 않는다."""
-    found = numbers_in(answer)
+    """answer의 수치 주장을 근거 집합과 대조한다. answer는 건드리지 않는다.
+
+    계수 단위는 주장(claim)이다: 같은 값의 반복 인용은 1건, 날짜는 성분을 묶어 1건.
+    """
     allowed_floats = [parsed for parsed in (_as_float(item) for item in facts) if parsed is not None]
+
+    unique: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for claim in _claims_in(answer):
+        key = _claim_key(claim)
+        if key in unique:
+            unique[key]["occurrences"] += 1
+            continue
+        claim["occurrences"] = 1
+        unique[key] = claim
 
     ungrounded: list[dict[str, Any]] = []
     grounded = 0
-    for token in found:
-        if token in facts:
-            grounded += 1
+    for claim in unique.values():
+        if claim["kind"] == "date":
+            missing = [token for token in claim["components"] if not _in_facts(token, facts)]
+            if not missing:
+                grounded += 1
+                continue
+            ungrounded.append(
+                {
+                    "value": claim["value"],
+                    "date": True,
+                    "missing": missing,
+                    "nearest": None,
+                    "deviation_pct": None,
+                    "small_int": False,
+                    "occurrences": claim["occurrences"],
+                }
+            )
             continue
+        token = claim["value"]
         value = _as_float(token)
-        if value is None:
+        if _in_facts(token, facts) or value is None:
             grounded += 1
             continue
         nearest, deviation = _nearest(value, allowed_floats)
@@ -100,10 +164,11 @@ def measure(answer: str, facts: set[str]) -> dict[str, Any]:
                 "nearest": nearest,
                 "deviation_pct": deviation,
                 "small_int": value.is_integer() and abs(value) <= _SMALL_INT_LIMIT,
+                "occurrences": claim["occurrences"],
             }
         )
 
-    total = len(found)
+    total = len(unique)
     deviations = [item["deviation_pct"] for item in ungrounded if item["deviation_pct"] is not None]
     return {
         "total": total,

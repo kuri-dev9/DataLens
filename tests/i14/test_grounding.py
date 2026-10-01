@@ -134,6 +134,43 @@ def test_zero_padded_number_matches_bare_form() -> None:
     assert "5" in facts and "05" in facts
 
 
+def test_repeated_claim_is_counted_once() -> None:
+    """실측 회귀: 같은 미검증 값이 3회 반복 인용되면 3건으로 불어나
+    ungrounded_ratio가 왜곡되던 문제. 주장 단위로 1건, occurrences로 횟수를 남긴다."""
+    report = measure("총 999999건입니다. 다시 말하지만 999999건, 즉 999999건입니다", set())
+    assert report["total"] == 1
+    assert report["ungrounded"][0]["occurrences"] == 3
+    assert report["ungrounded_ratio_pct"] == 100.0
+
+
+def test_date_is_one_claim_not_three_numbers() -> None:
+    """실측 회귀: "2024년 5월 30일"이 [2024, 5, 30] 3건으로 분해되던 문제.
+    날짜는 주장 하나로 세고, 근거에 없는 성분만 missing으로 남긴다."""
+    facts: set[str] = set()
+    collect_facts({"upper_bound": "2024-06-01"}, facts)
+    report = measure("데이터 범위가 2024년 5월 30일까지로 확인되었습니다", facts)
+    assert report["total"] == 1
+    entry = report["ungrounded"][0]
+    assert entry["date"] is True
+    assert "5월 30일" in entry["value"]
+    assert entry["missing"] == ["5", "30"]  # 2024는 근거에 있다
+
+
+def test_same_date_in_mixed_formats_dedupes() -> None:
+    report = measure("2024-05-30 기준입니다. 즉 2024년 5월 30일입니다", set())
+    assert report["total"] == 1
+    assert report["ungrounded"][0]["occurrences"] == 2
+
+
+def test_grounded_date_claim_counts_once() -> None:
+    facts: set[str] = set()
+    collect_facts({"upper_bound": "2024-05-30 12:00:00"}, facts)
+    report = measure("2024년 5월 30일, 재차 2024-05-30 기준입니다", facts)
+    assert report["ungrounded"] == []
+    assert report["total"] == 1
+    assert report["grounded_ratio"] == 1.0
+
+
 def test_small_int_is_measured_but_flagged() -> None:
     report = measure("1단계와 2단계", set())
     assert [item["small_int"] for item in report["ungrounded"]] == [True, True]
@@ -187,6 +224,40 @@ async def test_grd_ac7_no_extra_upstream_calls() -> None:
     await agent.run(InMemorySessionStore(60).create(), "질문", time.monotonic() + 2)
     assert qf.call_count == 1
     assert not provider.turns
+
+
+@pytest.mark.anyio
+async def test_qf_empty_range_warning_reaches_warnings_and_fact_set() -> None:
+    """QF_EMPTY_RANGE가 오면 ① result.warnings로 전달되고 ② 경고 속 가용 범위
+    수치는 근거 집합에 들어가, 모델이 그 범위를 인용한 답변이 grounded로 계수된다."""
+    qf_session = "Q" * 22
+    empty_result = QueryForgeResult(
+        True,
+        qf_session,
+        {
+            "ok": True,
+            "session_id": qf_session,
+            "dataset_id": "ds_000000021",
+            "row_count": 0,
+            "columns": [],
+            "preview": [],
+            "warnings": [
+                {
+                    "code": "QF_EMPTY_RANGE",
+                    "requested": {"column": "EVENT_TIME", "from": "2024-05-30", "to": "2024-05-30"},
+                    "available": {"min": "2023-11-01", "max": "2024-05-28"},
+                    "nearest_nonempty": "2024-05-28",
+                }
+            ],
+        },
+    )
+    provider = FakeProvider(
+        [query_call(), AssistantTurn("요청 기간에는 데이터가 없고, 보유 구간은 2024년 5월 28일까지입니다", (), "stop")]
+    )
+    agent = BoundedAgent(provider, FakeQueryForge([empty_result]), max_tool_calls=3, recovery_budget=1)
+    result = await agent.run(InMemorySessionStore(60).create(), "통계 만들어줘", time.monotonic() + 2)
+    assert [item["code"] for item in result.warnings] == ["QF_EMPTY_RANGE"]
+    assert result.grounding["ungrounded"] == []
 
 
 @pytest.mark.anyio
