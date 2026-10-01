@@ -167,6 +167,16 @@ def test_ui_liveness_timer_ticks_while_waiting() -> None:
     assert "clearInterval(ticker)" in source
 
 
+def test_done_warnings_are_rendered_for_the_user() -> None:
+    """done 이벤트의 warnings(QF_EMPTY_RANGE 등)는 답변 아래에 코드와 사실만 표시한다."""
+    source = DEMO.read_text()
+    assert "renderWarnings(answer,doneData?.warnings)" in source
+    assert 'box.className="warnings"' in source
+    # 경고에 담긴 사실(가용 범위)을 그대로 보여주되, 서버 원문을 해석 없이 쓴다
+    assert "item?.available" in source
+    assert "가용 범위" in source
+
+
 def test_memory_recall_is_shown_in_the_trace() -> None:
     source = DEMO.read_text()
     assert 'if(name==="memory")renderMemory(trace,data)' in source

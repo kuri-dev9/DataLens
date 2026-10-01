@@ -216,7 +216,7 @@ event: dataset
 data: {"dataset_id":"ds_000000003","row_count":323,"columns":[...]}
 
 event: done
-data: {"status":"completed","metadata":{"duration_ms":25654,"tool_calls":2}}
+data: {"status":"completed","warnings":[],"metadata":{"duration_ms":25654,"tool_calls":2}}
 ```
 
 **처리 규칙**
@@ -229,6 +229,8 @@ data: {"status":"completed","metadata":{"duration_ms":25654,"tool_calls":2}}
   아니다 — 서버는 활동이 있는 한 작업을 끊지 않고, 활동이 끊기면 `error`로 종료를 알린다
 - `tool_call`은 진행 표시에 사용한다. `status`가 `started`/`completed`로 두 번 온다
 - `dataset` 이벤트를 받으면 **즉시** §5 rows를 호출해 표를 채운다. `done`을 기다리지 않는다
+- `done.warnings`에 상류 경고가 올 수 있다(예: `QF_EMPTY_RANGE` — 요청 기간에 데이터가
+  없을 때 실제 가용 범위를 담는다). 비어 있지 않으면 답변 아래에 코드와 함께 표시한다
 - `error` 이벤트의 data는 §3.1 실패 응답의 `error` 객체와 동일한 구조다
 - thinking 블록은 서버가 제거한다. 클라이언트에서 필터링할 필요 없다
 

@@ -291,14 +291,33 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        # "빈 기간"이 들어오면 0행 + QF_EMPTY_RANGE 경고 흐름을 재현한다.
+        # 경고는 상류가 돌려준 사실(가용 범위)만 담는다 — 해석 문구가 아니다.
+        empty_range = "빈 기간" in message
+        warnings = (
+            [
+                {
+                    "code": "QF_EMPTY_RANGE",
+                    "requested": {"column": "EVENT_TIME", "from": "2024-05-30", "to": "2024-05-30"},
+                    "available": {"min": "2023-11-01", "max": "2024-05-28"},
+                    "nearest_nonempty": "2024-05-28",
+                }
+            ]
+            if empty_range
+            else []
+        )
+        row_count = 0 if empty_range else 128
         index += 1
         self.emit("tool_call", {"index": index, "tool": "query", "status": "started", "intent": query_intent})
         time.sleep(self.delay)
+        query_result = {"dataset_id": "ds_000000008", "row_count": row_count}
+        if empty_range:
+            query_result["warning_codes"] = ["QF_EMPTY_RANGE"]
         self.emit(
             "tool_call",
             {
                 "index": index, "tool": "query", "status": "completed", "elapsed_ms": 146, "intent": query_intent,
-                "result": {"dataset_id": "ds_000000008", "row_count": 128},
+                "result": query_result,
             },
         )
         self.emit(
@@ -306,9 +325,9 @@ class Handler(BaseHTTPRequestHandler):
             {
                 "dataset_id": "ds_000000008",
                 "role": "primary",
-                "row_count": 128,
-                "columns": COLUMNS,
-                "preview": rows(5),
+                "row_count": row_count,
+                "columns": COLUMNS if not empty_range else [],
+                "preview": rows(5) if not empty_range else [],
             },
         )
         # 생성이 progress_interval(기본 15s)을 넘기면 실서버가 보내는 진행 표식(ADR-033).
@@ -324,6 +343,7 @@ class Handler(BaseHTTPRequestHandler):
             "done",
             {
                 "status": "completed",
+                "warnings": warnings,
                 "metadata": {
                     "duration_ms": int((time.monotonic() - started) * 1000),
                     "tool_calls": index,

@@ -114,7 +114,8 @@ x-api-key: <DataLens API key>
 
 메시지 스트림 이벤트는 `start`, `tool_call`, `progress`, `token`, `dataset`, `done` 순서로
 발생할 수 있다. 오류는 기존 `DL_*` 본문을 담은 `error` 이벤트 후 종료된다. thinking 블록은
-제거되어 `token` 이벤트에 포함되지 않는다.
+제거되어 `token` 이벤트에 포함되지 않는다. `done` 이벤트의 data에는 `metadata`와 함께
+턴 중 수집된 상류 경고 `warnings` 배열이 포함된다(JSON 응답의 `warnings`와 동일 구조).
 
 LLM 생성이 오래 걸리면(기본 15초 간격) `progress` 이벤트로 작업이 살아 있음을 알린다.
 `: ping` 주석은 연결 생존 표시일 뿐이므로, 작업 진행 여부는 `progress`로 판단해야 한다.
@@ -131,7 +132,7 @@ event: token
 data: {"text":"안녕하세요"}
 
 event: done
-data: {"status":"completed","metadata":{"duration_ms":1200,"tool_calls":0}}
+data: {"status":"completed","warnings":[],"metadata":{"duration_ms":1200,"tool_calls":0}}
 ```
 
 rows 스트림은 `meta` → 100행 단위 `rows` → `done`, 카탈로그 스트림은 `meta` →

@@ -497,6 +497,15 @@ class BoundedAgent:
             summary["partitioned"] = bool(bounded["partitioned"])
         if bounded.get("truncated"):
             summary["truncated"] = True
+        # 행 데이터는 담지 않지만, 경고 코드는 "0행이 왜 0행인지"를 trace에서
+        # 바로 보여주는 단서라 요약에 남긴다.
+        codes = [
+            item["code"]
+            for item in bounded.get("warnings") or []
+            if isinstance(item, dict) and isinstance(item.get("code"), str)
+        ]
+        if codes:
+            summary["warning_codes"] = codes[:5]
         return summary
 
     @staticmethod

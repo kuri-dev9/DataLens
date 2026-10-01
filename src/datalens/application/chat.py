@@ -120,6 +120,9 @@ class ChatApplicationService:
         )
         return {
             "status": "completed",
+            # JSON 응답과 달리 스트림에는 최종 본문이 없다. QF_EMPTY_RANGE 같은
+            # 상류 경고가 사용자에게 닿는 유일한 통로가 done 이벤트다.
+            "warnings": list(result.warnings),
             "metadata": {
                 "duration_ms": duration_ms,
                 "tool_calls": result.tool_calls,
