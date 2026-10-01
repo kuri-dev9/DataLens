@@ -1448,6 +1448,53 @@ GRD-AC-8  미검증 수치마다 최근접 근거값과 deviation_pct가 산출�
 
 ---
 
+## ADR-035 — 세션 데이터셋 계보 노출과 상류 경고 전달
+
+**상태**: `ACCEPTED` (2026-10-01 — 구현·테스트 완료)
+
+### 맥락
+
+실측 트레이스(2026-10-01)에서 두 가지가 보였다. ① 0행 query 뒤 모델이 측정하지 않은
+데이터 범위를 "확인되었습니다"로 단정했다 — 상류가 사실(가용 범위)을 돌려줘도 그것이
+사용자에게 닿는 통로가 스트림에는 없었다. ② 세션에 이미 만들어진 데이터셋을 모델이
+다음 턴에서 참조할 방법이 없어, 같은 조회를 반복하거나 dataset_id를 지어낼 여지가 있었다.
+
+### 결정
+
+**경고 전달.** JSON 응답에만 있던 `warnings`를 SSE `done` 이벤트 data에도 담는다
+(`QF_EMPTY_RANGE` 등 상류 경고의 유일한 스트림 통로). `tool_call completed`의
+result 요약에는 `warning_codes`만 노출한다 — 행 데이터는 여전히 담지 않는다.
+경고 속 수치는 bounded 결과를 거치므로 자동으로 근거 집합에 들어간다(ADR-034 정합).
+
+**데이터셋 계보.** Session에 `dataset_lineage`(최대 8개, 오래된 것부터)를 두고,
+도구 결과·인자에서 나온 사실만 담는다: `dataset_id`·`action`·`table`·
+`parent_dataset_id`·`row_count`. 매 턴 `DataLens session context`의 `datasets`로
+모델에 노출하고, 시스템 프롬프트가 "목록에 있는 dataset_id만 재사용, 없는 id 날조 금지"를
+지시한다. 같은 데이터셋이 재사용되면 최신 자리로 옮긴다 — 상한 절단이 방금 쓴 항목을
+떨어뜨리지 않기 위해서다. 컨텍스트 메시지는 `DataLens ` 접두로 시작하므로 계보의
+수치도 근거 집합에 포함된다(이전 턴 row_count 재인용이 오탐이 되지 않는다).
+
+### 인수 기준
+
+```
+WRN-AC-1  done 이벤트 data에 warnings 배열이 포함된다 (JSON 응답과 동일 구조)
+WRN-AC-2  QF_EMPTY_RANGE의 수치를 인용한 답변은 grounded로 계수된다
+          (tests/i14::test_qf_empty_range_warning_reaches_warnings_and_fact_set)
+LIN-AC-1  query가 만든 dataset이 세션 계보에 사실 필드만으로 기록된다
+LIN-AC-2  다음 턴 세션 컨텍스트에 계보가 노출된다
+LIN-AC-3  계보의 수치는 다음 턴 근거 집합에 들어간다
+LIN-AC-4  계보는 상한(8)을 넘지 않고, 재사용 항목은 최신 자리로 이동한다
+LIN-AC-5  transform의 parent_dataset_id가 계보에 보존된다
+          (LIN-AC-1~5: tests/i15/test_dataset_lineage.py)
+```
+
+### 함께 갱신된 사항
+
+docs/API.md · DATALENS-API-FOR-AI.md(done.warnings), demo/datalens-demo.html(경고 표시),
+scripts/mock_server.py("빈 기간" 시나리오), prompts ko·ja([데이터셋 재사용]).
+
+---
+
 ## 현재 재검토 항목
 
 | 항목 | 상태 |
@@ -1471,5 +1518,6 @@ GRD-AC-8  미검증 수치마다 최근접 근거값과 deviation_pct가 산출�
 | 0.5 | 2026-08-21 | ADR-006 개정, ADR-029~032 통합. 영속 DatasetStore, lifecycle 분리, serialization, capability detection, shutdown, retry, Query Cost Guard 반영 |
 | 0.6 | 2026-08-26 | 공식 MCP SDK session, 독립 versioned image 배포, 현재 구현·재검토 항목 반영 |
 | 0.7 | 2026-08-30 | ADR-017 개정 — mcp.max_response_bytes 재정의(Agent 컨텍스트 보호 → 서버 자원 보호), 기본값 32,768 → 10,485,760 |
+| 0.8 | 2026-10-01 | ADR-034 1단계 계측 보정(주장 단위 계수 — 중복 제거·날짜 묶음·occurrences), ADR-035 등록(세션 데이터셋 계보 노출, done 이벤트 warnings 전달) |
 | 0.8 | 2026-09-08 | Phase 0 consistency gate. DataLens의 QueryForge wheel runtime 의존 제거, 현재 Dataset/Preview 계약 반영, 세 Session 및 Agent/deadline 소유권 명확화 |
 | 0.9 | 2026-09-29 | ADR-033 신규·승인(ACCEPTED) — 무응답 워치독을 활동 기반 생존 판정으로 설계·구현. 실측 트레이스 원인 판정, OBS 계측, progress 이벤트, num_predict 상한, complete() 스트리밍 통일 |

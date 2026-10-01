@@ -17,6 +17,9 @@ class Session:
     active_table: str | None = None
     active_period: dict[str, str] | None = None
     turn_state: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    # 이 세션에서 만들어진 데이터셋의 계보. 모델이 과거 데이터셋을 지어내지 않고
+    # 그대로 재사용할 수 있도록 세션 컨텍스트로 노출된다 (ADR-035).
+    dataset_lineage: tuple[dict[str, Any], ...] = field(default_factory=tuple)
 
     def public(self) -> dict[str, str]:
         return {

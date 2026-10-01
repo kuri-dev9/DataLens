@@ -36,6 +36,9 @@ from datalens.observability import current_request_id, safe_log_value
 LOG = logging.getLogger("datalens.agent")
 # 애플리케이션 계층이 가로채는 내부 이벤트. SSE로 내보내지 않는다.
 QUERYFORGE_SESSION_EVENT = "_queryforge_session"
+# 세션 컨텍스트로 노출하는 데이터셋 계보 상한. 컨텍스트는 매 턴 모델 입력에 들어가므로
+# 무한정 키우지 않고, 오래된 항목부터 떨어뜨린다.
+_LINEAGE_LIMIT = 8
 
 
 class AgentError(RuntimeError):
@@ -170,6 +173,8 @@ class BoundedAgent:
         recovery_count = 0
         qf_session_id = session.queryforge_session_id
         datasets: dict[str, DatasetReference] = {}
+        # 이번 턴에 만들어진 데이터셋의 계보 항목. 세션에 병합되어 다음 턴 컨텍스트가 된다.
+        lineage: dict[str, dict[str, Any]] = {}
         warnings: list[Any] = []
         # 모델이 실제로 받은 수치만 모은다. 여기 없는 수치는 모델이 지어낸 것이다.
         facts: set[str] = set()
@@ -231,7 +236,7 @@ class BoundedAgent:
                         message,
                         answer,
                         qf_session_id,
-                        tuple(datasets),
+                        tuple(lineage.values()),
                         active_table,
                         active_period,
                     )
@@ -358,6 +363,7 @@ class BoundedAgent:
                     reference = self._dataset_reference(result)
                     if reference is not None:
                         datasets[reference.dataset_id] = reference
+                        lineage[reference.dataset_id] = self._lineage_entry(call.name, tool_arguments, result, reference)
                         if event_sink is not None:
                             await event_sink("dataset", reference.public())
                     if call.name == "query":
@@ -617,6 +623,28 @@ class BoundedAgent:
             bounded["preview_rows"] = min(requested, self._preview_rows)
         return bounded
 
+    @staticmethod
+    def _lineage_entry(
+        tool_name: str,
+        arguments: dict[str, Any],
+        result: QueryForgeResult,
+        reference: DatasetReference,
+    ) -> dict[str, Any]:
+        """데이터셋이 어디서 왔는지 — 전부 도구 결과·인자에서 나온 사실이다."""
+        entry: dict[str, Any] = {"dataset_id": reference.dataset_id, "action": tool_name}
+        parent = result.payload.get("parent_dataset_id")
+        if isinstance(parent, str):
+            entry["parent_dataset_id"] = parent
+        table = result.payload.get("table")
+        if not isinstance(table, str):
+            source = arguments.get("source") if isinstance(arguments, dict) else None
+            table = source.get("table") if isinstance(source, dict) else None
+        if isinstance(table, str):
+            entry["table"] = table
+        if isinstance(reference.row_count, int):
+            entry["row_count"] = reference.row_count
+        return entry
+
     def _dataset_reference(self, result: QueryForgeResult) -> DatasetReference | None:
         dataset_id = result.payload.get("dataset_id")
         if not isinstance(dataset_id, str):
@@ -639,6 +667,9 @@ class BoundedAgent:
             "active_table": session.active_table,
             "active_period": session.active_period,
             "active_dataset_id": session.active_dataset_id,
+            # 이 세션에서 만들어진 데이터셋 목록(오래된 것부터). 모델은 여기 있는
+            # dataset_id만 재사용할 수 있고, 없는 id를 지어내면 안 된다.
+            "datasets": list(session.dataset_lineage),
         }
         messages = [
             ProviderMessage("system", load_system_prompt(session.locale)),
@@ -660,16 +691,24 @@ class BoundedAgent:
         user_message: str,
         answer: str,
         qf_session_id: str | None,
-        dataset_ids: tuple[str, ...],
+        new_lineage: tuple[dict[str, Any], ...],
         active_table: str | None,
         active_period: dict[str, str] | None,
     ) -> Session:
         history = (*session.turn_state, {"role": "user", "content": user_message}, {"role": "assistant", "content": answer})[-12:]
+        # 같은 데이터셋이 다시 쓰이면 최신 자리로 옮긴다. 상한을 자를 때
+        # 방금 재사용한 항목이 먼저 떨어져 나가면 안 되기 때문이다.
+        merged: dict[str, dict[str, Any]] = {}
+        for item in (*session.dataset_lineage, *new_lineage):
+            merged.pop(item["dataset_id"], None)
+            merged[item["dataset_id"]] = item
+        lineage = tuple(merged.values())[-_LINEAGE_LIMIT:]
         return replace(
             session,
             queryforge_session_id=qf_session_id,
-            active_dataset_id=dataset_ids[-1] if dataset_ids else session.active_dataset_id,
+            active_dataset_id=new_lineage[-1]["dataset_id"] if new_lineage else session.active_dataset_id,
             active_table=active_table,
             active_period=active_period,
             turn_state=tuple(history),
+            dataset_lineage=lineage,
         )
