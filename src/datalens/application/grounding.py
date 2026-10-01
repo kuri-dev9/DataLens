@@ -23,6 +23,9 @@ _DATE = re.compile(
     r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}"
     r"|(?:\d{4}\s*년\s*)?\d{1,2}\s*월\s*\d{1,2}\s*일"
 )
+# 천 단위 콤마 표기. 이걸 모르면 "41,747,290"이 [41, 747, 290] 3건의 미검증으로
+# 쪼개진다(실측 2026-10-01). 콤마를 벗긴 값으로 근거 대조하고, 표기는 원문대로 남긴다.
+_GROUPED = re.compile(r"(?<![\d,])\d{1,3}(?:,\d{3})+(?:\.\d+)?(?!\d)")
 # 스텝 번호·목록 번호처럼 본문 구조에서 나오는 작은 정수. 1단계에서는 세되 표시만 한다.
 _SMALL_INT_LIMIT = 12
 
@@ -47,7 +50,13 @@ def collect_facts(node: Any, sink: set[str]) -> None:
     elif isinstance(node, (int, float)):
         _register(float(node), sink)
     elif isinstance(node, str):
-        for token in numbers_in(node):
+        rest = node
+        for match in _GROUPED.finditer(node):
+            parsed = _as_float(match.group().replace(",", ""))
+            if parsed is not None:
+                _register(parsed, sink)
+        rest = _GROUPED.sub(lambda match: " " * len(match.group()), rest)
+        for token in numbers_in(rest):
             sink.add(token)
             parsed = _as_float(token)
             if parsed is not None:
@@ -94,6 +103,12 @@ def _claims_in(answer: str) -> list[dict[str, Any]]:
         )
     # 날짜 구간을 같은 길이의 공백으로 치우고 남은 숫자만 일반 수치 주장으로 센다.
     rest = _DATE.sub(lambda match: " " * len(match.group()), answer)
+    # 천 단위 콤마 수치는 콤마를 벗긴 값으로 대조하되 표기는 원문대로 남긴다.
+    for match in _GROUPED.finditer(rest):
+        claims.append(
+            {"kind": "number", "value": match.group(), "normalized": match.group().replace(",", ""), "pos": match.start()}
+        )
+    rest = _GROUPED.sub(lambda match: " " * len(match.group()), rest)
     for match in _NUM.finditer(rest):
         claims.append({"kind": "number", "value": match.group(), "pos": match.start()})
     claims.sort(key=lambda claim: claim["pos"])
@@ -104,7 +119,7 @@ def _claim_key(claim: dict[str, Any]) -> tuple[Any, ...]:
     """동일 값의 반복 인용은 주장 하나다. "2024-05-30"과 "2024년 5월 30일"도 같은 주장이다."""
     if claim["kind"] == "date":
         return ("date", *(_normal(token) for token in claim["components"]))
-    return ("number", _normal(claim["value"]))
+    return ("number", _normal(claim.get("normalized") or claim["value"]))
 
 
 def _normal(token: str) -> str:
@@ -152,7 +167,7 @@ def measure(answer: str, facts: set[str]) -> dict[str, Any]:
                 }
             )
             continue
-        token = claim["value"]
+        token = claim.get("normalized") or claim["value"]
         value = _as_float(token)
         if _in_facts(token, facts) or value is None:
             grounded += 1
@@ -160,7 +175,7 @@ def measure(answer: str, facts: set[str]) -> dict[str, Any]:
         nearest, deviation = _nearest(value, allowed_floats)
         ungrounded.append(
             {
-                "value": token,
+                "value": claim["value"],
                 "nearest": nearest,
                 "deviation_pct": deviation,
                 "small_int": value.is_integer() and abs(value) <= _SMALL_INT_LIMIT,

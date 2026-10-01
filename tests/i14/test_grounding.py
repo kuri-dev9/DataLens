@@ -171,6 +171,29 @@ def test_grounded_date_claim_counts_once() -> None:
     assert report["grounded_ratio"] == 1.0
 
 
+def test_comma_grouped_number_matches_fact_without_commas() -> None:
+    """실측 회귀: 모델이 쓴 "41,747,290"이 콤마에서 [41, 747, 290]으로 쪼개져
+    미검증 3건이 되던 문제. 콤마를 벗긴 값으로 대조하고 주장 1건으로 센다."""
+    facts: set[str] = set()
+    collect_facts({"TOTAL_ACTIVE_USER_CNT": 41747290}, facts)
+    report = measure("Total Active User: 41,747,290", facts)
+    assert report["ungrounded"] == []
+    assert report["total"] == 1
+
+
+def test_comma_grouped_fabricated_number_keeps_original_form() -> None:
+    report = measure("총 1,234,567건입니다", set())
+    assert report["total"] == 1
+    assert report["ungrounded"][0]["value"] == "1,234,567"
+
+
+def test_comma_grouped_fact_string_registers_joined_value() -> None:
+    facts: set[str] = set()
+    collect_facts({"note": "총 41,747,290명"}, facts)
+    assert "4.17473e+07" in facts or "41747290" in facts
+    assert measure("41747290명입니다", facts)["ungrounded"] == []
+
+
 def test_small_int_is_measured_but_flagged() -> None:
     report = measure("1단계와 2단계", set())
     assert [item["small_int"] for item in report["ungrounded"]] == [True, True]
