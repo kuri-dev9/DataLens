@@ -26,6 +26,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -150,6 +151,23 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"rows": rows(128), "offset": 0, "limit": 1000, "row_count": 128})
         if path.endswith("/meta"):
             return self.send_json({"dataset_id": "ds_000000008", "row_count": 128, "columns": COLUMNS})
+        if path == "/v1/debug/logs":
+            # 임시 디버그(PoC): 실서버의 DATALENS_DEBUG_LOG_BUFFER 흐름을 데모에서 확인하기 위한 표본.
+            query = parse_qs(urlparse(self.path).query)
+            request_id = (query.get("request_id") or [None])[0]
+            logs = [
+                {
+                    "ts": "2026-10-01T00:00:00+00:00", "level": "INFO", "logger": "datalens.agent",
+                    "message": "tool_call", "request_id": request_id, "step": 1, "tool": "query",
+                    "ok": True, "elapsed_ms": 146, "recovery_attempt": False,
+                },
+                {
+                    "ts": "2026-10-01T00:00:04+00:00", "level": "INFO", "logger": "datalens.agent",
+                    "message": "agent_turn_completed", "request_id": request_id,
+                    "operation": "agent_turn", "elapsed_ms": 4200, "status": "completed", "tool_call_count": 3,
+                },
+            ]
+            return self.send_json({"request_id": request_id, "count": len(logs), "logs": logs})
         self.send_error_payload("DL_NOT_FOUND", "Not found", 404)
 
     def do_POST(self) -> None:

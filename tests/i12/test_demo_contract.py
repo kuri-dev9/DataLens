@@ -177,6 +177,18 @@ def test_done_warnings_are_rendered_for_the_user() -> None:
     assert "가용 범위" in source
 
 
+def test_server_logs_are_attached_to_debug_entries_when_available() -> None:
+    """임시 디버그(PoC): 서버가 로그 버퍼를 켰을 때만 각 턴의 서버 로그를 콘솔 항목에
+    덧붙인다. 꺼져 있으면(404) 조용히 건너뛰어야 한다 — 실패를 만들면 안 된다."""
+    source = DEMO.read_text()
+    assert "fetchServerLogs(log,requestId)" in source
+    assert "/v1/debug/logs?request_id=" in source
+    assert "if(!response.ok)return" in source  # 404(플래그 꺼짐)는 무음 통과
+    assert "entry.server_logs=body.logs" in source
+    assert "서버 로그" in source
+    assert 'requestId=data.request_id||requestId' in source
+
+
 def test_memory_recall_is_shown_in_the_trace() -> None:
     source = DEMO.read_text()
     assert 'if(name==="memory")renderMemory(trace,data)' in source

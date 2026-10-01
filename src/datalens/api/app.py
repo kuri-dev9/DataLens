@@ -771,24 +771,27 @@ def build_app(
             }
         )
 
-    app = Starlette(
-        routes=[
-            Route("/v1/health", health, methods=["GET"]),
-            Route("/v1/ready", ready, methods=["GET"]),
-            Route("/v1/sessions", create_session, methods=["POST"]),
-            Route("/v1/sessions/{session_id:str}/messages", message, methods=["POST"]),
-            Route("/v1/sessions/{session_id:str}", delete_session, methods=["DELETE"]),
-            Route("/v1/sessions/{session_id:str}/datasets/{dataset_id:str}/rows", dataset_rows, methods=["GET"]),
-            Route("/v1/sessions/{session_id:str}/datasets/{dataset_id:str}/meta", dataset_meta, methods=["GET"]),
-            Route("/v1/sessions/{session_id:str}/catalog/tables", catalog_tables, methods=["GET"]),
-            Route("/v1/sessions/{session_id:str}/catalog/tables/{table:str}/columns", catalog_columns, methods=["GET"]),
-            Route("/v1/memory/recipes", memory_recipes, methods=["GET"]),
-            Route("/v1/memory/recipes/{recipe_id:int}", memory_delete_recipe, methods=["DELETE"]),
-            Route("/v1/memory/terms", memory_terms, methods=["GET", "POST"]),
-            Route("/v1/memory/terms/{term_id:int}", memory_delete_term, methods=["DELETE"]),
-        ],
-        lifespan=lifespan,
-    )
+    routes = [
+        Route("/v1/health", health, methods=["GET"]),
+        Route("/v1/ready", ready, methods=["GET"]),
+        Route("/v1/sessions", create_session, methods=["POST"]),
+        Route("/v1/sessions/{session_id:str}/messages", message, methods=["POST"]),
+        Route("/v1/sessions/{session_id:str}", delete_session, methods=["DELETE"]),
+        Route("/v1/sessions/{session_id:str}/datasets/{dataset_id:str}/rows", dataset_rows, methods=["GET"]),
+        Route("/v1/sessions/{session_id:str}/datasets/{dataset_id:str}/meta", dataset_meta, methods=["GET"]),
+        Route("/v1/sessions/{session_id:str}/catalog/tables", catalog_tables, methods=["GET"]),
+        Route("/v1/sessions/{session_id:str}/catalog/tables/{table:str}/columns", catalog_columns, methods=["GET"]),
+        Route("/v1/memory/recipes", memory_recipes, methods=["GET"]),
+        Route("/v1/memory/recipes/{recipe_id:int}", memory_delete_recipe, methods=["DELETE"]),
+        Route("/v1/memory/terms", memory_terms, methods=["GET", "POST"]),
+        Route("/v1/memory/terms/{term_id:int}", memory_delete_term, methods=["DELETE"]),
+    ]
+    if settings.debug_log_buffer:
+        # 임시 디버그(PoC) — 이 블록과 datalens/api/debug_log_buffer.py가 제거 단위다.
+        from datalens.api.debug_log_buffer import endpoint as debug_logs_endpoint, install as install_log_buffer
+
+        routes.append(Route("/v1/debug/logs", debug_logs_endpoint(install_log_buffer(settings.debug_log_buffer_size)), methods=["GET"]))
+    app = Starlette(routes=routes, lifespan=lifespan)
     app.add_middleware(ApiKeyMiddleware, api_key=settings.api_key.get_secret_value())
     app.add_middleware(RequestIdMiddleware)
     app.add_middleware(CorsMiddleware, origins=settings.allowed_cors_origins)

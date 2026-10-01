@@ -139,6 +139,14 @@ rows 스트림은 `meta` → 100행 단위 `rows` → `done`, 카탈로그 스�
 100개 단위 `tables` → `done` 이벤트를 사용한다. `limit`이 있으면 그 범위까지만 보낸다.
 
 브라우저 `EventSource`는 `x-api-key` 같은 커스텀 헤더를 지정할 수 없으므로 사용할 수 없다.
+
+## 임시 디버그 — 서버 로그 조회 (운영 전 제거 대상)
+
+`DATALENS_DEBUG_LOG_BUFFER=true`로 기동하면 최근 구조화 로그(기본 2,000건)를 메모리에
+보관하고 `GET /v1/debug/logs?request_id=<dlr_...>&limit=300`으로 노출한다. 다른 경로와
+동일하게 `x-api-key`가 필요하다. 데모 디버그 콘솔은 각 턴 종료 시 이 경로를 호출해
+"서버 로그" 섹션으로 덧붙이며, 플래그가 꺼져 있으면(404) 조용히 건너뛴다.
+구현은 `datalens/api/debug_log_buffer.py` 한 모듈에 격리되어 있다.
 UI에서는 `fetch`와 `ReadableStream`을 사용해야 한다.
 
 ```js

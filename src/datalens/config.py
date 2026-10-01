@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     http_host: str = "0.0.0.0"
     http_port: int = Field(8000, ge=1, le=65535)
     log_level: Literal["critical", "error", "warning", "info", "debug"] = "info"
+    # 임시 디버그(PoC): 최근 구조화 로그를 메모리에 보관하고 /v1/debug/logs로 노출한다.
+    # 데모 디버그 콘솔이 request_id로 서버 로그를 끌어오는 용도. 운영 전 제거 대상.
+    debug_log_buffer: bool = False
+    debug_log_buffer_size: int = Field(2000, gt=0, le=20000)
     request_deadline_seconds: float = Field(240.0, gt=0)
     session_ttl_seconds: float = Field(1800.0, gt=0)
     country: Literal["KR", "JP"] = "KR"
