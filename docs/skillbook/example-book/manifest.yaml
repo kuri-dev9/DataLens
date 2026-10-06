@@ -1,0 +1,4 @@
+# 책 메타. 모든 항목이 선택이다 — 파일이 없어도 디렉터리 이름이 book_id가 되고
+# 전 locale 대상으로 색인된다.
+description: 주문 원장(orders) 도메인의 지표 정의와 해석 규칙 — SKILL BOOK 형식 견본
+locale: ko
