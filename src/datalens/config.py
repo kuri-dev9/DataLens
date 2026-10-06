@@ -23,16 +23,24 @@ class Settings(BaseSettings):
     # 데모 디버그 콘솔이 request_id로 서버 로그를 끌어오는 용도. 운영 전 제거 대상.
     debug_log_buffer: bool = False
     debug_log_buffer_size: int = Field(2000, gt=0, le=20000)
-    request_deadline_seconds: float = Field(240.0, gt=0)
+    # QueryForge query/transform 상한이 각 60초이므로(실측 최소값), 무거운 조회와 변환이
+    # 한 턴에 들어가면 240초로는 답변 직전에 끊긴다.
+    request_deadline_seconds: float = Field(300.0, gt=0)
     session_ttl_seconds: float = Field(1800.0, gt=0)
     country: Literal["KR", "JP"] = "KR"
     queryforge_endpoint: AnyHttpUrl = "http://127.0.0.1:8080/mcp"
     queryforge_data_base_url: AnyHttpUrl = "http://127.0.0.1:8080"
     queryforge_api_key: SecretStr
+    # MCP 초기화·도구 목록·ready(헬스체크) 전용. 장애 감지를 늦추지 않도록 짧게 둔다.
     queryforge_timeout_seconds: float = Field(5.0, gt=0)
+    # 실제 도구 호출과 Data API 상한. QueryForge 실측 최소값(query 60s, transform 60s,
+    # transform 큐 대기 5s, 카탈로그 갱신 시 column_range 프로브 30s)을 덮을 수 있어야 한다.
+    queryforge_call_timeout_seconds: float = Field(70.0, gt=0)
     agent_max_tool_calls: int = Field(12, gt=0)
     agent_recovery_budget: int = Field(5, ge=0)
-    agent_preview_rows: int = Field(5, ge=1, le=100)
+    # QueryForge preview.max_rows와 같은 값. 그보다 줄이면 작은 모델이 받은 몇 행을
+    # 전체 결과로 오인하는 사례가 많아 QueryForge가 실측 끝에 20으로 올린 값이다.
+    agent_preview_rows: int = Field(20, ge=1, le=100)
     llm_provider: Literal["ollama"] = "ollama"
     ollama_base_url: AnyHttpUrl = "http://127.0.0.1:11434"
     ollama_model: str = Field("gemma4:26b", min_length=1, max_length=128)
@@ -43,7 +51,8 @@ class Settings(BaseSettings):
     ollama_num_predict: int = Field(2048, gt=0)
     # 생성 진행 중 progress 이벤트 발행 주기.
     llm_progress_interval_seconds: float = Field(15.0, gt=0)
-    ollama_num_ctx: int = Field(8192, gt=0)
+    # preview 20행과 늘어난 시스템 프롬프트를 담을 수 있어야 한다.
+    ollama_num_ctx: int = Field(16384, gt=0)
     ollama_temperature: float = Field(0.2, ge=0)
     ollama_top_p: float = Field(0.95, ge=0, le=1)
     ollama_top_k: int = Field(64, gt=0)

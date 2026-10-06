@@ -708,3 +708,38 @@ async def test_rejected_event_carries_the_upstream_reason() -> None:
     assert event["error"]["detail"] == "narrow the range"
     assert event["error"]["details"]["upper_bound"] == "2025-02-05T00:00:00"
     assert event["recovery"]["will_retry"] is True
+
+
+@pytest.mark.anyio
+async def test_notice_reaches_the_model_but_not_the_grounding_facts() -> None:
+    """preview가 일부라는 사실은 모델에 전해야 하고, 안내 문장의 수치는 근거가 아니다."""
+    partial = QueryForgeResult(
+        True,
+        "Q" * 22,
+        {
+            "ok": True,
+            "notice": "showing 5 of 1000 rows, ~777 KB as JSON; next page: call transform with next_page, or raise preview_rows",
+            "next_page": {
+                "tool": "transform",
+                "arguments": {"session_id": "Q" * 22, "dataset_id": "ds_000000001", "pipeline": [{"op": "limit", "count": 5, "offset": 5}]},
+            },
+            "session_id": "Q" * 22,
+            "dataset_id": "ds_000000001",
+            "row_count": 1000,
+            "columns": [{"name": "event_time", "type": "datetime"}],
+            "preview": [{"event_time": "2026-09-08T00:00:00"}],
+            "warnings": [],
+        },
+    )
+    provider = FakeProvider([calling("schema", {"action": "list_tables"}), assistant("전체 1000행 중 777 항목")])
+    result = await BoundedAgent(provider, FakeQueryForge([partial]), max_tool_calls=3, recovery_budget=1).run(
+        session(), "조회", time.monotonic() + 2
+    )
+    payload = json.loads(next(item.content for item in provider.messages[-1] if item.role == "tool"))
+    assert payload["notice"].startswith("showing 5 of 1000 rows")
+    # 나머지 행을 받는 유일한 경로다. 모델이 그대로 복사해 호출할 수 있어야 한다.
+    assert payload["next_page"]["arguments"]["pipeline"] == [{"op": "limit", "count": 5, "offset": 5}]
+    # row_count로 전해진 1000은 근거이고, notice에만 있는 응답 크기 777은 근거가 아니다.
+    ungrounded = {item["value"] for item in result.grounding["ungrounded"]}
+    assert "777" in ungrounded
+    assert "1000" not in ungrounded

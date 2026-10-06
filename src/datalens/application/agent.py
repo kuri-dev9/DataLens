@@ -39,6 +39,10 @@ QUERYFORGE_SESSION_EVENT = "_queryforge_session"
 # 세션 컨텍스트로 노출하는 데이터셋 계보 상한. 컨텍스트는 매 턴 모델 입력에 들어가므로
 # 무한정 키우지 않고, 오래된 항목부터 떨어뜨린다.
 _LINEAGE_LIMIT = 8
+# 도구 결과 중 데이터가 아닌 안내용 필드. 모델에는 주고 근거 집합에서는 뺀다.
+# notice의 응답 크기 추정치("~120 KB")나 next_page의 페이징 인자(count/offset)를
+# 근거로 인정하면 ADR-034 계측이 느슨해진다.
+_NON_FACT_KEYS = frozenset({"notice", "next_page"})
 
 
 class AgentError(RuntimeError):
@@ -342,7 +346,10 @@ class BoundedAgent:
                     step.clear()
                     plan.append({"tool": call.name, "intent": deepcopy(intent)})
                     bounded = self._bounded_tool_result(result)
-                    collect_facts(bounded, facts)
+                    collect_facts(
+                        {key: value for key, value in bounded.items() if key not in _NON_FACT_KEYS},
+                        facts,
+                    )
                     if event_sink is not None:
                         await event_sink(
                             "tool_call",
@@ -588,6 +595,11 @@ class BoundedAgent:
             # query.partition_scope를 만들려면 반드시 필요한 필드들. 빼면 모델이 파티션 키를 추측한다.
             "partitioned", "partition", "primary_key", "comment", "entity_labels",
             "parent_dataset_id",
+            # QueryForge가 "showing 20 of 1000 rows"처럼 preview가 전부인지 일부인지 한 줄로 알린다.
+            # 이 한 줄이 없으면 모델은 받은 몇 행을 전체 결과로 오인한다.
+            # next_page는 나머지를 받는 transform 호출 인자이고, MCP만 쓰는 모델에게는
+            # 유일한 페이징 경로다. 도구 설명도 둘을 보고 판단하라고 지시한다.
+            "notice", "next_page",
         }
         bounded = {key: deepcopy(value) for key, value in result.payload.items() if key in allowed}
         if isinstance(bounded.get("preview"), list):

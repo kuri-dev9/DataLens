@@ -38,13 +38,18 @@ class McpQueryForgeClient:
         data_base_url: str | None = None,
         allowed_tools: frozenset[str] = DEFAULT_ALLOWED_TOOLS,
         default_timeout_seconds: float = 5.0,
+        call_timeout_seconds: float | None = None,
         data_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._endpoint = endpoint
         self._api_key = api_key
         self._data_base_url = data_base_url.rstrip("/") if data_base_url else None
         self._allowed_tools = allowed_tools
+        # 초기화·도구 목록·ready용 짧은 상한.
         self._default_timeout = default_timeout_seconds
+        # Data API 상한. QueryForge는 Parquet을 읽고 페이지 전수 Decimal 검사를 하므로
+        # 초기화와 같은 5초로 묶으면 큰 Dataset에서 끊긴다.
+        self._call_timeout = call_timeout_seconds or default_timeout_seconds
         self._discovery_lock = asyncio.Lock()
         self._tools: tuple[QueryForgeToolDefinition, ...] = ()
         self._data_client = data_client or httpx.AsyncClient(headers={"x-api-key": api_key})
@@ -181,7 +186,7 @@ class McpQueryForgeClient:
             response = await self._data_client.post(
                 f"{self._data_base_url}/data/sessions/{encoded}/release",
                 headers={"x-api-key": self._api_key},
-                timeout=min(timeout_seconds, self._default_timeout),
+                timeout=min(timeout_seconds, self._call_timeout),
             )
             if response.status_code == 404:
                 return
@@ -237,7 +242,7 @@ class McpQueryForgeClient:
                 f"{self._data_base_url}{path}",
                 headers={"x-api-key": self._api_key, "x-session-id": application_session_id},
                 params=params,
-                timeout=min(timeout_seconds, self._default_timeout),
+                timeout=min(timeout_seconds, self._call_timeout),
             )
             payload = response.json()
             if not isinstance(payload, dict):

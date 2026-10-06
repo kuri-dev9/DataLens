@@ -318,6 +318,7 @@ def build_app(
         settings.queryforge_api_key.get_secret_value(),
         data_base_url=settings.queryforge_data_url(),
         default_timeout_seconds=settings.queryforge_timeout_seconds,
+        call_timeout_seconds=settings.queryforge_call_timeout_seconds,
     )
     handler = message_handler or UnavailableMessageHandler()
     llm = llm_readiness or queryforge
@@ -589,7 +590,7 @@ def build_app(
                 try:
                     meta = await queryforge.fetch_dataset_meta(
                         request.path_params["dataset_id"], application_session_id,
-                        timeout_seconds=settings.queryforge_timeout_seconds,
+                        timeout_seconds=settings.queryforge_call_timeout_seconds,
                     )
                     if not 200 <= meta.status_code < 300:
                         yield sse_event("error", json.loads(data_result(request, meta).body))
@@ -601,7 +602,7 @@ def build_app(
                         result = await queryforge.fetch_dataset_rows(
                             request.path_params["dataset_id"], application_session_id,
                             offset=offset + returned, limit=chunk_limit,
-                            timeout_seconds=settings.queryforge_timeout_seconds,
+                            timeout_seconds=settings.queryforge_call_timeout_seconds,
                         )
                         if not 200 <= result.status_code < 300:
                             yield sse_event("error", json.loads(data_result(request, result).body))
@@ -624,7 +625,7 @@ def build_app(
                 application_session_id,
                 offset=offset,
                 limit=limit,
-                timeout_seconds=settings.queryforge_timeout_seconds,
+                timeout_seconds=settings.queryforge_call_timeout_seconds,
             )
         except TimeoutError:
             return error_response(
@@ -646,7 +647,7 @@ def build_app(
             result = await queryforge.fetch_dataset_meta(
                 request.path_params["dataset_id"],
                 application_session_id,
-                timeout_seconds=settings.queryforge_timeout_seconds,
+                timeout_seconds=settings.queryforge_call_timeout_seconds,
             )
         except TimeoutError:
             return error_response(
@@ -679,7 +680,7 @@ def build_app(
                 "schema",
                 arguments,
                 application_session_id=application_session_id,
-                timeout_seconds=settings.queryforge_timeout_seconds,
+                timeout_seconds=settings.queryforge_call_timeout_seconds,
             )
         except TimeoutError:
             return error_response(
@@ -734,7 +735,7 @@ def build_app(
                 "schema",
                 {"action": "list_columns", "table": request.path_params["table"]},
                 application_session_id=application_session_id,
-                timeout_seconds=settings.queryforge_timeout_seconds,
+                timeout_seconds=settings.queryforge_call_timeout_seconds,
             )
         except TimeoutError:
             return error_response(

@@ -11,13 +11,19 @@ describe_table 応答の partition に data_range（または upper_bound）が�
 
 [データが無い場合]
 保有区間が要求期間と異なる場合は聞き返さず、保有区間で照会して結果を示したうえで、「ご要望の<元の期間>にはデータが無いため、保有区間である<実際の期間>を基準にしています」と回答に必ず明記してください。
-保有区間が不明な状態で照会結果が0件なら、結果を捏造せず、その期間にデータが無いことを伝え、照会可能な期間をユーザーに確認してください。
+time_range の照会が0件なら、応答の warnings に EMPTY_TIME_RANGE が付きます。available が実際にデータがある区間、nearest_nonempty は要求範囲の前後で最も近いデータがある区間です。聞き返さず、この値で期間を変えて直ちに再照会してください。
+EMPTY_TIME_RANGE に available も nearest_nonempty も無い場合にのみ、照会可能な期間をユーザーに確認してください。
 PARTITION_SCOPE_TOO_WIDE と outside_loaded_partition_range が返ったら、details の upper_bound 直前の区間に絞って再照会してください。
+
+[スキーマ探索]
+列名は分かるがどのテーブルにあるか分からない場合は、schema {"action":"search_columns","name_pattern":"CEI"} でテーブルを探してください。テーブルを一つずつ describe_table で調べないでください。
+テーブル一覧は schema {"action":"list_tables","name_pattern":"PGW"} のようにパターンで絞って受け取ってください。
 
 [データセットの再利用]
 DataLens session context の datasets は、このセッションで既に作成されたデータセットの一覧です（古い順、最新が最後）。各項目には dataset_id、作成したツール（action）、元テーブル（table）、親データセット（parent_dataset_id）、row_count があります。
 以前の結果を加工したり続けて分析したりする場合は、この一覧の dataset_id をそのまま使ってください。一覧に無い dataset_id を捏造しないでください。
 同じ条件の query を再実行せず、既にあるデータセットを再利用してください。
+二つのデータセットを結合する場合は再度 query せず、transform {"op":"join","other_dataset_id":"ds_000002","on":["SIGNAL_DATE","CODE"],"how":"left","columns":["PREV_CLOSE"]} を使ってください。キー名は両側で同じでなければならず、異なる場合は先に rename してください。
 
 [記憶の活用]
 DataLens memory が与えられたら、そこから始めてください。過去の解法に出たテーブルと列が質問に合えば、schema 探索を省いて直接 query を呼んでください。
@@ -27,8 +33,17 @@ DataLens memory が与えられたら、そこから始めてください。過�
 [query 引数の書き方]
 select には列名のみを入れてください。{"column":"PGW_ID"} の形式です。SUM(X) AS Y のような SQL 式は拒否されます。
 集計は aggregations に {"function":"sum","column":"DATA_CEI_VALUE","alias":"TOTAL"} の形式で入れてください。function は小文字です。
-group_by は列名の文字列配列です。["PGW_ID"] のように書き、オブジェクトを入れないでください。
+一つの集計だけにかかる条件は、その集計の where に入れてください。{"function":"sum","column":"QTY","where":{"column":"FLAG","operator":"eq","value":"BUY"},"alias":"BUY_QTY"} のように書けば、条件別の合計を query 一回で求められます。
+stddev と variance も集計 function として使えます。median と分位数は describe か transform で求めてください。
+group_by は列名の文字列配列です。["PGW_ID"] のように書いてください。
+日別・時間別の集計は group_by に {"column":"EVENT_TIME","bucket":"day","alias":"DAY"} というオブジェクトを入れてください。bucket は minute, hour, day, month です。バケット値は alias の名前で返り order_by で使えます。バケットに使った元の列は select に入れないでください。
 group_by を使う場合、select のすべての列が group_by に含まれている必要があります。
+
+[結果の読み方]
+preview は結果の一部です。notice に showing N of M rows と書かれていれば、M が全体の行数で、そのうち N 行だけを見ていることになります。preview に無い行を推測して答えないでください。
+全体を対象とする合計・最大・件数は preview を数えず、query の aggregations で求めてください。
+応答に next_page があれば、まだ受け取っていない行が残っているという意味です。残りを見る必要があれば、next_page の arguments をそのままコピーして transform を呼んでください。
 
 [エラー処理]
 ツールが ok:false を返したら、error.code と error.hint を読んで引数を修正し、呼び直してください。同じ引数で繰り返し呼ばないでください。
+ただし RESOURCE_LIMIT_EXCEEDED はサーバーが混み合っているだけなので、引数を修正せず同じ引数でもう一度呼んでください。

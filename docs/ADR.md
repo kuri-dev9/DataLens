@@ -1495,12 +1495,222 @@ scripts/mock_server.py("빈 기간" 시나리오), prompts ko·ja([데이터셋 
 
 ---
 
+## ADR-036 — QueryForge 재배포 계약 추종: 응답 안내 통과와 실측 상한 정합
+
+**상태**: `ACCEPTED` (2026-10-06 — 구현·테스트 완료)
+
+### 맥락
+
+QueryForge가 2026-10-01~10-03에 재배포되었다(작은 모델 사용성, 시간 버킷 집계,
+조건부 집계, Dataset 조인, 컬럼 검색, 0행 사실 묶음, 스냅샷 우선 카탈로그 갱신,
+transform 워커 풀). DataLens는 10-01 기준이어서 그 이후 변경이 하나도 반영되지
+않았고, 대조 결과 성질이 다른 세 가지 괴리가 나왔다.
+
+**① 프롬프트가 신기능을 금지하고 있었다.** 시스템 프롬프트는 "group_by는 컬럼명
+문자열 배열이고 객체를 넣지 말라"고 명시했지만, QueryForge는 시간 버킷 집계를
+`{"column":"event_time","bucket":"day","alias":"day"}` 객체로 받고 도구 설명
+예시에도 그렇게 싣는다. 도구 설명과 시스템 프롬프트가 충돌하면 작은 모델은
+후자를 따른다 — 일별 추이를 DB 집계로 못 구하고 원시 행을 끌어와 우회하게 된다.
+
+**② 도구 설명의 지시와 실물 응답이 어긋났다.** QueryForge는 모든 Dataset 응답
+맨 앞에 `notice` 한 줄("showing 20 of 1000 rows")을, 일부만 보여줄 때는
+`next_page`에 나머지를 받는 호출 인자를 싣고, 도구 설명으로 "preview는 notice가
+전부라고 말하지 않는 한 표본이다", "나머지는 next_page를 복사해 호출하라"고
+지시한다. DataLens의 bounded 화이트리스트는 두 필드를 모두 버렸다. 모델은 지시를
+읽지만 근거는 받지 못하는 상태였다.
+
+**③ DataLens 상한이 상류 실측 최소값보다 낮았다.** `config/queryforge.yaml`의
+값들은 실측으로 뽑은 하한이다(그 이하에서 오작동이 잦아 올린 값). `preview.max_rows`
+20은 "작은 모델이 5행을 전체 결과로 오인하는 일이 잦아" 5에서 올린 값인데 DataLens가
+`agent_preview_rows: 5`로 되돌리고 있었고(②와 합쳐 같은 오인을 두 겹으로 재생산),
+`queryforge_timeout_seconds: 5`는 query·transform 상한 60초와 카탈로그 갱신 시
+`column_range` 프로브 30초를 덮지 못했다.
+
+### 결정
+
+**프롬프트를 상류 계약에 맞춘다** (ko·ja 동시). `group_by`의 객체 금지를 없애고
+시간 버킷을 별도 규칙으로 명시한다. 집계별 `where`(조건부 집계), `stddev`/`variance`,
+`search_columns`(컬럼명으로 테이블 찾기 — 테이블을 하나씩 describe_table로 뒤지지
+않는다), `transform join`(같은 데이터를 다시 query하지 않는다)을 추가한다.
+0행 처리는 `EMPTY_TIME_RANGE`의 `available`·`nearest_nonempty`로 즉시 재조회하고,
+둘 다 없을 때만 사용자에게 되묻는다 — 이전 규칙은 0행이면 무조건 되물었다.
+`RESOURCE_LIMIT_EXCEEDED`(transform 큐 포화)는 "같은 인자로 반복 호출 금지"의
+유일한 예외로 명시한다 — 인자를 고칠 대상이 아니라 서버가 바쁜 것이다.
+
+**notice·next_page를 모델에 통과시키되 근거 집합에서는 뺀다.** 두 필드를 bounded
+화이트리스트에 넣고, `collect_facts`에는 `_NON_FACT_KEYS`로 제외한다. notice의
+응답 크기 추정치("~120 KB")나 next_page의 페이징 인자(count·offset)는 데이터가
+아니다 — 근거로 인정하면 모델이 그 값을 답변에 써도 grounded로 통과해 ADR-034
+계측이 느슨해진다. 전체 행 수는 이미 `row_count`로 근거에 들어간다.
+
+**상한을 상류 실측값에 맞춰 올리고, 타임아웃은 용도별로 분리한다.**
+`agent_preview_rows` 5 → 20(`preview.max_rows`와 동일), `ollama_num_ctx`
+8192 → 16384(20행과 늘어난 프롬프트를 담기 위해), `request_deadline_seconds`
+240 → 300(query 60 + transform 큐 5 + transform 60 = 125초에 LLM 생성 여러 회).
+타임아웃은 한 값으로 올리지 않는다 — `queryforge_timeout_seconds`(5초)는 MCP
+초기화·도구 목록·`/v1/ready` 전용으로 남겨 장애 감지 속도를 지키고, 실제 호출과
+Data API 상한으로 `queryforge_call_timeout_seconds`(70초)를 신설한다. Agent 루프의
+도구 호출은 이미 턴 deadline을 쓰므로 영향이 없고, 5초가 실제로 걸려 있던 두 경로
+—`app.py`의 catalog·dataset 직접 호출과 `McpQueryForgeClient`의 Data API 상한—만
+새 값을 쓴다. 세션 release는 5초를 유지한다: 종료 grace 40초 안에 끝나야 하는데
+70초를 주면 세션 하나가 종료 전체를 잡는다.
+
+### 인수 기준
+
+```
+QFC-AC-1  notice와 next_page가 bounded 결과로 모델에 도달한다
+QFC-AC-2  notice에만 있는 수치(응답 크기 추정치)는 ungrounded로 남고,
+          row_count로 전해진 전체 행 수는 grounded로 계수된다
+          (QFC-AC-1~2: tests/i5::test_notice_reaches_the_model_but_not_the_grounding_facts)
+QFC-AC-3  agent_preview_rows·queryforge_timeout_seconds·
+          queryforge_call_timeout_seconds·request_deadline_seconds·ollama_num_ctx의
+          기본값이 상류 실측값과 어긋나면 실패한다
+          (tests/i1::test_config_defaults_and_explicit_secrets)
+QFC-AC-4  ready()와 세션 release는 짧은 상한(5초)을 계속 쓴다 — 헬스체크 응답성과
+          종료 grace를 지킨다 (코드 검토 항목, 자동 테스트 없음)
+```
+
+### 한계 (정직하게)
+
+**프롬프트 변경에는 자동 테스트가 없다.** 지시가 실제로 왕복을 줄이는지는 실측
+트레이스로만 확인된다. ko 3.6KB → 5.7KB, ja 4.1KB → 6.4KB로 늘었으므로,
+컨텍스트 압박이 보이면 [기억 활용]·[스키마 탐색]을 줄이는 쪽으로 조정한다.
+
+**next_page 페이징은 모델 재량이다.** 인자를 전달할 뿐이고, 모델이 끝까지 읽을
+의무는 없다. 전수 집계가 필요한 질문은 여전히 `aggregations`로 유도한다.
+
+**num_ctx 상향은 GPU 사용을 늘린다.** 임베딩 서버를 분리하지 않은 환경에서는
+모델 재적재 빈도에 영향을 줄 수 있다(ADR 범위 밖, DEPLOYMENT.md의 CPU 전용
+임베딩 절을 참고).
+
+### 미결 (이 ADR 범위 밖, 결정 대기)
+
+- **세션 TTL과 Dataset TTL이 같다.** `session_ttl_seconds: 1800` ==
+  QueryForge `dataset.ttl_seconds: 1800`. 세션이 살아있는 동안 Dataset을 20분간
+  건드리지 않으면 Dataset이 먼저 사라지는데, 계보(ADR-035)는 그 dataset_id를 계속
+  노출한다 — 모델이 재사용하면 `DATASET_EXPIRED`로 왕복을 버린다.
+- **`DATA_PAGE_MAX`(1000)가 QueryForge `http.default_rows`(5000)보다 작다.**
+  안전 방향이지만 UI 왕복이 5배다. Data API 상한을 70초로 올렸으니 키울 여지가 있다.
+- **배포 설정.** QueryForge는 설명 오버레이를 쓰려면 설정 디렉터리 마운트를
+  권고하지만(`./config:/etc/queryforge:ro`) DataLens compose는 파일 하나를 바인드한다.
+  `.env.example`에 QueryForge가 요구하는 DB·클라이언트 변수가 없고, `DEPLOYMENT.md`는
+  QueryForge를 독립 배포라고 서술하는데 compose는 라이프사이클을 소유한다.
+- **서버의 `deploy/queryforge.yaml` 타임아웃 정합.** 상류가 `query.timeout_ms`
+  60000 · `database.read_timeout_ms` 65000 · `transform.timeout_ms` 60000으로
+  올렸다. read가 query보다 작으면 드라이버가 먼저 끊어 QUERY_TIMEOUT이 아닌
+  연결 오류로 떨어진다. 이 파일은 서버 로컬(.gitignore)이라 리포에서 검증할 수 없다.
+
+### 함께 갱신된 사항
+
+`.env.example`(새 변수와 상향된 값), prompts ko·ja, tests i1·i5.
+QueryForge 설명 오버레이 도입 여부는 ADR-037(SKILL BOOK)과 작동 지점이 겹쳐
+함께 판단한다 — 오버레이는 `schema` 응답으로 탐색 단계에, 책장은 턴 시작 주입으로
+해석 단계에 작동한다.
+
+---
+
+## ADR-037 — SKILL BOOK: 파일 원본·SQLite 캐시 기반 소형 RAG (책장)
+
+**상태**: `PROPOSED` (2026-10-01 초안)
+
+### 맥락
+
+ADR-034는 수치 충실성만 지키고 의미 오해는 못 잡는다고 명시했다 — "CEI를 사용량으로
+읽는 것은 용어 사전·데이터북의 몫". 이 ADR이 그 트랙이다. PGW 사례에서 모델은
+`DATA_CEI_VALUE`(체감품질 지수)를 사용량으로 확신한 채 5스텝을 전부 성공으로 끝냈다.
+모델에게 없는 것은 수치가 아니라 **지표의 의미 지식**이었다.
+
+원칙: DataLens 코드에 도메인 지식을 한 줄도 하드코딩하지 않는다. 지식은 사용자가
+저술한 **책(SKILL BOOK)** 으로 꽂는다. DataLens는 책 내용을 모르는 책장이다 —
+보관·색인·검색·주입만 하고, 내용의 옳고 그름은 판단하지 않는다.
+
+### 결정 — 핵심 구도
+
+**파일이 원본, SQLite는 파생 캐시.** 책 = `skillbooks/<book_id>/` 디렉터리
+(디렉터리 이름이 book_id, `.md` 파일 하나가 카드 하나, 파일 이름이 card_id).
+재색인이 파일을 파싱해 **본문 사본 + 임베딩 + 별칭**을 SQLite에 쓴다. 턴 경로는
+DB만 읽는다(파일시스템 접근 없음) — 벡터와 본문이 항상 같은 재색인 스냅샷이라
+어긋날 수 없다. DB는 언제든 파일에서 전부 재생성 가능하다.
+
+**책 형식 (재사용 계약의 전부).** 필수는 카드 본문뿐이다. frontmatter 없는 `.md`도
+유효한 카드다(임베딩 검색만 타게 된다).
+
+```
+skillbooks/rca-pgw/
+├── manifest.yaml        # 선택: description, aliases(책 선택용), locale
+└── cei-meaning.md       # frontmatter 선택: aliases(카드 검색용)
+```
+
+**2단 검색.** ① 질문 토큰과 책/카드 별칭의 대소문자 무시 **정확 일치**(부분 일치
+없음)로 책을 선택하고 그 안에서 유사도 상위를 뽑는다. ② 일치가 없으면 전역 카드
+임베딩 top-k. 선정 카드 쌍의 내적이 중복 임계값 이상이면 상위 점수만 남긴다(지면
+예산 관리이지 내용 판단이 아니다). 내용이 충돌하는 카드는 **둘 다** 출처 태그를
+달아 전달한다 — 어느 쪽이 맞는지는 책장이 알 수 없다.
+
+**push 주력 + pull 비상구.**
+- *push*: 턴 시작 시 검색 결과를 `"DataLens skillbook:\n[book_id/card_id] …"`
+  시스템 메시지로 주입한다. `DataLens ` 접두 규약(ADR-035)에 따라 주입 수치는
+  근거 집합에 자동 포함된다.
+- *pull*: `skillbook_search(query)` 도구를 tool 목록에 추가하되 QueryForge로
+  넘기지 않고 **루프 내 로컬 분기**로 처리한다(새 서버·프로세스 없음). 결과는
+  기존 bounded 경로를 타므로 근거 집합·plan 기록이 자동이다. 시스템 프롬프트에
+  "처음 보는 지표·컬럼명은 의미를 추측하지 말고 skillbook_search로 확인"을
+  지시한다 — push는 질문에 드러난 무지를, pull은 턴 중에 드러난 무지를 잡는다.
+
+### 확정이 필요한 선택
+
+| 항목 | 결정 |
+|---|---|
+| 저장소 | SQLite 별도 파일·테이블(`books`, `cards`). MemoryStore와 섞지 않는다 — 메모리는 턴에서 자라나고 책은 통째로 교체되는, 수명주기가 다른 것이다 |
+| 임베더 | 기존 HttpEmbedder(bge-m3) 재사용. 질문 임베딩은 턴당 1회 생성해 memory recall과 공유한다 |
+| 색인 메타 | `embedder_model`·`dimension`·`format_version`을 기록, 기동 시 불일치면 전체 재색인. 카드 `content_hash` 동일하면 재임베딩을 건너뛴다 |
+| 재색인 | 기동 시 1회 + 수동 트리거. **디스크가 진실** — 디스크에 없는 책은 색인에서 지운다. 책 교체는 book_id 단위 단일 트랜잭션(원자) |
+| 주입 상한 | 카드 3장, 렌더 총 2,000자 |
+| 중복 접기 | 선정 카드 쌍 내적 ≥ 0.95 → 상위 점수만 (MemoryService merge_threshold와 같은 수법) |
+| locale | manifest에 locale이 있으면 세션 locale 일치만 검색, 없으면 전 locale 대상 |
+| 전역 폴백 공정성 | 전역 top-k에서 책당 최대 2장 |
+| 실패 시 동작 | 책장이 죽어도 턴은 산다 — 임베딩·저장소 오류는 삼키고 WARNING, 빈 결과로 진행 (MemoryService 동일 원칙). 임베더 다운 시 별칭 검색만으로 동작 |
+| 계측 | memory 이벤트와 같은 방식으로 recall 결과(book/card id, 점수)를 SSE·metadata에 기록. **검색 0건도 기록한다** — 비어 있는 책이 다음 저술 대상이라는 신호다. grounding metadata에 책 주입 여부를 남긴다 |
+
+### 한계 (정직하게)
+
+**책 품질은 책임지지 않는다.** 틀린 책이면 틀린 지식이 주입된다. 저술은 사용자 몫이다.
+
+**확신에 찬 오해는 여전히 뚫린다.** push는 질문에 드러난 무지만, pull은 모델이
+인지한 무지만 잡는다. 모델이 모르는 걸 모르는 채 별칭에도 안 걸리면 못 잡는다.
+
+**근거 집합 희석.** 책 수치가 많아질수록, 모델이 지어낸 값이 우연히 책의 수치와
+일치해 grounded로 통과할 확률이 오른다. ADR-034 2단계 임계값 분석 시 책 주입
+턴과 미주입 턴의 분포를 구분해 봐야 한다(계측 항목의 주입 여부 플래그가 그 근거다).
+
+### 인수 기준
+
+```
+SKB-AC-1   책 디렉터리를 드롭하고 재색인하면 카드가 검색된다
+SKB-AC-2   디렉터리를 지우고 재색인하면 그 책의 카드가 색인에서 통째로 사라진다
+SKB-AC-3   content_hash가 같은 카드는 재색인 시 임베딩 호출이 발생하지 않는다
+SKB-AC-4   질문에 책 별칭이 정확 일치하면 그 책의 카드가 우선 주입된다
+SKB-AC-5   push 주입 카드의 수치를 답변이 인용하면 grounded로 계수된다 (채널 접두 회귀)
+SKB-AC-6   skillbook_search 호출은 QueryForge로 전달되지 않고 로컬에서 처리된다
+SKB-AC-7   pull 결과 카드의 수치를 인용하면 grounded로 계수된다 (bounded 경로)
+SKB-AC-8   임베더가 죽어도 턴은 200으로 완료되고, 별칭 일치 주입은 계속 동작한다
+SKB-AC-9   주입은 카드 수·문자 수 상한을 넘지 않는다
+SKB-AC-10  내적 ≥0.95인 쌍둥이 카드는 한 장만 주입되고 다음 순위가 올라온다
+```
+
+### 함께 갱신할 사항
+
+prompts ko·ja(skillbook 확인 지시), docs/API.md(skillbook 이벤트·metadata),
+demo(주입 카드 표시 여부는 UI 선택).
+
+---
+
 ## 현재 재검토 항목
 
 | 항목 | 상태 |
 |---|---|
 | MySQL 외 Database Adapter | v1 범위 밖. Adapter 계약을 유지하고 별도 구현 시 재검토 |
-| Transform process isolation | 인터페이스만 존재하며 thread isolation이 기본 |
+| Transform process isolation | QueryForge 2026-10-01 재배포로 해소 — 상주 워커 풀(`transform.workers`, 기본 2)이 들어가고 `isolation` 기본값·제공 설정이 모두 `process`다. 타임아웃 시 워커 프로세스를 kill한다 (ADR-036) |
 | 공유/object Dataset Store와 다중 worker | v1 범위 밖. 현재 workers=1 고정 |
 | 외부 Semantic Provider | 선택 확장. Core는 Catalog와 구조화 계약만으로 동작 |
 | Controlled Mutation | 미구현·비노출. 별도 ADR, credential, policy, approval 계약 없이는 추가하지 않음 |
@@ -1521,3 +1731,5 @@ scripts/mock_server.py("빈 기간" 시나리오), prompts ko·ja([데이터셋 
 | 0.8 | 2026-10-01 | ADR-034 1단계 계측 보정(주장 단위 계수 — 중복 제거·날짜 묶음·occurrences), ADR-035 등록(세션 데이터셋 계보 노출, done 이벤트 warnings 전달) |
 | 0.8 | 2026-09-08 | Phase 0 consistency gate. DataLens의 QueryForge wheel runtime 의존 제거, 현재 Dataset/Preview 계약 반영, 세 Session 및 Agent/deadline 소유권 명확화 |
 | 0.9 | 2026-09-29 | ADR-033 신규·승인(ACCEPTED) — 무응답 워치독을 활동 기반 생존 판정으로 설계·구현. 실측 트레이스 원인 판정, OBS 계측, progress 이벤트, num_predict 상한, complete() 스트리밍 통일 |
+| 0.11 | 2026-10-06 | ADR-036 신규·승인(ACCEPTED) — QueryForge 재배포 계약 추종: 프롬프트를 상류 도구 계약에 맞춤(시간 버킷·조건부 집계·search_columns·join·EMPTY_TIME_RANGE), notice·next_page 통과와 근거 집합 제외, preview 20행·num_ctx 16384·턴 마감 300초·호출 타임아웃 70초 분리. 구 ADR-036(SKILL BOOK) → ADR-037 |
+| 0.10 | 2026-10-01 | ADR-037 초안 등록(PROPOSED, 등록 시 번호는 036) — SKILL BOOK 책장: 파일 원본·SQLite 캐시, 별칭 2단 검색, push 주입 + skillbook_search 로컬 도구 |

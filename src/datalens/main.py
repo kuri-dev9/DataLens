@@ -25,6 +25,7 @@ def create_app():
         settings.queryforge_api_key.get_secret_value(),
         data_base_url=settings.queryforge_data_url(),
         default_timeout_seconds=settings.queryforge_timeout_seconds,
+        call_timeout_seconds=settings.queryforge_call_timeout_seconds,
     )
     sessions = SessionService(
         store, QueryForgeSessionCleanup(queryforge, settings.queryforge_timeout_seconds)
