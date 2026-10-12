@@ -96,6 +96,14 @@ class OllamaProvider:
             "messages": [self._message(message, index == 0) for index, message in enumerate(messages)],
             "tools": [self._tool(tool) for tool in tools],
             "options": dict(self._options),
+            # Ollama 의 thinking 스위치를 **실제로 전달한다**.
+            # enable_thinking 은 지금까지 시스템 프롬프트에 <|think|> 를 붙이는
+            # 용도로만 쓰였고 이 파라미터는 보내지 않았다. 그래서 gemma4 처럼
+            # 기본이 thinking 인 모델은 설정을 꺼도 계속 사고했고, 긴 증거팩을
+            # 받으면 추론만 하다 num_predict 를 소진해 본문을 한 글자도 못 쓴 채
+            # done_reason="length" 로 끝났다 (실측: thinking 1873청크 ·
+            # visible 0자 → graphio 쪽은 502 DL_UPSTREAM_INVALID_RESPONSE).
+            "think": self._enable_thinking,
         }
         if output_policy.max_output_tokens is not None:
             payload["options"]["num_predict"] = output_policy.max_output_tokens
