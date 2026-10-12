@@ -19,6 +19,9 @@ build/
 
 # Local configuration
 .env
+# 설정 백업본 — .env 사본이라 API 키가 그대로 들어 있다
+*.bak-*
+*.bak
 .datalens/
 
 # Server-local deployment config
