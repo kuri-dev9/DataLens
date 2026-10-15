@@ -15,12 +15,18 @@ services:
       QUERYFORGE_HOST: 0.0.0.0
       QUERYFORGE_PORT: "8080"
     volumes:
-      - ./deploy/queryforge.yaml:/etc/queryforge/queryforge.yaml:ro
+      # QueryForge 설정은 QueryForge 쪽이 소유한다. 디렉터리째 마운트해야 databases.yaml 이 보이고,
+      # 편집기가 저장하며 inode 를 갈아끼워도 컨테이너가 새 내용을 본다(파일 하나만 바인드하면 못 본다).
+      # 운영에서는 QUERYFORGE_CONFIG_DIR 로 리포 밖 경로를 가리킨다.
+      - ${QUERYFORGE_CONFIG_DIR:-../QueryForge/config}:/etc/queryforge:ro
       - qf_state:/var/lib/queryforge
     ports:
       # ADR-011 — 외부 노출 금지. 기본 바인드 호스트를 127.0.0.1에서 올리지 않는다.
       - "${QUERYFORGE_BIND_HOST:-127.0.0.1}:${QUERYFORGE_BIND_PORT:-8080}:8080"
-    networks: [ppnet]
+    # graphio-net 은 graphio-probe-rca/docker-compose.dev.yml 이 만든 외부
+    # 네트워크다. 여기에 붙어야 DB_HOST=graphio-mysql 로 닿는다. DataLens 는
+    # MySQL 에 직접 붙지 않으므로(QueryForge 경유) ppnet 만 있으면 된다.
+    networks: [ppnet, graphio-net]
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
@@ -63,6 +69,10 @@ services:
 networks:
   ppnet:
     driver: bridge
+  # graphio 쪽 compose 가 먼저 떠 있어야 한다:
+  #   cd ../graphio-probe-rca && docker compose -f docker-compose.dev.yml up -d
+  graphio-net:
+    external: true
 
 volumes:
   datalens-memory:

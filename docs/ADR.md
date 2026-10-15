@@ -1591,14 +1591,46 @@ QFC-AC-4  ready()와 세션 release는 짧은 상한(5초)을 계속 쓴다 — 
   노출한다 — 모델이 재사용하면 `DATASET_EXPIRED`로 왕복을 버린다.
 - **`DATA_PAGE_MAX`(1000)가 QueryForge `http.default_rows`(5000)보다 작다.**
   안전 방향이지만 UI 왕복이 5배다. Data API 상한을 70초로 올렸으니 키울 여지가 있다.
-- **배포 설정.** QueryForge는 설명 오버레이를 쓰려면 설정 디렉터리 마운트를
-  권고하지만(`./config:/etc/queryforge:ro`) DataLens compose는 파일 하나를 바인드한다.
-  `.env.example`에 QueryForge가 요구하는 DB·클라이언트 변수가 없고, `DEPLOYMENT.md`는
-  QueryForge를 독립 배포라고 서술하는데 compose는 라이프사이클을 소유한다.
-- **서버의 `deploy/queryforge.yaml` 타임아웃 정합.** 상류가 `query.timeout_ms`
-  60000 · `database.read_timeout_ms` 65000 · `transform.timeout_ms` 60000으로
-  올렸다. read가 query보다 작으면 드라이버가 먼저 끊어 QUERY_TIMEOUT이 아닌
-  연결 오류로 떨어진다. 이 파일은 서버 로컬(.gitignore)이라 리포에서 검증할 수 없다.
+- **배포 설정** (2026-10-15 해소 — 아래 "QueryForge 설정 소유권" 참조). 설정 디렉터리를
+  통째로 마운트하도록 바꾸어 `deploy/queryforge.yaml`(로컬 파일, `.gitignore`)을 더 이상 쓰지
+  않는다. `.env.example`에 QueryForge가 요구하는 변수가 없는 것과, `DEPLOYMENT.md`가 QueryForge를 독립 배포로 서술하는데 compose가
+  라이프사이클을 소유하는 것은 여전히 열려 있다.
+
+### QueryForge 설정 소유권 (2026-10-15)
+
+QueryForge 설정은 QueryForge 리포가 소유한다. compose는 **어느 디렉터리를 들여다볼지만** 가리키고
+내용은 들고 있지 않다.
+
+```yaml
+- ${QUERYFORGE_CONFIG_DIR:-../QueryForge/config}:/etc/queryforge:ro
+```
+
+디렉터리째 마운트해야 하는 이유가 둘이다. 접속 선언(`databases.yaml`)과 설명 오버레이가 보여야 하고,
+**파일 하나만 바인드하면 편집기가 저장하며 inode를 갈아끼울 때 컨테이너가 옛 파일을 계속 본다** —
+QueryForge의 무중단 반영(설명 오버레이, 접속 선언)이 조용히 동작하지 않는다. 운영에서는
+`QUERYFORGE_CONFIG_DIR`로 리포 밖 경로를 가리킨다.
+
+QueryForge가 DB 여러 개를 등록할 수 있게 되었으므로(상류 ADR-033) `.env`에 다음이 필요하다.
+`.env`는 `.gitignore` 대상이라 리포에서 검증할 수 없으니 배포 절차로 관리한다.
+
+| 변수 | 용도 |
+|---|---|
+| `QUERYFORGE_DATABASES_FILE` | 접속 선언 파일의 컨테이너 내 경로. 설정하면 그 파일이 접속 목록의 전부이고 `.env`의 `DB_*`는 무시된다 |
+| 선언의 `password_ref`가 가리키는 변수 | 예: `DEFAULT_DB_PW`. 기동 시점 환경에서 읽으므로 **새 변수를 추가하면 컨테이너 재생성**이 필요하다 |
+
+DB가 둘 이상 등록되면 Agent는 `schema`·`relationship`·`query` 호출에 `database`를 보내야 한다.
+도구 정의는 `discover_tools`가 동적으로 받아오므로 코드 변경은 필요 없지만, **정의는 프로세스 메모리에
+캐시**되고 `refresh=True`는 `/ready`에서만 돈다 — 상류 도구 계약이 바뀌면 DataLens를 재기동하거나
+`/ready`를 한 번 쳐야 한다.
+
+상류 재기동은 Application Session을 무효화한다(메모리 보관). 배포 직후 첫 호출이 `INVALID_SESSION`을
+받으며, 상류 힌트는 `session_id` 없이 다시 부르라고 알려준다. **지금 DataLens는 그 힌트에 따라
+자동 재발급하지 않아** 사람이 세션을 새로 만들어야 한다 — 미결 항목이다.
+
+- **상류 타임아웃 정합.** `query.timeout_ms` 60000 · `database.read_timeout_ms` 65000 ·
+  `transform.timeout_ms` 60000. read가 query보다 작으면 드라이버가 먼저 끊어 QUERY_TIMEOUT이 아닌
+  연결 오류로 떨어진다. 이제 이 값은 `../QueryForge/config/queryforge.yaml`에서 오므로 상류 리포에서
+  검증된다(선언 항목이 `read_timeout_ms`를 덮어쓰면 상류가 기동 시 거부한다).
 
 ### 함께 갱신된 사항
 
