@@ -18,7 +18,7 @@ from datalens.application.agent import (
 )
 from datalens.infrastructure.session_store import InMemorySessionStore
 from datalens.infrastructure.ollama import strip_thought_blocks
-from datalens.ports.llm import AssistantTurn, LLMTimeout, LLMUnavailable, ToolCall
+from datalens.ports.llm import AssistantTurn, LLMTimeout, LLMUnavailable, TokenUsage, ToolCall
 from datalens.ports.queryforge import (
     QueryForgeFailure,
     QueryForgeResult,
@@ -743,3 +743,56 @@ async def test_notice_reaches_the_model_but_not_the_grounding_facts() -> None:
     ungrounded = {item["value"] for item in result.grounding["ungrounded"]}
     assert "777" in ungrounded
     assert "1000" not in ungrounded
+
+
+def usage(prompt_tokens: int, num_ctx: int = 16384, reserved: int = 2048) -> TokenUsage:
+    return TokenUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=8,
+        context_window=num_ctx,
+        reserved_output_tokens=reserved,
+        prompt_chars=prompt_tokens * 2,
+    )
+
+
+@pytest.mark.anyio
+async def test_turn_reports_the_tightest_llm_call_not_the_last() -> None:
+    # 도구 결과가 쌓이는 중간 호출이 가장 크고, 마지막 호출은 도리어 작을 수 있다.
+    # 마지막만 보면 "괜찮았다"로 기록되어 절단이 묻힌다.
+    provider = FakeProvider(
+        [
+            replace(calling("schema", {"action": "list_tables"}), usage=usage(16384)),
+            replace(assistant("events가 있습니다"), usage=usage(1200)),
+        ]
+    )
+    result = await BoundedAgent(provider, FakeQueryForge([ok_schema()]), max_tool_calls=3, recovery_budget=1).run(
+        session(), "목록", time.monotonic() + 2
+    )
+    assert result.context["status"] == "truncated"
+    assert result.context["prompt_tokens"] == 16384
+    assert result.context["headroom_tokens"] == 0
+
+
+@pytest.mark.anyio
+async def test_healthy_turn_reports_ok_with_the_numbers_to_check_later() -> None:
+    provider = FakeProvider([replace(assistant("완료"), usage=usage(3000))])
+    result = await BoundedAgent(provider, FakeQueryForge(), max_tool_calls=1, recovery_budget=0).run(
+        session(), "질문", time.monotonic() + 2
+    )
+    assert result.context == {
+        "status": "ok",
+        "num_ctx": 16384,
+        "prompt_tokens": 3000,
+        "prompt_chars": 6000,
+        "reserved_output_tokens": 2048,
+        "headroom_tokens": 13384,
+    }
+
+
+@pytest.mark.anyio
+async def test_provider_without_usage_leaves_context_absent_rather_than_guessing() -> None:
+    provider = FakeProvider([assistant("완료")])
+    result = await BoundedAgent(provider, FakeQueryForge(), max_tool_calls=1, recovery_budget=0).run(
+        session(), "질문", time.monotonic() + 2
+    )
+    assert result.context is None

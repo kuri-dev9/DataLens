@@ -9,7 +9,14 @@ import httpx
 import pytest
 
 from datalens.infrastructure.ollama import OllamaProvider, strip_thought_blocks
-from datalens.ports.llm import LLMInvalidResponse, LLMTimeout, OutputPolicy, ProviderMessage, ToolCall
+from datalens.ports.llm import (
+    LLMInvalidResponse,
+    LLMTimeout,
+    OutputPolicy,
+    ProviderMessage,
+    TokenUsage,
+    ToolCall,
+)
 from datalens.ports.queryforge import QueryForgeToolDefinition
 
 
@@ -421,3 +428,109 @@ async def test_readiness_uses_model_inventory_without_completion() -> None:
     finally:
         await client.aclose()
     assert paths == ["/api/tags"]
+
+
+@pytest.mark.parametrize(
+    ("prompt_tokens", "num_ctx", "reserved", "expected"),
+    [
+        (3000, 8192, 2048, "ok"),
+        (6144, 8192, 2048, "ok"),          # 정확히 들어맞는 경계는 ok
+        (6145, 8192, 2048, "tight"),       # 생성 예약분이 한 토큰 모자란다
+        (8191, 8192, 2048, "tight"),
+        (8192, 8192, 2048, "truncated"),   # 창을 꽉 채웠다 = 앞이 잘려 들어갔다
+        (None, 8192, 2048, "unknown"),     # 상류가 수치를 안 줬다
+        (3000, None, 2048, "unknown"),
+    ],
+)
+def test_context_status_is_derived_from_numbers_we_already_have(
+    prompt_tokens, num_ctx, reserved, expected
+) -> None:
+    usage = TokenUsage(
+        prompt_tokens=prompt_tokens, context_window=num_ctx, reserved_output_tokens=reserved
+    )
+    assert usage.context_status == expected
+
+
+@pytest.mark.anyio
+async def test_usage_carries_the_context_budget_without_asking_ollama() -> None:
+    captured: list[dict] = []
+    adapter, client = provider(
+        {
+            "message": {"role": "assistant", "content": "완료"},
+            "done_reason": "stop",
+            "prompt_eval_count": 1500,
+            "eval_count": 3,
+        },
+        captured,
+    )
+    try:
+        turn = await adapter.complete(
+            [ProviderMessage("user", "가" * 2000)], (TOOL,), time.monotonic() + 1, OutputPolicy(64)
+        )
+    finally:
+        await client.aclose()
+    # 추가 호출은 없다 — 요청 1건으로 끝난다
+    assert len(captured) == 1
+    assert turn.usage.context_window == 8192
+    assert turn.usage.reserved_output_tokens == 64
+    assert turn.usage.prompt_chars > 2000          # 도구 정의까지 센다
+    assert turn.usage.context_status == "ok"
+    assert turn.usage.public() == {
+        "status": "ok",
+        "num_ctx": 8192,
+        "prompt_tokens": 1500,
+        "prompt_chars": turn.usage.prompt_chars,
+        "reserved_output_tokens": 64,
+        "headroom_tokens": 6692,
+    }
+
+
+@pytest.mark.anyio
+async def test_silent_truncation_is_raised_to_a_warning_log(caplog) -> None:
+    adapter, client = provider(
+        {
+            "message": {"role": "assistant", "content": "확인할 수 없습니다"},
+            "done_reason": "stop",
+            # ollama 는 창을 넘는 프롬프트를 말없이 자른다. 천장에 닿은 이 값이 유일한 흔적이다.
+            "prompt_eval_count": 8192,
+            "eval_count": 7,
+        }
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger="datalens.llm"):
+            turn = await adapter.complete(
+                [ProviderMessage("user", "증거" * 20000)], (TOOL,), time.monotonic() + 1, OutputPolicy()
+            )
+    finally:
+        await client.aclose()
+    assert turn.usage.context_status == "truncated"
+    pressure = [record for record in caplog.records if record.message == "llm_context_pressure"]
+    assert len(pressure) == 1
+    assert pressure[0].levelno == logging.WARNING
+    assert pressure[0].context_status == "truncated"
+    assert pressure[0].num_ctx == 8192
+    assert pressure[0].prompt_eval_count == 8192
+    assert pressure[0].headroom_tokens == 0
+    # 질문 본문은 로그에 실리지 않는다 — 글자 수만 남는다
+    assert "증거증거" not in caplog.text
+    assert pressure[0].prompt_chars > 40000
+
+
+@pytest.mark.anyio
+async def test_healthy_turn_logs_no_pressure_warning(caplog) -> None:
+    adapter, client = provider(
+        {
+            "message": {"role": "assistant", "content": "완료"},
+            "done_reason": "stop",
+            "prompt_eval_count": 1000,
+            "eval_count": 3,
+        }
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger="datalens.llm"):
+            await adapter.complete(
+                [ProviderMessage("user", "짧은 질문")], (TOOL,), time.monotonic() + 1, OutputPolicy()
+            )
+    finally:
+        await client.aclose()
+    assert [record for record in caplog.records if record.message == "llm_context_pressure"] == []

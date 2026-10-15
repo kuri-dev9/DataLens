@@ -69,6 +69,9 @@ class ChatApplicationService:
                 "stop_reason": "completed",
                 "memory": recall.public() if recall else None,
                 "grounding": result.grounding,
+                # 프롬프트가 컨텍스트 창에 들어갔는지. status != "ok"면 모델이 증거의
+                # 일부를 못 봤다는 뜻이고, 답변의 "확인할 수 없다"는 그 결과일 수 있다.
+                "context": result.context,
             },
             "error": None,
         }
@@ -130,6 +133,9 @@ class ChatApplicationService:
                 "stop_reason": "completed",
                 "memory": recall.public() if recall else None,
                 "grounding": result.grounding,
+                # 프롬프트가 컨텍스트 창에 들어갔는지. status != "ok"면 모델이 증거의
+                # 일부를 못 봤다는 뜻이고, 답변의 "확인할 수 없다"는 그 결과일 수 있다.
+                "context": result.context,
             },
         }
 

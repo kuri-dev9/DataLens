@@ -21,6 +21,7 @@ from datalens.ports.llm import (
     LLMUnavailable,
     OutputPolicy,
     ProviderMessage,
+    TokenUsage,
 )
 from datalens.ports.queryforge import (
     QueryForgeClient,
@@ -117,6 +118,9 @@ class AgentResult:
     plan: tuple[dict[str, Any], ...] = ()
     # 답변 수치가 도구 결과에 있었는지 재기만 한 결과. 답변은 바꾸지 않는다 (ADR-034).
     grounding: dict[str, Any] | None = None
+    # 이번 턴에서 프롬프트가 컨텍스트 창을 얼마나 먹었는지. 절단은 에러가 아니라
+    # 침묵으로 나타나므로, 잘렸는지를 사후에 알 수 있는 유일한 통로다.
+    context: dict[str, Any] | None = None
 
 
 class BoundedAgent:
@@ -196,6 +200,9 @@ class BoundedAgent:
         active_table = session.active_table
         active_period = deepcopy(session.active_period)
         step: dict[str, Any] = {}
+        # 한 턴은 LLM을 여러 번 부른다. 도구 결과가 쌓일수록 프롬프트가 커지므로
+        # 가장 압박이 심했던 호출을 들고 간다 — 평균을 내면 절단이 묻힌다.
+        worst_usage: TokenUsage | None = None
 
         try:
             while True:
@@ -230,6 +237,7 @@ class BoundedAgent:
                     step["detail"] = str(exc)
                     raise AgentInvalidUpstreamResponse("LLM provider returned an invalid response") from exc
                 step.clear()
+                worst_usage = self._worst_usage(worst_usage, turn.usage)
 
                 if not turn.tool_calls:
                     answer = (turn.content or "").strip()
@@ -253,6 +261,7 @@ class BoundedAgent:
                         recovery_count=recovery_count,
                         updated_session=updated,
                         plan=tuple(plan),
+                        context=worst_usage.public() if worst_usage else None,
                     )
 
                 messages.append(ProviderMessage("assistant", turn.content or "", turn.tool_calls))
@@ -446,6 +455,14 @@ class BoundedAgent:
         if len(expected) <= 400:
             detail = f"{detail} | expected at {BoundedAgent._error_path(primary)}: {expected}"
         return detail[:1024]
+
+    @staticmethod
+    def _worst_usage(current: TokenUsage | None, candidate: TokenUsage | None) -> TokenUsage | None:
+        if candidate is None:
+            return current
+        if current is None or (candidate.prompt_tokens or 0) > (current.prompt_tokens or 0):
+            return candidate
+        return current
 
     def _recovery_state(self, recovery_count: int, will_retry: bool) -> dict[str, Any]:
         return {"attempt": recovery_count + 1, "budget": self._recovery_budget, "will_retry": will_retry}

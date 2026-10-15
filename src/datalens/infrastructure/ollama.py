@@ -107,6 +107,13 @@ class OllamaProvider:
         }
         if output_policy.max_output_tokens is not None:
             payload["options"]["num_predict"] = output_policy.max_output_tokens
+        # 보낸 분량을 여기서 세어 둔다. ollama는 프롬프트를 조용히 자르고 그 사실을
+        # 응답에 남기지 않으므로, "무엇을 보냈는지"는 우리만 알 수 있는 값이다.
+        num_ctx = self._optional_int(payload["options"].get("num_ctx"))
+        num_predict = self._optional_int(payload["options"].get("num_predict"))
+        prompt_chars = len(json.dumps(payload["messages"], ensure_ascii=False)) + len(
+            json.dumps(payload["tools"], ensure_ascii=False)
+        )
         sanitizer = ThoughtStreamSanitizer()
         content_parts: list[str] = []
         calls: tuple[ToolCall, ...] = ()
@@ -166,6 +173,13 @@ class OllamaProvider:
             outcome = "invalid_response"
             raise LLMInvalidResponse("Ollama returned an invalid streaming response") from exc
         finally:
+            usage = TokenUsage(
+                prompt_tokens=self._optional_int(final.get("prompt_eval_count")),
+                completion_tokens=self._optional_int(final.get("eval_count")),
+                context_window=num_ctx,
+                reserved_output_tokens=num_predict,
+                prompt_chars=prompt_chars,
+            )
             # 스트림이 어떻게 끝났든 "그동안 무엇이 흐르고 있었는지"를 남긴다.
             # 화면에 ping만 보이는 턴이 죽은 행인지 비가시 생성(thinking·사고 블록)인지는
             # 이 카운터 없이는 사후에 구분할 수 없다(실측 트레이스 2026-09-29).
@@ -181,11 +195,30 @@ class OllamaProvider:
                     "thinking_chunks": thinking_chunk_count,
                     "visible_chars": sum(len(part) for part in content_parts),
                     "tool_call_count": len(calls),
-                    "prompt_eval_count": self._optional_int(final.get("prompt_eval_count")),
-                    "eval_count": self._optional_int(final.get("eval_count")),
+                    "prompt_eval_count": usage.prompt_tokens,
+                    "eval_count": usage.completion_tokens,
                     "done_reason": final.get("done_reason"),
+                    "num_ctx": num_ctx,
+                    "prompt_chars": prompt_chars,
+                    "context_status": usage.context_status,
                 },
             )
+            # 절단은 에러가 아니라 침묵으로 나타난다 — 모델이 "확인할 수 없다"고 답할 뿐이다.
+            # INFO 더미에 섞어 두면 사후에 못 찾으므로 압박일 때만 WARNING으로 올린다.
+            if usage.context_status in {"truncated", "tight"}:
+                LOG.warning(
+                    "llm_context_pressure",
+                    extra={
+                        "request_id": current_request_id(),
+                        "model": self._model,
+                        "context_status": usage.context_status,
+                        "num_ctx": num_ctx,
+                        "prompt_eval_count": usage.prompt_tokens,
+                        "prompt_chars": prompt_chars,
+                        "reserved_output_tokens": num_predict,
+                        "headroom_tokens": usage.public()["headroom_tokens"],
+                    },
+                )
         tail = sanitizer.finish()
         if tail:
             content_parts.append(tail)
@@ -197,10 +230,7 @@ class OllamaProvider:
             content=content,
             tool_calls=calls,
             stop_reason=str(final.get("done_reason") or ("tool_calls" if calls else "stop")),
-            usage=TokenUsage(
-                prompt_tokens=self._optional_int(final.get("prompt_eval_count")),
-                completion_tokens=self._optional_int(final.get("eval_count")),
-            ),
+            usage=usage,
             provider_request_id=str(final.get("id")) if final.get("id") is not None else None,
         )
 

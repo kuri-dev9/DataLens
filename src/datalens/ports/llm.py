@@ -28,6 +28,42 @@ class ProviderMessage:
 class TokenUsage:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    # 컨텍스트 예산 대조용. ollama는 프롬프트를 잘라도 그 사실을 알려주지 않으므로
+    # (응답에 truncated 같은 필드가 없다) 아래 숫자를 맞대어 역산하는 수밖에 없다.
+    context_window: int | None = None
+    reserved_output_tokens: int | None = None
+    prompt_chars: int | None = None
+
+    @property
+    def context_status(self) -> str:
+        """ok | tight | truncated | unknown.
+
+        `truncated`는 프롬프트 토큰이 컨텍스트 창을 꽉 채운 경우다 — 창보다 큰
+        프롬프트는 평가될 수 없으므로, 천장에 닿았다는 건 앞쪽이 잘려 들어갔다는 뜻이다.
+        `tight`는 프롬프트는 들어갔지만 생성 예약분을 빼면 자리가 모자라, 생성 도중
+        앞쪽이 밀려나는 경우다. 둘 다 "모델이 증거를 못 봤다"로 이어진다.
+        """
+        if self.prompt_tokens is None or not self.context_window:
+            return "unknown"
+        if self.prompt_tokens >= self.context_window:
+            return "truncated"
+        if self.prompt_tokens + (self.reserved_output_tokens or 0) > self.context_window:
+            return "tight"
+        return "ok"
+
+    def public(self) -> dict[str, int | str | None]:
+        return {
+            "status": self.context_status,
+            "num_ctx": self.context_window,
+            "prompt_tokens": self.prompt_tokens,
+            "prompt_chars": self.prompt_chars,
+            "reserved_output_tokens": self.reserved_output_tokens,
+            "headroom_tokens": (
+                None
+                if self.prompt_tokens is None or not self.context_window
+                else self.context_window - self.prompt_tokens
+            ),
+        }
 
 
 @dataclass(frozen=True, slots=True)

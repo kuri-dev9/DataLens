@@ -160,11 +160,48 @@ content-type: application/json
       "ungrounded": [
         {"value": "118", "nearest": 123.0, "deviation_pct": 4.065, "small_int": false}
       ]
+    },
+    "context": {
+      "status": "ok",
+      "num_ctx": 16384,
+      "prompt_tokens": 7310,
+      "prompt_chars": 15720,
+      "reserved_output_tokens": 2048,
+      "headroom_tokens": 9074
     }
   },
   "error": null
 }
 ```
+
+#### `metadata.context` — 프롬프트가 컨텍스트에 들어갔는가
+
+**모델에 들어갈 프롬프트가 컨텍스트 창을 넘으면 ollama는 앞부분을 말없이 잘라낸다.** 에러도,
+경고도, 응답 필드도 없다. 드러나는 건 "확인할 수 없습니다"라는 답뿐이라, 증거가 잘린 것과
+데이터가 실제로 없는 것이 똑같이 보인다. `metadata.context`는 그 둘을 가르라고 있는 값이다.
+
+| 필드 | 의미 |
+|---|---|
+| `status` | `ok` \| `tight` \| `truncated` \| `unknown` |
+| `num_ctx` | 모델 컨텍스트 창 (`DATALENS_OLLAMA_NUM_CTX`) |
+| `prompt_tokens` | ollama가 실제로 평가한 프롬프트 토큰 수 (`prompt_eval_count`) |
+| `prompt_chars` | DataLens가 보낸 글자 수 (메시지 + 도구 정의). **본문은 담기지 않는다** |
+| `reserved_output_tokens` | 생성 예약분 (`num_predict`) |
+| `headroom_tokens` | `num_ctx - prompt_tokens` |
+
+- **`truncated`** — 프롬프트 토큰이 창을 꽉 채웠다. 창보다 큰 프롬프트는 평가될 수 없으므로,
+  천장에 닿았다는 건 **앞쪽이 잘려 들어갔다**는 뜻이다. 답변이 부실하면 원인은 여기다.
+- **`tight`** — 프롬프트는 들어갔지만 생성 예약분을 빼면 자리가 모자라, 생성 도중 앞쪽이 밀려난다.
+- **`unknown`** — 상류가 `prompt_eval_count`를 주지 않았다. 추측하지 않는다.
+
+값은 **한 턴에서 가장 압박이 심했던 LLM 호출** 기준이다. 한 턴은 도구 호출만큼 모델을 여러 번
+부르고 도구 결과가 쌓일수록 프롬프트가 커지는데, 마지막 호출만 보면 절단이 묻힌다.
+
+`status`가 `ok`가 아닐 때 서버 로그에도 `llm_context_pressure`가 **WARNING**으로 남는다
+(`request_id` 포함). 클라이언트 응답과 로그 양쪽에서 같은 턴을 추적할 수 있다.
+
+이 값을 얻는 데 추가 호출은 없다 — `prompt_eval_count`는 ollama가 평소 응답에 실어 보내는
+값이고, 나머지는 DataLens가 이미 아는 자기 설정과 자기가 만든 프롬프트 크기다.
 
 `metadata.grounding`은 답변 속 수치가 이번 턴 도구 결과에 실제로 있었는지 재기만 한 결과다(ADR-034 1단계).
 `deviation_pct`는 최근접 근거값 대비 편차로, 0에 가까우면 반올림 표기 차이이고 크면 모델이 지어낸 값이다.
@@ -199,6 +236,7 @@ content-type: application/json
 | `columns[].type` | Polars 타입명 (`String`, `Int64`, `Float64`, `Date`, `Datetime` 등) |
 | `warnings[]` | 배열. 있으면 사용자에게 알린다. `code` 필드로 분기 |
 | `metadata.tool_calls` | 0이면 DB 조회 없이 대화만 한 것 |
+| `metadata.context.status` | `ok`가 아니면 프롬프트가 잘렸을 수 있다. 답변이 부실할 때 **여기부터 본다** (§3.1) |
 
 ### 3.3 SSE 모드
 

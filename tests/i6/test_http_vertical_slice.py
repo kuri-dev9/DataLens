@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 import asyncio
 from contextlib import asynccontextmanager
@@ -36,8 +37,9 @@ HEADERS = {"x-api-key": "data-secret"}
 
 
 class FakeAgent:
-    def __init__(self, outcome=None) -> None:
+    def __init__(self, outcome=None, context=None) -> None:
         self.outcome = outcome
+        self.context = context
         self.calls = []
 
     async def run(self, session, message, deadline, event_sink=None, hints=None):
@@ -57,6 +59,7 @@ class FakeAgent:
             2,
             0,
             updated,
+            context=self.context,
         )
 
 
@@ -554,3 +557,37 @@ def test_dataset_rows_are_reachable_while_the_turn_is_still_running(settings) ->
     assert bound == ["Q" * 22]
     assert QUERYFORGE_SESSION_EVENT not in emitted
     assert "dataset" in emitted
+
+
+TRUNCATED_CONTEXT = {
+    "status": "truncated",
+    "num_ctx": 16384,
+    "prompt_tokens": 16384,
+    "prompt_chars": 41200,
+    "reserved_output_tokens": 2048,
+    "headroom_tokens": 0,
+}
+
+
+def test_silent_truncation_reaches_the_client_in_both_transports(settings) -> None:
+    # 절단된 턴도 200으로 끝난다 — 모델이 "확인할 수 없다"고 답할 뿐이다.
+    # 그 답이 미연동 때문인지 증거가 잘린 탓인지는 metadata.context로만 갈린다.
+    app, _ = wired(settings, FakeAgent(context=TRUNCATED_CONTEXT))
+    with TestClient(app) as client:
+        synchronous = client.post(
+            f"/v1/sessions/{create(client)}/messages", headers=HEADERS, json={"message": "증거 분석"}
+        )
+        streamed = client.post(
+            f"/v1/sessions/{create(client)}/messages",
+            headers={**HEADERS, "accept": "text/event-stream"},
+            json={"message": "증거 분석"},
+        )
+    assert synchronous.status_code == 200
+    assert synchronous.json()["metadata"]["context"] == TRUNCATED_CONTEXT
+
+    done = [
+        json.loads(line[len("data: ") :])
+        for line in streamed.text.splitlines()
+        if line.startswith("data: ") and '"context"' in line
+    ]
+    assert done and done[-1]["metadata"]["context"] == TRUNCATED_CONTEXT

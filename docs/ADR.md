@@ -566,8 +566,68 @@ CTX-AC-3  MESSAGE_MAX_CHARS와 ollama_num_ctx가 함께 움직이지 않으면 �
 ```
 
 **한계.** 상한은 사용자 메시지 1건만 센다. 대화 이력·스키마·preview가 함께 커지면 16,384자
-이내여도 num_ctx를 넘길 수 있고, 그때 ollama는 경고 없이 자른다. `prompt_eval_count`가
-`num_ctx`에 근접할 때 경고를 남기는 계측은 아직 없다 — 재검토 항목.
+이내여도 num_ctx를 넘길 수 있다. 막을 수는 없으므로 보이게 한다 — 아래 절.
+
+### 조용한 프롬프트 절단을 사후 추적 가능하게 한다 (2026-10-15)
+
+**절단은 막는 대상이 아니라 보이게 할 대상이다.** 상한을 아무리 잘 잡아도 대화 이력·스키마·
+preview가 함께 커지면 num_ctx를 넘는 턴은 생긴다. 그때 ollama는 앞부분을 말없이 자르고
+200으로 정상 응답한다 — 에러도, 경고도, 응답 필드도 없다. 드러나는 건 "확인할 수 없습니다"
+라는 답뿐이라, **증거가 잘린 것과 데이터가 실제로 없는 것이 구분되지 않는다.** 상한 초과를
+400으로 거부하는 것(위 절)은 검증 관문만 지킬 뿐, 관문을 통과한 뒤의 이 침묵은 못 막는다.
+
+**이미 손에 있는 숫자만으로 역산한다. 추가 호출은 없다.** 세 값을 맞대면 충분하다 —
+`prompt_eval_count`(ollama가 평소 응답에 실어 보내는 값, 지금까지 로그에만 찍고 버렸다),
+`num_ctx`(우리 설정), 보낸 프롬프트 글자 수(우리가 만든 것). 상류에 토큰 수를 묻는 별도
+엔드포인트는 쓰지 않는다 — ollama 0.40에 `/api/tokenize`가 없고, 있더라도 턴마다 왕복을
+하나 더 다는 비용은 이 목적에 과하다.
+
+| status | 판정 | 근거 |
+|---|---|---|
+| `truncated` | 프롬프트가 잘려 들어갔다 | `prompt_tokens >= num_ctx` — 창보다 큰 프롬프트는 평가될 수 없으므로 천장에 닿았다는 건 앞이 잘렸다는 뜻이다 |
+| `tight` | 생성 도중 앞이 밀려난다 | `prompt_tokens + num_predict > num_ctx` |
+| `ok` | 여유 있음 | 그 외 |
+| `unknown` | 판정 불가 | 상류가 `prompt_eval_count`를 주지 않았다. **추측하지 않는다** |
+
+**두 곳으로 동시에 내보낸다.** 서버 로그에는 `llm_context_pressure`를 WARNING으로 남긴다
+(`ok`일 때는 남기지 않는다 — INFO 더미에 섞이면 사후에 못 찾는다). 클라이언트에는 턴
+`metadata.context`로 싣는다. 로그만으로는 상류(graphio)가 자기 쪽에서 즉시 알 수 없고,
+응답만으로는 운영자가 사후에 분포를 볼 수 없다. 두 경로가 같은 `request_id`로 엮인다.
+
+**한 턴의 가장 압박이 심했던 호출을 들고 간다.** 한 턴은 도구 호출 수만큼 모델을 여러 번
+부르고, 도구 결과가 쌓일수록 프롬프트가 커진다. 마지막 호출은 도리어 작을 수 있어, 마지막만
+기록하면 중간에서 일어난 절단이 묻힌다. 평균도 같은 이유로 쓰지 않는다.
+
+**본문은 싣지 않는다.** 로그·응답 모두 글자 수(`prompt_chars`)만 남긴다. 질문 본문이 로그에
+들어가면 운영 데이터가 샌다 — 위 `details` 절과 같은 규칙이다.
+
+```
+CTX-AC-4  prompt_tokens가 num_ctx에 닿은 턴은 status="truncated"로 기록되고,
+          llm_context_pressure가 WARNING으로 남으며, 본문은 어디에도 없다
+CTX-AC-5  status가 ok면 WARNING을 남기지 않는다 (경고 피로 방지)
+CTX-AC-6  한 턴의 여러 LLM 호출 중 prompt_tokens가 가장 큰 호출이 보고된다
+CTX-AC-7  prompt_eval_count가 없으면 "unknown"이고, 숫자를 지어내지 않는다
+CTX-AC-8  JSON·SSE 양쪽 전송에서 metadata.context가 동일하게 도달한다
+          (CTX-AC-4~7: tests/i4/test_ollama_provider.py, tests/i5/test_bounded_agent.py
+           CTX-AC-8: tests/i6/test_http_vertical_slice.py)
+```
+
+**사전 차단은 하지 않는다 (결정).** 이 판정은 사후 보고일 뿐 절단을 막지 않는다. 막으려면 보내기
+전에 프롬프트를 토큰으로 재야 하고, 그러려면 모델별 토크나이저를 DataLens가 들고 있어야 한다 —
+모델은 설정값(`DATALENS_OLLAMA_MODEL`)이고 배포마다 다르다. 상류에 물어볼 엔드포인트도 없다
+(ollama 0.40에 `/api/tokenize` 없음). 그 값을 선험적으로 아는 길이 없으므로 **차단 대신 튜닝으로
+간다**: 계측값이 쌓이면 그게 예산 조정의 근거다.
+
+**그래서 `prompt_chars`를 `prompt_tokens`와 같은 줄에 남긴다.** 둘의 비가 곧 "이 배포에 걸린
+모델의 문자/토큰 비"다. 2026-10-15 수동 실측 2.15자/토큰(gemma4:12b·한국어)이 이제 턴마다
+자동으로 쌓이고, 모델을 바꾸면 며칠 운영으로 새 비율이 나온다. `MESSAGE_MAX_CHARS`와
+`agent_preview_rows`를 조정할 때 이 분포를 본다.
+
+**한계 (정직하게).** `prompt_eval_count`는 ollama가 **새로 평가한** 토큰만 센다. KV 캐시가
+적중한 턴에서는 실제 프롬프트보다 작게 나올 수 있고, 그 경우 절단을 놓친다(거짓 음성). 반대 방향
+— 멀쩡한 턴을 절단으로 오인하는 거짓 양성 — 은 구조상 나오지 않는다. 캐시는 수치를 줄이기만
+하기 때문이다. **그러므로 `truncated`가 떴으면 실제로 잘린 것이고, 안 떴다고 안전하다고는
+말할 수 없다.** 이 비대칭을 전제로 읽어야 한다.
 
 ---
 
@@ -1904,7 +1964,7 @@ demo(주입 카드 표시 여부는 UI 선택).
 | 공유/object Dataset Store와 다중 worker | v1 범위 밖. 현재 workers=1 고정 |
 | 외부 Semantic Provider | 선택 확장. Core는 Catalog와 구조화 계약만으로 동작 |
 | Controlled Mutation | 미구현·비노출. 별도 ADR, credential, policy, approval 계약 없이는 추가하지 않음 |
-| 프롬프트 컨텍스트 초과 계측 | 미구현. `prompt_eval_count`는 로깅되지만 `num_ctx` 근접 시 경고가 없어, ollama의 조용한 절단이 "확인할 수 없다"는 답으로만 드러난다 (ADR-017 개정 2026-10-15) |
+| 프롬프트 컨텍스트 초과 계측 | 2026-10-15 해소 — `metadata.context` + `llm_context_pressure` WARNING. **사전 차단은 추구하지 않는다**(결정): 계측값을 쌓아 예산을 튜닝하는 쪽으로 간다 (ADR-017 개정 2026-10-15) |
 
 ---
 
@@ -1912,6 +1972,7 @@ demo(주입 카드 표시 여부는 UI 선택).
 
 | 버전 | 일자 | 내용 |
 |---|---|---|
+| 0.15 | 2026-10-15 | ADR-017 개정 — 조용한 프롬프트 절단을 사후 추적 가능하게: `prompt_eval_count`·`num_ctx`·보낸 글자 수만으로 `ok`/`tight`/`truncated`/`unknown`을 역산해 턴 `metadata.context`와 `llm_context_pressure` WARNING 양쪽으로 내보낸다. 상류 추가 호출 없음, 본문 미수록, 한 턴의 최대 압박 호출 기준 |
 | 0.14 | 2026-10-15 | ADR-017 개정 — 사용자 메시지 문자 상한을 8,192 → 16,384자로 상향(2.15자/토큰 실측으로 num_ctx 16384에서 역산, 요청받은 32,768자는 조용한 프롬프트 절단을 불러 기각). 검증 실패 사유를 `details.fields`에 노출(입력값 제외), `ValueError`(Malformed JSON)와 `ValidationError`를 분리 |
 | 0.1 | 2026-08-10 | 초안. ADR-001~019 등록 |
 | 0.2 | 2026-08-10 | ADR-005 확정 (MySQL 8.x). 액션 아이템 #1 해소 |
