@@ -531,6 +531,46 @@ A2 15.3GB 환경에서 실사용 컨텍스트 상한은 8K~16K다(ADR-001). 이�
 
 ---
 
+### 메시지 문자 상한과 검증 사유 노출 (2026-10-15)
+
+**사용자 메시지 1건의 상한은 16,384자다**(`app.py`의 `MESSAGE_MAX_CHARS`, 기존 8,192자).
+위 토큰 배분표의 "작업 여유 + 생성" 칸을 문자 수로 환산한 값이다. 근거는 실측이다 —
+gemma4:12b에 한국어·식별자 혼합 텍스트를 넣고 `prompt_eval_count`를 읽으면
+**2.15자/토큰**으로 길이에 무관하게 일정하다(8,192자 → 3,826토큰, 18,000자 → 8,375토큰,
+32,768자 → 15,227토큰). `ollama_num_ctx`가 16,384(ADR-036)이므로 16,384자는 약 7.6K
+토큰을 쓰고, 시스템 프롬프트(ko 3,320자 ≈ 1.5K)·도구 정의·스키마·preview 20행·대화
+이력·생성 예약(`num_predict` 2048)이 나머지를 나눈다.
+
+**요청받은 32,768자는 채택하지 않았다.** 그 값은 혼자서 15.2K 토큰을 먹어 num_ctx의 93%를
+차지한다. 검증은 통과하지만 ollama가 프롬프트를 **조용히 잘라** 모델에 넣는다 — 클라이언트가
+증거를 잘라 보내던 문제가 400 없이 보이지 않는 곳으로 옮겨갈 뿐이고, 그쪽이 더 나쁘다.
+상한을 더 올리려면 `DATALENS_OLLAMA_NUM_CTX`를 먼저 올려야 하며, 두 값은 같이 움직인다.
+
+**검증 실패는 사유를 `details.fields`에 담는다.** `loc`·`msg`·`type`만 추리고 입력값은
+담지 않는다(`errors(include_input=False)`) — 질문 본문이 에러 응답과 로그에 실리면 운영
+데이터가 샌다. 그리고 `ValueError`(JSON 파싱 실패)와 `ValidationError`(필드 규격 위반)를
+가른다. 전자는 `"Malformed JSON"` + `details: null`로, 파싱 위치도 노출하지 않는다.
+한 덩이로 잡으면 고치는 방법이 전혀 다른 두 실패가 같은 문구로 나온다.
+
+**왜 지금인가.** 상류(graphio-probe-rca)가 이 400의 원인을 찾느라 메시지 길이를 바꿔 가며
+이분 탐색을 돌렸고, 매 시도마다 Ollama 추론이 실제로 돌아 수십 초씩 걸렸다. `details` 한 줄이면
+끝날 일이었다. 검증 단계 거부는 추론 전에 일어나므로 이 응답을 채워도 비용은 0이다.
+
+```
+CTX-AC-1  상한 초과 요청은 400 DL_INVALID_REQUEST이고,
+          details.fields[0]이 {field: "message", type: "string_too_long"}이며
+          본문 내용은 응답 어디에도 없다
+CTX-AC-2  깨진 JSON은 "Malformed JSON" + details: null로 필드 위반과 구분된다
+CTX-AC-3  MESSAGE_MAX_CHARS와 ollama_num_ctx가 함께 움직이지 않으면 실패한다
+          (CTX-AC-1~3: tests/i2/test_session_api.py)
+```
+
+**한계.** 상한은 사용자 메시지 1건만 센다. 대화 이력·스키마·preview가 함께 커지면 16,384자
+이내여도 num_ctx를 넘길 수 있고, 그때 ollama는 경고 없이 자른다. `prompt_eval_count`가
+`num_ctx`에 근접할 때 경고를 남기는 계측은 아직 없다 — 재검토 항목.
+
+---
+
 ## ADR-018 — 개발 수행 모델 및 검증 전략
 
 **상태**: `ACCEPTED`
@@ -1864,6 +1904,7 @@ demo(주입 카드 표시 여부는 UI 선택).
 | 공유/object Dataset Store와 다중 worker | v1 범위 밖. 현재 workers=1 고정 |
 | 외부 Semantic Provider | 선택 확장. Core는 Catalog와 구조화 계약만으로 동작 |
 | Controlled Mutation | 미구현·비노출. 별도 ADR, credential, policy, approval 계약 없이는 추가하지 않음 |
+| 프롬프트 컨텍스트 초과 계측 | 미구현. `prompt_eval_count`는 로깅되지만 `num_ctx` 근접 시 경고가 없어, ollama의 조용한 절단이 "확인할 수 없다"는 답으로만 드러난다 (ADR-017 개정 2026-10-15) |
 
 ---
 
@@ -1871,6 +1912,7 @@ demo(주입 카드 표시 여부는 UI 선택).
 
 | 버전 | 일자 | 내용 |
 |---|---|---|
+| 0.14 | 2026-10-15 | ADR-017 개정 — 사용자 메시지 문자 상한을 8,192 → 16,384자로 상향(2.15자/토큰 실측으로 num_ctx 16384에서 역산, 요청받은 32,768자는 조용한 프롬프트 절단을 불러 기각). 검증 실패 사유를 `details.fields`에 노출(입력값 제외), `ValueError`(Malformed JSON)와 `ValidationError`를 분리 |
 | 0.1 | 2026-08-10 | 초안. ADR-001~019 등록 |
 | 0.2 | 2026-08-10 | ADR-005 확정 (MySQL 8.x). 액션 아이템 #1 해소 |
 | 0.3 | 2026-08-10 | Semantic 제안 검토(SEM-REVIEW-001) 반영. ADR-020~027 신규 등록. ADR-009 개정(Domain Pack SoT 유지), ADR-010 개정(3분할 및 게이트 명시). 액션 아이템 #4 해소, #8~12 신규 등록 |

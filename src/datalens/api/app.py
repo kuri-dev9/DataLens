@@ -45,6 +45,10 @@ DATA_PAGE_MAX = 1000
 LOG = logging.getLogger("datalens.http")
 CORS_METHODS = "GET, POST, DELETE, OPTIONS"
 CORS_HEADERS = "x-api-key, content-type, accept"
+# 사용자 메시지 1건의 문자 수 상한(ADR-017 개정 2026-10-15). ollama_num_ctx=16384에서
+# 한국어 2.15자/토큰 실측 기준 약 7.6K 토큰이며, 나머지는 시스템 프롬프트·도구 정의·
+# 스키마·preview·생성 예약(num_predict)이 쓴다. num_ctx를 올리면 같이 올려야 한다.
+MESSAGE_MAX_CHARS = 16384
 
 
 class MessageHandler(Protocol):
@@ -61,7 +65,7 @@ class Readiness(Protocol):
 
 class MessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-    message: str = Field(min_length=1, max_length=8192)
+    message: str = Field(min_length=1, max_length=MESSAGE_MAX_CHARS)
 
 
 class GlossaryRequest(BaseModel):
@@ -105,6 +109,37 @@ def error_response(
     if session_id is not None:
         payload["session_id"] = session_id
     return JSONResponse(payload, status_code=status)
+
+
+def invalid_request(request: Request, message: str, exc: ValidationError | None) -> JSONResponse:
+    """검증 실패를 사유와 함께 400으로 돌려준다.
+
+    JSON 자체가 깨진 것("Malformed JSON")과 필드가 규격에 안 맞는 것을 가른다 —
+    클라이언트가 고치는 방법이 전혀 다르다. 사유는 loc·msg·type만 추린다:
+    pydantic errors()는 기본적으로 입력값을 포함하는데, 그대로 두면 질문 본문이
+    에러 응답과 로그에 실려 운영 데이터가 샌다.
+    """
+    if exc is None:
+        return error_response(request, "DL_INVALID_REQUEST", "Malformed JSON", 400)
+    errors = exc.errors(include_url=False, include_input=False, include_context=False)
+    if any(error["type"] == "json_invalid" for error in errors):
+        return error_response(request, "DL_INVALID_REQUEST", "Malformed JSON", 400)
+    return error_response(
+        request,
+        "DL_INVALID_REQUEST",
+        message,
+        400,
+        details={
+            "fields": [
+                {
+                    "field": ".".join(str(part) for part in error["loc"]) or "(body)",
+                    "error": error["msg"],
+                    "type": error["type"],
+                }
+                for error in errors
+            ]
+        },
+    )
 
 
 def sse_event(event: str, data: dict[str, Any]) -> bytes:
@@ -369,8 +404,10 @@ def build_app(
         try:
             raw = await request.body()
             parsed = CreateSessionRequest.model_validate_json(raw) if raw else CreateSessionRequest()
-        except (ValueError, ValidationError):
-            return error_response(request, "DL_INVALID_REQUEST", "Invalid session request", 400)
+        except ValidationError as exc:
+            return invalid_request(request, "Invalid session request", exc)
+        except ValueError:
+            return invalid_request(request, "Invalid session request", None)
         if parsed.locale not in {None, "ko", "ja"}:
             return error_response(
                 request,
@@ -392,8 +429,10 @@ def build_app(
         try:
             body = await request.json()
             parsed = MessageRequest.model_validate(body)
-        except (ValueError, ValidationError):
-            return error_response(request, "DL_INVALID_REQUEST", "Invalid message request", 400)
+        except ValidationError as exc:
+            return invalid_request(request, "Invalid message request", exc)
+        except ValueError:
+            return invalid_request(request, "Invalid message request", None)
         try:
             session = sessions.begin_turn(session_id)
         except SessionNotFound:
@@ -512,8 +551,10 @@ def build_app(
             return JSONResponse({"terms": [entry.public() for entry in memory.list_terms(locale, limit=limit)]})
         try:
             parsed = GlossaryRequest.model_validate(await request.json())
-        except (ValueError, ValidationError):
-            return error_response(request, "DL_INVALID_REQUEST", "Invalid glossary request", 400)
+        except ValidationError as exc:
+            return invalid_request(request, "Invalid glossary request", exc)
+        except ValueError:
+            return invalid_request(request, "Invalid glossary request", None)
         entry = await memory.upsert_term(
             parsed.term,
             parsed.locale or settings.default_locale,

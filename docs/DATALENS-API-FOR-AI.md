@@ -106,6 +106,20 @@ content-type: application/json
 {"message": "CD_CAUSE_ORIGINAL 테이블 데이터 보여줘"}
 ```
 
+**요청 본문 제약**
+
+| 필드 | 규칙 |
+|---|---|
+| `message` | 필수. 공백 제거 후 **1자 이상 16,384자 이하**. 초과하면 400 `DL_INVALID_REQUEST` |
+| 그 외 필드 | **금지**. 모르는 필드가 있으면 400 (`type: extra_forbidden`) |
+
+상한 16,384자는 뒤에 붙는 모델의 컨텍스트(`DATALENS_OLLAMA_NUM_CTX`, 기본 16,384 토큰)에서
+역산한 값이다. 한국어 혼합 텍스트는 실측 **2.15자/토큰**이므로 16,384자는 약 7.6K 토큰이고,
+나머지는 시스템 프롬프트·도구 정의·스키마·preview·생성 예약이 쓴다. **상한을 넘기지 않더라도
+본문이 길수록 모델이 쓸 수 있는 도구 결과 공간이 줄어든다** — 긴 증거는 요약해서 보내는 편이
+답변 품질에 유리하다. 배포에서 `DATALENS_OLLAMA_NUM_CTX`를 올렸다면
+`src/datalens/api/app.py`의 `MESSAGE_MAX_CHARS`도 같이 올려야 한다.
+
 **응답 200** (실측)
 
 ```json
@@ -461,6 +475,29 @@ data: {"returned":323,"total":323}
 - `TABLE_NOT_ALLOWED` 등 정책 오류: "허용되지 않은 데이터 요청입니다"
 - 그 외 또는 `upstream_code` 없음: "데이터 요청을 처리하지 못했습니다"
 - `details`에는 교정용 구조 필드만 포함되며 SQL 원문, 접속 문자열, 비밀번호, 행 데이터는 포함하지 않는다.
+
+`DL_INVALID_REQUEST`는 **무엇이 왜 거부됐는지**를 `details.fields`에 담는다. 길이·필드 이름·타입을
+구분하지 못해 이분 탐색을 돌릴 필요가 없다.
+
+```json
+{
+  "code": "DL_INVALID_REQUEST",
+  "message": "Invalid message request",
+  "retryable": false,
+  "details": {
+    "fields": [
+      {"field": "message", "error": "String should have at most 16384 characters", "type": "string_too_long"}
+    ]
+  }
+}
+```
+
+- `field`는 점으로 이은 경로(`columns.0`), 본문 전체면 `(body)`.
+- `type`은 pydantic 오류 종류다. 분기에 쓸 수 있는 안정적인 값:
+  `string_too_long`, `string_too_short`, `extra_forbidden`, `missing`, `literal_error`, `string_type`.
+- **입력값은 담기지 않는다.** 질문 본문이 에러 응답이나 로그에 실리지 않도록 `loc`·`msg`·`type`만 추린다.
+- **JSON 자체가 깨진 경우는 `message`가 `"Malformed JSON"`이고 `details`는 `null`이다.** 파싱 실패
+  위치는 노출하지 않는다. 고치는 방법이 다르므로 필드 위반과 반드시 구분해서 처리한다.
 
 ---
 
