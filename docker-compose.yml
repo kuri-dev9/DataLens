@@ -8,12 +8,31 @@ services:
       dockerfile: Dockerfile
     container_name: pp-queryforge
     restart: unless-stopped
+    # **두 서비스가 같은 `.env` 를 쓴다** (2026-10-20 결정). 전에는 현장이
+    # `../QueryForge/.env` 를 따로 두었는데, 같은 변수 7개가 양쪽에 중복돼
+    # 한쪽만 고치면 **에러 없이** 한쪽 경로만 실패했다. QueryForge 쪽 설정의
+    # **구조**는 자기 저장소가 갖고(`config/databases.yaml`), **비밀은**
+    # 이 파일 하나가 갖는다 — `password_ref` 가 그 둘을 잇는다.
     env_file:
       - path: ${DATALENS_ENV_FILE:-.env}
         required: true
     environment:
       QUERYFORGE_HOST: 0.0.0.0
       QUERYFORGE_PORT: "8080"
+      # ── 선언 파일을 쓴다 — **`.env` 에 맡기지 않는다** (2026-10-20) ────
+      #
+      # 이 변수가 없으면 QueryForge 는 `config/databases.yaml` 을 **아예 보지
+      # 않고** `.env` 의 `DB_*` 한 묶음으로 단일 DB 를 만든다(레거시 경로,
+      # `config/databases.py:declaration_path`). 선언 파일을 고쳐도 **아무 일도
+      # 일어나지 않고 에러도 없다.**
+      #
+      # 현장 PoC 서버에서 실제로 그 상태였고, 거기서 compose 에 직접 적어
+      # 해결했다 — 그 수정을 여기로 올린 것이다. `.env` 에 두면 환경을 새로
+      # 깔 때마다 빠뜨릴 수 있고, 빠뜨린 것이 드러나지 않는다.
+      #
+      # 경로는 **컨테이너 안 경로**다. 아래 volumes 가 `config/` 디렉터리를
+      # `/etc/queryforge` 로 마운트한다.
+      QUERYFORGE_DATABASES_FILE: /etc/queryforge/databases.yaml
     volumes:
       # QueryForge 설정은 QueryForge 쪽이 소유한다. 디렉터리째 마운트해야 databases.yaml 이 보이고,
       # 편집기가 저장하며 inode 를 갈아끼워도 컨테이너가 새 내용을 본다(파일 하나만 바인드하면 못 본다).

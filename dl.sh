@@ -28,6 +28,34 @@ compose() {
     --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" "$@"
 }
 
+#: 폐기한 명령. **조용히 사라지면 다음 사람이 옛 메모를 보고 그대로 친다.**
+#: 왜 없어졌는지와 무엇을 쓸지 말하며 멈춘다 (graphio `gp.sh` 와 같은 모양).
+retired() {
+  local cmd="$1" why="$2" instead="$3"
+  echo "✗ ${cmd} 는 폐기됐다 — ${why}" >&2
+  echo "  대신: ${instead}" >&2
+  exit 2
+}
+
+#: 인자로 받은 서비스 이름이 실제로 있는지 본다.
+#:
+#: **오타를 그냥 넘기면 "전체가 떴다"로 끝난다.** `docker compose up -d qeuryforge`
+#: 는 "no such service" 로 죽지만, 우리가 인자를 그대로 넘기지 않고 가공하는
+#: 자리가 생기면 조용히 빠질 수 있다. 여기서 먼저 막고 **무엇을 쓸 수 있는지**
+#: 말한다.
+check_services() {
+  [[ $# -eq 0 ]] && return 0
+  local known name
+  known="$(compose config --services 2>/dev/null)"
+  for name in "$@"; do
+    grep -qx -- "${name}" <<<"${known}" || {
+      echo "그런 서비스가 없다: ${name}" >&2
+      echo "  쓸 수 있는 것: $(tr '\n' ' ' <<<"${known}")" >&2
+      exit 1
+    }
+  done
+}
+
 preflight() {
   command -v docker >/dev/null || { echo "Docker is required." >&2; exit 1; }
   docker compose version >/dev/null
@@ -121,12 +149,22 @@ usage() {
   cat >&2 <<USAGE
 Usage: $0 <command> [args]
 
-운영
+운영  ※ [서비스] 를 주면 그것만 — 생략하면 전부 (queryforge | datalens)
   preflight              설정 검증 (.env 필수값, compose 문법)
-  up | restart           재빌드 후 기동 (바뀐 소스가 바로 반영된다)
-  down                   정지
-  rebuild [옵션|서비스]  재빌드 후 기동 (예: rebuild datalens, rebuild --pull)
-  status | logs          컨테이너 상태 / 로그 follow
+  start   [서비스]       기동 (이미지가 있으면 그대로 쓴다)
+  restart [서비스]       **재빌드 + 재기동** — 소스를 고친 뒤 쓴다
+  stop    [서비스]       정지 + 제거 (네트워크·볼륨은 남는다)
+  status  [서비스]       컨테이너 상태
+  logs    [서비스]       로그 follow (기본 datalens)
+  sh      [서비스]       컨테이너 셸 (기본 datalens)
+
+  ※ graphio 의 ./gp.sh 와 같은 말이다 — 한쪽을 배우면 다른 쪽도 안다
+  ※ start datalens 는 queryforge 도 함께 띄운다 (depends_on)
+    정말 한 컨테이너만: docker compose up -d --no-deps <서비스>
+
+폐기  up | down | rebuild   치면 이유와 대안을 말한다
+
+점검
   health                 health + ready 확인
   smoke                  세션 생성 검증
   agent-check            3턴 시나리오 회귀 검증
@@ -156,7 +194,9 @@ Usage: $0 <command> [args]
   --json                 가공하지 않은 전체 JSON 출력
 
 예시
-  $0 up
+  $0 start                       # 전부 띄운다
+  $0 restart queryforge          # QueryForge 소스·설정을 고쳤을 때
+  $0 logs queryforge
   $0 new -l ko
   $0 ask "PM_ENB_KPI_1M 컬럼 알려줘" --detail
   $0 tables PM_ --limit 1000
@@ -169,14 +209,70 @@ USAGE
 command="${1:-help}"
 case "${command}" in
   preflight) preflight ;;
-  up) preflight; compose up -d --build ;;
-  down) compose down ;;
-  restart) preflight; compose up -d --build ;;
-  # --pull은 기본값이 아니다. 베이스 이미지를 매번 다시 받으면 Docker Hub rate limit(429)에 걸린다.
-  # 베이스 이미지를 갱신하려면 ./dl.sh rebuild --pull, 특정 서비스만 빌드하려면 ./dl.sh rebuild datalens
-  rebuild) preflight; shift; compose build "$@"; compose up -d ;;
-  status) compose ps ;;
-  logs) compose logs --tail=200 -f datalens ;;
+
+  # ── 서비스 관리 — **graphio `gp.sh` 와 같은 말을 쓴다** (2026-10-20) ──
+  #
+  # 전에는 `up`·`restart` 가 **둘 다** `up -d --build` 였다. 이름이 둘인데
+  # 하는 일이 같으니 "재빌드 없이 띄우는" 방법이 아예 없었고, `rebuild` 는
+  # 빌드만 서비스를 가리고 기동은 전체였다. 어느 것이 무엇을 하는지 매번
+  # 다시 읽어야 했다.
+  #
+  #     start   [서비스]   띄운다 (이미지가 있으면 그대로 쓴다)
+  #     restart [서비스]   **재빌드 + 재기동** — 소스를 고친 뒤 쓴다
+  #     stop    [서비스]   정지 + 제거
+  #
+  # 대상을 생략하면 전부다. 두 스크립트가 같은 말을 쓰면 한쪽을 배우면
+  # 다른 쪽도 안다 — `gp.sh` 쪽이 먼저 이 모양으로 갔다.
+  #
+  # **의존 방향은 그대로 산다.** `start datalens` 는 queryforge 를 함께
+  # 띄운다(compose 가 `depends_on: service_healthy` 를 지킨다). 정말 한
+  # 컨테이너만 손대려면 `docker compose up -d --no-deps <서비스>` 인데,
+  # 그 경우는 드물어서 명령으로 만들지 않았다.
+  start)
+    preflight; shift; check_services "$@"
+    echo "기동"
+    compose up -d "$@"
+    compose ps ;;
+
+  # `--build` 를 붙이는 것이 `start` 와의 유일한 차이다. 두 서비스 모두
+  # 소스를 이미지에 굽기 때문에, 코드를 고쳤으면 이쪽이어야 반영된다.
+  restart)
+    preflight; shift; check_services "$@"
+    echo "재기동 — 이미지를 다시 빌드한다"
+    compose up -d --build "$@"
+    compose ps ;;
+
+  # **네트워크·볼륨은 남긴다.** `down` 은 그것까지 지우는데 `datalens-memory`
+  # 볼륨에 임베딩이 들어 있어 한 번 날리면 다시 만드는 데 시간이 걸린다.
+  # 전부 정리해야 할 때만 `docker compose down` 을 직접 친다.
+  stop)
+    shift; check_services "$@"
+    echo "정지"
+    compose stop "$@"
+    compose rm -f "$@" ;;
+
+  status) shift; check_services "$@"; compose ps "$@" ;;
+
+  # 기본은 datalens 다 — 평소 보는 것이 그쪽이라서. 인자를 주면 그것만 본다.
+  logs) shift; check_services "$@"; compose logs --tail=200 -f "${@:-datalens}" ;;
+
+  # 컨테이너 셸. 기본은 datalens.
+  sh) shift; check_services "$@"; docker exec -it "pp-${1:-datalens}" sh ;;
+
+  # ── 폐기 — 치면 이유와 대안을 말한다 ────────────────────────────────
+  #
+  # 조용히 사라지면 다음 사람이 옛 문서·메모를 보고 그대로 친다.
+  # `--pull` 은 기본이 아니다 — 베이스를 매번 받으면 Docker Hub rate
+  # limit(429)에 걸린다. 필요하면 compose 를 직접 부른다.
+  up)      retired "up" \
+             "\`start\`(빌드 없이 기동)와 \`restart\`(재빌드)로 갈랐다" \
+             "./dl.sh start [서비스]   — 재빌드가 필요하면 restart" ;;
+  down)    retired "down" \
+             "네트워크·볼륨까지 지워 datalens-memory 임베딩이 날아간다" \
+             "./dl.sh stop [서비스]    — 정말 전부 정리하려면 docker compose down" ;;
+  rebuild) retired "rebuild" \
+             "빌드는 서비스를 가리고 기동은 전체여서 어긋났다" \
+             "./dl.sh restart [서비스] — 베이스까지 받으려면 docker compose build --pull" ;;
   health) health ;;
   smoke) run_check smoke ;;
   agent-check) run_check agent-check ;;
