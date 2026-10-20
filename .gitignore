@@ -26,5 +26,15 @@ build/
 
 # Server-local deployment config
 deploy/
-exporting/
 docker-compose.override.yml
+
+# 현장에서 만드는 반출물. **슬래시를 떼었다** (2026-10-20) —
+# `exporting/` 는 디렉터리만 막는데 현장에는 같은 이름의 **파일**이 있어서
+# `git status` 에 `?? exporting` 으로 남았다. 그 신호가 섞이면 "현장이 무엇을
+# 고쳤나"를 볼 때 진짜 변경을 가린다.
+exporting
+
+# 문서용 이미지. 1.3MB PNG 한 장(시스템 아키텍처)이고 코드와 함께 버전을
+# 맞출 필요가 없다. **저장소에 두고 싶으면 `git add -f assets/<파일>`** 로
+# 개별 추가한다 — 디렉터리째 추적하면 편집 때마다 바이너리 diff 가 쌓인다.
+assets/
