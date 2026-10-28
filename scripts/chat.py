@@ -53,12 +53,12 @@ def base_url() -> str:
     host = ENV.get("DATALENS_BIND_HOST", "127.0.0.1")
     if host == "0.0.0.0":
         host = "127.0.0.1"
-    return f"http://{host}:{ENV.get('DATALENS_BIND_PORT', '18121')}"
+    return f"http://{host}:{ENV.get('DATALENS_BIND_PORT', '20005')}"
 
 
 BASE = base_url()
 KEY = ENV.get("DATALENS_API_KEY") or os.environ.get("DATALENS_API_KEY", "")
-QF_BASE = "http://127.0.0.1:8080"
+QF_BASE = f"http://127.0.0.1:{ENV.get('QUERYFORGE_BIND_PORT', '20001')}"
 OLLAMA = "http://127.0.0.1:11434"
 
 C = {"dim": "\033[2m", "b": "\033[1m", "r": "\033[31m", "g": "\033[32m",

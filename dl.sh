@@ -16,7 +16,7 @@ env_value() {
 api_base() {
   local host port
   host="$(env_value DATALENS_BIND_HOST 127.0.0.1)"
-  port="$(env_value DATALENS_BIND_PORT 8000)"
+  port="$(env_value DATALENS_BIND_PORT 20005)"
   [[ "${host}" == "0.0.0.0" ]] && host="127.0.0.1"
   printf 'http://%s:%s' "${host}" "${port}"
 }

@@ -28,8 +28,8 @@ class Settings(BaseSettings):
     request_deadline_seconds: float = Field(300.0, gt=0)
     session_ttl_seconds: float = Field(1800.0, gt=0)
     country: Literal["KR", "JP"] = "KR"
-    queryforge_endpoint: AnyHttpUrl = "http://127.0.0.1:8080/mcp"
-    queryforge_data_base_url: AnyHttpUrl = "http://127.0.0.1:8080"
+    queryforge_endpoint: AnyHttpUrl = "http://127.0.0.1:20001/mcp"
+    queryforge_data_base_url: AnyHttpUrl = "http://127.0.0.1:20001"
     queryforge_api_key: SecretStr
     # MCP 초기화·도구 목록·ready(헬스체크) 전용. 장애 감지를 늦추지 않도록 짧게 둔다.
     queryforge_timeout_seconds: float = Field(5.0, gt=0)

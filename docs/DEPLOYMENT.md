@@ -44,7 +44,8 @@ Replace every placeholder and set at least:
 - request, session, Agent, QueryForge, and Ollama timeout/policy values as needed
 
 `DATALENS_HTTP_HOST=0.0.0.0` is required inside the container. `DATALENS_BIND_HOST` and
-`DATALENS_BIND_PORT` control host publication. Keep the default bind host `127.0.0.1`
+`DATALENS_BIND_PORT` control host publication (default host port `20005`; the container
+keeps listening on `DATALENS_HTTP_PORT=8000`). Keep the default bind host `127.0.0.1`
 unless a reverse proxy, firewall, and test-server access policy explicitly permit remote
 access. Completed `.env` files must remain server-side and uncommitted. Docker/Compose
 secret injection may be used instead, provided the same environment names reach the
