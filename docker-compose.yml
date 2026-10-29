@@ -8,12 +8,25 @@ services:
       dockerfile: Dockerfile
     container_name: pp-queryforge
     restart: unless-stopped
-    # **두 서비스가 같은 `.env` 를 쓴다** (2026-10-20 결정). 전에는 현장이
-    # `../QueryForge/.env` 를 따로 두었는데, 같은 변수 7개가 양쪽에 중복돼
-    # 한쪽만 고치면 **에러 없이** 한쪽 경로만 실패했다. QueryForge 쪽 설정의
-    # **구조**는 자기 저장소가 갖고(`config/databases.yaml`), **비밀은**
-    # 이 파일 하나가 갖는다 — `password_ref` 가 그 둘을 잇는다.
+    # ── 설정은 그것을 쓰는 저장소가 소유한다 (2026-10-27 정리) ──────────
+    #
+    # 전에는 QueryForge 의 비밀까지 이 저장소의 `.env` 가 들고 있었다.
+    # DataLens 는 QueryForge 를 **띄우기만** 하는데 남의 설정을 쥐고 있어서,
+    # 값 하나를 바꾸려면 어느 파일인지부터 찾아야 했다. 실제로 pem 비번이
+    # 네 자리에 흩어져 한 곳만 고친 채로 돌다가 `Access denied` 를 만났다.
+    #
+    #   `../QueryForge/.env`  QF 소유 — 비밀·클라이언트 맵. **혼자 띄울 때도 쓴다**
+    #   `.env`                이 저장소 — DataLens 설정 + compose 레벨(이미지·포트)
+    #
+    # **2026-10-20 에 하나로 합쳤던 이유는 중복이었다.** 그때는 같은 변수
+    # 7개가 양쪽에 **복사**돼 한쪽만 고치면 조용히 어긋났다. 지금은 복사가
+    # 아니라 **참조**다 — 각 키가 한 파일에만 있어 그 사고가 재발하지 않는다.
+    #
+    # 순서가 의미를 갖는다: 뒤가 이긴다. 평소에는 겹치는 키가 없고, 상위가
+    # 일부러 덮고 싶을 때만 `.env` 나 아래 `environment:` 에 적는다.
     env_file:
+      - path: ../QueryForge/.env
+        required: true
       - path: ${DATALENS_ENV_FILE:-.env}
         required: true
     environment:
