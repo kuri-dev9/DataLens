@@ -46,11 +46,15 @@ services:
       # 경로는 **컨테이너 안 경로**다. 아래 volumes 가 `config/` 디렉터리를
       # `/etc/queryforge` 로 마운트한다.
       QUERYFORGE_DATABASES_FILE: /etc/queryforge/databases.yaml
+      # 설정 화면 http://localhost:20001/ui (QueryForge ADR-034). **인증이 없다** — 아래 ports 의
+      # 127.0.0.1 바인딩이 유일한 경계다. QUERYFORGE_BIND_HOST 를 올리는 환경에서는 이 값을 끈다.
+      QUERYFORGE_UI_ENABLED: ${QUERYFORGE_UI_ENABLED:-y}
     volumes:
       # QueryForge 설정은 QueryForge 쪽이 소유한다. 디렉터리째 마운트해야 databases.yaml 이 보이고,
       # 편집기가 저장하며 inode 를 갈아끼워도 컨테이너가 새 내용을 본다(파일 하나만 바인드하면 못 본다).
       # 운영에서는 QUERYFORGE_CONFIG_DIR 로 리포 밖 경로를 가리킨다.
-      - ${QUERYFORGE_CONFIG_DIR:-../QueryForge/config}:/etc/queryforge:ro
+      # 읽기 전용이 아니다 — 설정 화면이 databases.yaml 을 고쳐 쓴다(같은 디렉터리에 쓰고 바꿔치기, .bak 한 벌).
+      - ${QUERYFORGE_CONFIG_DIR:-../QueryForge/config}:/etc/queryforge
       - qf_state:/var/lib/queryforge
     ports:
       # ADR-011 — 외부 노출 금지. 기본 바인드 호스트를 127.0.0.1에서 올리지 않는다.
