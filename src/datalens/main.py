@@ -8,6 +8,9 @@ from datalens.application.chat import ChatApplicationService
 from datalens.application.sessions import SessionService
 from datalens.config import get_settings
 from datalens.application.memory import MemoryService
+from datalens.application.runtime_config import RuntimeConfig
+from datalens.application.trace import TurnLog
+from datalens.infrastructure.sqlite_turns import SqliteTurnStore
 from datalens.infrastructure.ollama import OllamaProvider
 from datalens.infrastructure.embeddings import HttpEmbedder
 from datalens.infrastructure.sqlite_memory import SqliteMemoryStore
@@ -41,8 +44,10 @@ def create_app():
         temperature=settings.ollama_temperature,
         top_p=settings.ollama_top_p,
         top_k=settings.ollama_top_k,
+        repeat_penalty=settings.ollama_repeat_penalty,
         enable_thinking=settings.enable_thinking,
     )
+    runtime = RuntimeConfig(settings, settings.runtime_config_path or None)
     agent = BoundedAgent(
         provider,
         queryforge,
@@ -50,6 +55,7 @@ def create_app():
         recovery_budget=settings.agent_recovery_budget,
         preview_rows=settings.agent_preview_rows,
         timezone=settings.timezone,
+        runtime=runtime,
     )
     memory = None
     if settings.memory_enabled:
@@ -68,7 +74,8 @@ def create_app():
             max_recipes=settings.memory_max_recipes,
             timeout_seconds=settings.memory_timeout_seconds,
         )
-    chat = ChatApplicationService(sessions, agent, memory)
+    turn_log = TurnLog(settings.trace_keep, SqliteTurnStore(settings.memory_path))
+    chat = ChatApplicationService(sessions, agent, memory, runtime, turn_log)
     return build_app(
         settings,
         session_service=sessions,
@@ -78,6 +85,9 @@ def create_app():
         queryforge_client=queryforge,
         memory=memory,
         closeables=(provider,),
+        runtime_config=runtime,
+        turn_log=turn_log,
+        previewer=agent,
     )
 
 

@@ -304,6 +304,8 @@ async def test_err_ac_n3_retryable_partition_error_is_returned_to_model_and_retr
     assert len(qf.calls) == 2
     assert payload["error"] == {
         "code": "MISSING_PARTITION_SCOPE",
+        # QueryForge 가 이유를 적어 보내는 자리가 이것뿐이다(2026-11-08)
+        "message": "partition scope mismatch",
         "retryable": True,
         "hint": 'Use {"kind":"not_partitioned"}',
         "details": {"table": "PM_CEI_PGW_5M", "expected_kind": "not_partitioned"},

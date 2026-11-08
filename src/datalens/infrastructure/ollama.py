@@ -14,6 +14,7 @@ from datalens.observability import current_request_id
 
 from datalens.ports.llm import (
     AssistantTurn,
+    LLMEmptyResponse,
     LLMInvalidResponse,
     LLMTimeout,
     LLMUnavailable,
@@ -42,6 +43,7 @@ class OllamaProvider:
         temperature: float = 1.0,
         top_p: float = 0.95,
         top_k: int = 64,
+        repeat_penalty: float = 1.0,
         enable_thinking: bool = False,
         client: httpx.AsyncClient | None = None,
     ) -> None:
@@ -55,6 +57,7 @@ class OllamaProvider:
             "temperature": temperature,
             "top_p": top_p,
             "top_k": top_k,
+            "repeat_penalty": repeat_penalty,
             # 생성 토큰 상한(ADR-033). 유휴 워치독이 못 잡는 "살아있지만 끝나지 않는"
             # 생성(반복 루프)을 끊는 유일한 장치다. OutputPolicy가 있으면 그 값이 우선한다.
             "num_predict": num_predict,
@@ -90,12 +93,17 @@ class OllamaProvider:
     ) -> AssistantTurn:
         if deadline - time.monotonic() <= 0:
             raise LLMTimeout("LLM deadline exhausted before request")
+        # 설정 화면(/ui)이 모드별로 덮어쓴 값. 없으면 기동 설정 그대로다.
+        think = self._enable_thinking if output_policy.think is None else output_policy.think
+        idle_timeout = output_policy.idle_timeout_seconds or self._idle_timeout
+        options = dict(self._options)
+        options.update({key: value for key, value in (output_policy.options or {}).items() if value is not None})
         payload: dict[str, Any] = {
             "model": self._model,
             "stream": True,
-            "messages": [self._message(message, index == 0) for index, message in enumerate(messages)],
+            "messages": [self._message(message, index == 0, think) for index, message in enumerate(messages)],
             "tools": [self._tool(tool) for tool in tools],
-            "options": dict(self._options),
+            "options": options,
             # Ollama 의 thinking 스위치를 **실제로 전달한다**.
             # enable_thinking 은 지금까지 시스템 프롬프트에 <|think|> 를 붙이는
             # 용도로만 쓰였고 이 파라미터는 보내지 않았다. 그래서 gemma4 처럼
@@ -103,8 +111,12 @@ class OllamaProvider:
             # 받으면 추론만 하다 num_predict 를 소진해 본문을 한 글자도 못 쓴 채
             # done_reason="length" 로 끝났다 (실측: thinking 1873청크 ·
             # visible 0자 → graphio 쪽은 502 DL_UPSTREAM_INVALID_RESPONSE).
-            "think": self._enable_thinking,
+            "think": think,
         }
+        if output_policy.keep_alive:
+            # 숫자만이면 초 단위 정수로 보낸다(-1 무기한 · 0 즉시 내림). 단위가 붙으면 Ollama duration 문자열.
+            value = output_policy.keep_alive
+            payload["keep_alive"] = int(value) if value.lstrip("-").isdigit() else value
         if output_policy.max_output_tokens is not None:
             payload["options"]["num_predict"] = output_policy.max_output_tokens
         # 보낸 분량을 여기서 세어 둔다. ollama는 프롬프트를 조용히 자르고 그 사실을
@@ -130,7 +142,7 @@ class OllamaProvider:
                 "POST",
                 f"{self._base_url}/api/chat",
                 json=payload,
-                timeout=httpx.Timeout(self._idle_timeout),
+                timeout=httpx.Timeout(idle_timeout),
             ) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():
@@ -179,6 +191,9 @@ class OllamaProvider:
                 context_window=num_ctx,
                 reserved_output_tokens=num_predict,
                 prompt_chars=prompt_chars,
+                load_ms=self._ns_to_ms(final.get("load_duration")),
+                prompt_eval_ms=self._ns_to_ms(final.get("prompt_eval_duration")),
+                eval_ms=self._ns_to_ms(final.get("eval_duration")),
             )
             # 스트림이 어떻게 끝났든 "그동안 무엇이 흐르고 있었는지"를 남긴다.
             # 화면에 ping만 보이는 턴이 죽은 행인지 비가시 생성(thinking·사고 블록)인지는
@@ -225,7 +240,7 @@ class OllamaProvider:
             await on_token(tail)
         content = "".join(content_parts)
         if not content and not calls:
-            raise LLMInvalidResponse("Ollama returned neither content nor tool calls")
+            raise LLMEmptyResponse("Ollama returned neither content nor tool calls")
         return AssistantTurn(
             content=content,
             tool_calls=calls,
@@ -257,6 +272,10 @@ class OllamaProvider:
             return False
 
     @staticmethod
+    def _ns_to_ms(value: Any) -> int | None:
+        return int(value) // 1_000_000 if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+    @staticmethod
     def _tool(tool: QueryForgeToolDefinition) -> dict[str, Any]:
         return {
             "type": "function",
@@ -267,9 +286,11 @@ class OllamaProvider:
             },
         }
 
-    def _message(self, message: ProviderMessage, first: bool = False) -> dict[str, Any]:
+    def _message(
+        self, message: ProviderMessage, first: bool = False, think: bool | None = None
+    ) -> dict[str, Any]:
         content = message.content
-        if first and message.role == "system" and self._enable_thinking:
+        if first and message.role == "system" and (self._enable_thinking if think is None else think):
             content = f"<|think|>{content}"
         converted: dict[str, Any] = {"role": message.role, "content": content}
         if message.role == "tool" and message.tool_name:

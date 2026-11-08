@@ -65,6 +65,7 @@ async def test_normal_answer_and_tool_schema_conversion() -> None:
         "temperature": 1.0,
         "top_p": 0.95,
         "top_k": 64,
+        "repeat_penalty": 1.0,        # 기본 1.0 = 끔(2026-11-07) — 항상 실리되 동작은 같다
         "num_predict": 64,
     }
 
@@ -113,6 +114,7 @@ async def test_opt_ac1_sampling_options_and_thinking_control_are_sent() -> None:
         "temperature": 0.8,
         "top_p": 0.9,
         "top_k": 32,
+        "repeat_penalty": 1.0,
         # OutputPolicy가 비어 있으면 생성 상한 기본값이 항상 실린다(ADR-033 WDG-AC-3).
         "num_predict": 2048,
     }
@@ -534,3 +536,41 @@ async def test_healthy_turn_logs_no_pressure_warning(caplog) -> None:
     finally:
         await client.aclose()
     assert [record for record in caplog.records if record.message == "llm_context_pressure"] == []
+
+
+# ── repeat_penalty (2026-11-07 · L3 반복 억제 경로) — 기본은 끔, 켜는 길만 만든다 ───────────────
+
+def _options(adapter_kwargs: dict, policy: OutputPolicy) -> dict:
+    captured: list[dict] = []
+
+    async def go() -> dict:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(json.loads(request.content))
+            return httpx.Response(200, json={"message": {"role": "assistant", "content": "ok"}, "done_reason": "stop"})
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        adapter = OllamaProvider("http://ollama.test", "m", request_timeout_seconds=5, client=client, **adapter_kwargs)
+        try:
+            await adapter.complete([ProviderMessage("system", "지침")], (), time.monotonic() + 1, policy)
+        finally:
+            await client.aclose()
+        return captured[0]["options"]
+
+    return asyncio.run(go())
+
+
+def test_repeat_penalty_defaults_to_off_and_is_always_sent():
+    assert _options({}, OutputPolicy())["repeat_penalty"] == 1.0
+
+
+def test_repeat_penalty_from_the_startup_setting_is_sent():
+    assert _options({"repeat_penalty": 1.1}, OutputPolicy())["repeat_penalty"] == 1.1
+
+
+def test_a_runtime_override_beats_the_startup_setting():
+    assert _options({"repeat_penalty": 1.0}, OutputPolicy(options={"repeat_penalty": 1.15}))["repeat_penalty"] == 1.15
+
+
+def test_a_none_override_keeps_the_startup_setting_and_other_options_stay():
+    got = _options({"repeat_penalty": 1.1, "top_k": 32}, OutputPolicy(options={"repeat_penalty": None, "temperature": 0.3}))
+    assert got["repeat_penalty"] == 1.1 and got["top_k"] == 32 and got["temperature"] == 0.3

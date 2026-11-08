@@ -14,7 +14,9 @@ from jsonschema.exceptions import relevance
 
 from datalens.domain.session import Session
 from datalens.prompts import load_system_prompt
+from datalens.application.runtime_config import HISTORY_STORE_LIMIT, Mode, Profile, RuntimeConfig
 from datalens.ports.llm import (
+    LLMEmptyResponse,
     LLMInvalidResponse,
     LLMProvider,
     LLMTimeout,
@@ -30,6 +32,7 @@ from datalens.ports.queryforge import (
     QueryForgeToolDefinition,
     QueryForgeUnavailable,
 )
+from datalens.application import query_args
 from datalens.application.grounding import collect_facts, safe_measure
 from datalens.observability import current_request_id, safe_log_value
 
@@ -44,6 +47,22 @@ _LINEAGE_LIMIT = 8
 # notice의 응답 크기 추정치("~120 KB")나 next_page의 페이징 인자(count/offset)를
 # 근거로 인정하면 ADR-034 계측이 느슨해진다.
 _NON_FACT_KEYS = frozenset({"notice", "next_page"})
+# 도구 정의 lazy 모드의 메타 도구(2026-11-04). QueryForge 도구가 아니다 — DataLens 가 직접 답한다.
+TOOL_SPEC_NAME = "get_tool_spec"
+# 빈 출력이 재시도 뒤에도 이어질 때 도구 없이 한 번 더 부르며 붙이는 지시(2026-11-08).
+# 사용자 차례로 넣는다 — 대화 중간의 system 은 gemma 템플릿에서 첫 system 과 합쳐지지 않는다.
+_FINAL_WITHOUT_TOOLS = {
+    "ko": "[DataLens 안내] 도구를 더 부를 수 없습니다. 지금까지의 도구 결과와 위 맥락만으로 질문에 답하세요. "
+          "조회하지 못한 것은 조회하지 못했다고 말하고, 받지 않은 수치는 쓰지 마세요.",
+    "ja": "[DataLens 案内] これ以上ツールは呼べません。これまでのツール結果と上の文脈だけで質問に答えてください。"
+          "照会できなかったものは照会できなかったと述べ、受け取っていない数値は書かないでください。",
+}
+_LAZY_HINT = {
+    "ko": "[도구 정의] 도구 목록의 정의는 요약본이다(이름·한 줄 설명·최상위 인자). 인자 구조가 확실하지 않으면 "
+          f"그 도구를 부르기 전에 {TOOL_SPEC_NAME}(name)으로 전체 정의를 받아라. 한 번 받은 정의는 이후 도구 목록에 그대로 실린다.",
+    "ja": "[ツール定義] ツール一覧の定義は要約版です(名前・一行説明・最上位の引数)。引数の構造が確かでなければ、"
+          f"そのツールを呼ぶ前に {TOOL_SPEC_NAME}(name) で完全な定義を受け取ってください。一度受け取った定義は以後のツール一覧にそのまま載ります。",
+}
 
 
 class AgentError(RuntimeError):
@@ -121,6 +140,12 @@ class AgentResult:
     # 이번 턴에서 프롬프트가 컨텍스트 창을 얼마나 먹었는지. 절단은 에러가 아니라
     # 침묵으로 나타나므로, 잘렸는지를 사후에 알 수 있는 유일한 통로다.
     context: dict[str, Any] | None = None
+    # 이번 턴에 무엇을 실었나(모드·맥락 구성·파라미터·도구 수). 호출부가 "무엇을 보냈는지"를
+    # 사후에 확인하는 통로다 — 설정 화면 값은 바뀔 수 있으므로 턴마다 남긴다.
+    profile: dict[str, Any] | None = None
+    # 마지막 LLM 호출에 실제로 실린 메시지·도구·응답(application/trace.py 가 블록으로 나눈다).
+    # 메모리에만 보관되는 진단용 값이고 API 응답 본문에는 싣지 않는다.
+    trace: dict[str, Any] | None = None
 
 
 class BoundedAgent:
@@ -153,6 +178,7 @@ class BoundedAgent:
         recovery_budget: int,
         preview_rows: int = 5,
         timezone: str = "Asia/Seoul",
+        runtime: RuntimeConfig | None = None,
     ) -> None:
         self._provider = provider
         self._queryforge = queryforge
@@ -160,6 +186,8 @@ class BoundedAgent:
         self._recovery_budget = recovery_budget
         self._preview_rows = preview_rows
         self._timezone = timezone
+        # None 이면 모드 설정이 없는 예전 동작(agent 기본값 · 기동 설정 파라미터)이다.
+        self._runtime = runtime
 
     async def run(
         self,
@@ -168,14 +196,33 @@ class BoundedAgent:
         deadline: float,
         event_sink: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
         hints: str | None = None,
+        mode: Mode = "agent",
     ) -> AgentResult:
         self._remaining(deadline)
-        try:
-            tools = await self._queryforge.discover_tools(self._remaining(deadline))
-        except (TimeoutError, QueryForgeUnavailable) as exc:
-            raise AgentUpstreamUnavailable("QueryForge capability discovery failed") from exc
+        profile = self.profile(mode)
+        if profile.tools == "off":
+            # 증거 전용 모드는 QueryForge 를 부르지도 않는다 — QueryForge 가 내려가 있어도 답한다.
+            tools: tuple[QueryForgeToolDefinition, ...] = ()
+        else:
+            try:
+                tools = tuple(await self._queryforge.discover_tools(self._remaining(deadline)))
+            except (TimeoutError, QueryForgeUnavailable) as exc:
+                raise AgentUpstreamUnavailable("QueryForge capability discovery failed") from exc
         tool_map = {tool.name: tool for tool in tools}
-        messages = self._context(session, message, hints)
+        # lazy 모드에서 전체 정의를 받은 도구. 세션에 남아 다음 턴에도 펼쳐진 채로 간다.
+        expanded: list[str] = [name for name in session.expanded_tools if name in tool_map]
+        sent_tools = self._sent_tools(tools, profile.tools, expanded)
+        spec_calls = 0
+        messages = self._context(session, message, hints if profile.memory else None, profile)
+        # 여기까지가 조립된 입력이다. 뒤에 붙는 것은 도구 호출 루프가 만든 메시지다.
+        base_len = len(messages)
+        policy = self._output_policy(profile)
+        sent = {
+            **profile.public(),
+            "tool_count": len(sent_tools),
+            "tool_chars": sum(len(tool.description) + len(json.dumps(tool.input_schema, ensure_ascii=False)) for tool in sent_tools),
+            "history_used": sum(1 for item in messages if item.role in {"user", "assistant"}) - 1,
+        }
         plan: list[dict[str, Any]] = []
         tool_count = 0
         recovery_count = 0
@@ -194,6 +241,8 @@ class BoundedAgent:
                 for item in messages
                 if item.role == "assistant"
                 or (item.role == "system" and item.content.startswith("DataLens "))
+                # 증거 전용 모드에서는 사용자가 보낸 자료가 곧 사실이다. 이전 턴의 자료도 같다.
+                or (profile.mode == "evidence" and item.role == "user")
             ],
             facts,
         )
@@ -203,6 +252,10 @@ class BoundedAgent:
         # 한 턴은 LLM을 여러 번 부른다. 도구 결과가 쌓일수록 프롬프트가 커지므로
         # 가장 압박이 심했던 호출을 들고 간다 — 평균을 내면 절단이 묻힌다.
         worst_usage: TokenUsage | None = None
+        # 본문도 도구 호출도 없는 생성은 한 턴에 한 번만 다시 보낸다(LLMEmptyResponse · 2026-11-08).
+        empty_retried = False
+        # 재시도도 비면 도구 없이 마지막 답을 한 번 더 받는다 — 빈손으로 502 를 내지 않는다.
+        final_without_tools = False
 
         try:
             while True:
@@ -212,18 +265,19 @@ class BoundedAgent:
                 # LLM 호출 도중 끊기면 어느 단계에서 멈췄는지 failed_step으로 남는다.
                 step.clear()
                 step.update({"index": tool_count + 1, "tool": "llm"})
+                sent_tools = () if final_without_tools else self._sent_tools(tools, profile.tools, expanded)
                 try:
                     if event_sink is not None and hasattr(self._provider, "complete_stream"):
                         turn = await self._provider.complete_stream(
                             messages,
-                            tools,
+                            sent_tools,
                             deadline,
-                            OutputPolicy(),
+                            policy,
                             lambda text: event_sink("token", {"text": text}),
                             lambda data: event_sink("progress", data),
                         )
                     else:
-                        turn = await self._provider.complete(messages, tools, deadline, OutputPolicy())
+                        turn = await self._provider.complete(messages, sent_tools, deadline, policy)
                 except LLMTimeout as exc:
                     step["upstream_code"] = "LLM_IDLE_TIMEOUT"
                     step["detail"] = str(exc)
@@ -232,6 +286,37 @@ class BoundedAgent:
                     step["upstream_code"] = "LLM_UNAVAILABLE"
                     step["detail"] = str(exc)
                     raise AgentUpstreamUnavailable("LLM provider failed") from exc
+                except LLMEmptyResponse as exc:
+                    # gemma4 의 도구 호출을 Ollama 가 읽지 못하면 아무것도 없이 끝난다. 흘린 토큰이
+                    # 없으니 같은 입력으로 한 번 더 부른다. 두 번째도 비면 도구를 빼고 지금까지 받은 것으로
+                    # 답하게 한 번 더 부른다. 그것도 비면 예전처럼 실패로 끝낸다.
+                    if final_without_tools:
+                        step["upstream_code"] = "LLM_INVALID_RESPONSE"
+                        step["detail"] = str(exc)
+                        raise AgentInvalidUpstreamResponse("LLM provider returned an invalid response") from exc
+                    if empty_retried:
+                        final_without_tools = True
+                        messages.append(
+                            ProviderMessage("user", _FINAL_WITHOUT_TOOLS.get(session.locale, _FINAL_WITHOUT_TOOLS["ko"]))
+                        )
+                        warnings.append(
+                            {
+                                "code": "DATALENS_FINAL_WITHOUT_TOOLS",
+                                "action": "answered_without_tools",
+                                "detail": "the model returned empty output twice; answered from tool results gathered so far",
+                            }
+                        )
+                        LOG.warning(
+                            "llm_final_without_tools",
+                            extra={"request_id": current_request_id(), "session_id": session.session_id, "step": tool_count + 1, "tool_calls": tool_count},
+                        )
+                        continue
+                    empty_retried = True
+                    LOG.warning(
+                        "llm_empty_retry",
+                        extra={"request_id": current_request_id(), "session_id": session.session_id, "step": tool_count + 1},
+                    )
+                    continue
                 except LLMInvalidResponse as exc:
                     step["upstream_code"] = "LLM_INVALID_RESPONSE"
                     step["detail"] = str(exc)
@@ -239,6 +324,13 @@ class BoundedAgent:
                 step.clear()
                 worst_usage = self._worst_usage(worst_usage, turn.usage)
 
+                if final_without_tools and turn.tool_calls:
+                    # 도구 목록을 비웠는데도 호출을 냈다 — 본문이 있으면 그것을 답으로 쓰고 호출은 버린다.
+                    if not (turn.content or "").strip():
+                        step["upstream_code"] = "LLM_INVALID_RESPONSE"
+                        step["detail"] = "tool call after tools were withdrawn"
+                        raise AgentInvalidUpstreamResponse("LLM provider returned an invalid response")
+                    turn = replace(turn, tool_calls=())
                 if not turn.tool_calls:
                     answer = (turn.content or "").strip()
                     if not answer:
@@ -251,6 +343,7 @@ class BoundedAgent:
                         tuple(lineage.values()),
                         active_table,
                         active_period,
+                        tuple(expanded),
                     )
                     return AgentResult(
                         answer=answer,
@@ -262,19 +355,46 @@ class BoundedAgent:
                         updated_session=updated,
                         plan=tuple(plan),
                         context=worst_usage.public() if worst_usage else None,
+                        profile=sent,
+                        trace={
+                            "messages": list(messages),
+                            "tools": sent_tools,
+                            "base_len": base_len,
+                            "usage": turn.usage,
+                            "stop_reason": turn.stop_reason,
+                        },
                     )
 
                 messages.append(ProviderMessage("assistant", turn.content or "", turn.tool_calls))
                 should_retry = False
                 for call in turn.tool_calls:
+                    if profile.tools == "lazy" and call.name == TOOL_SPEC_NAME:
+                        # QueryForge 호출이 아니므로 도구 예산을 쓰지 않는다. 대신 도구 수만큼만 허용해 루프를 막는다.
+                        spec_calls += 1
+                        if spec_calls > len(tool_map) + 2:
+                            raise AgentLimitError("Tool spec request budget exhausted")
+                        messages.append(self._tool_spec_message(call.arguments, tool_map, expanded))
+                        should_retry = True
+                        continue
                     if tool_count >= self._max_tool_calls:
                         raise AgentLimitError("Tool call budget exhausted")
                     tool_count += 1
                     step.clear()
                     step.update({"index": tool_count, "tool": call.name})
+                    arguments = call.arguments
+                    fixes: list[str] = []
+                    if call.name == "query":
+                        # 뜻이 같은 모양 고침만 한다(query_args 머리말). 고친 인자가 검증·호출·계보에 쓰인다.
+                        arguments, fixes = query_args.normalize(arguments)
+                        if fixes:
+                            step["normalized"] = list(fixes)
+                            LOG.info(
+                                "tool_arguments_normalized",
+                                extra={"request_id": current_request_id(), "session_id": session.session_id, "step": tool_count, "tool": call.name, "fixes": fixes},
+                            )
                     # 무엇을 하려는 단계인지 먼저 알린다. 인자 검증에서 걸러지는 호출도
                     # 사용자 화면에서는 하나의 시도로 보여야 한다.
-                    intent = self._call_summary(call.name, call.arguments)
+                    intent = self._call_summary(call.name, arguments)
                     if intent:
                         step["intent"] = deepcopy(intent)
                     if event_sink is not None:
@@ -285,9 +405,9 @@ class BoundedAgent:
                     definition = tool_map.get(call.name)
                     if definition is None:
                         raise AgentPolicyError("LLM requested a tool outside the allowlist")
-                    validation_error = self._validate(definition, call.arguments)
+                    validation_error = self._validate(definition, arguments)
                     if validation_error is not None:
-                        self._log_tool_call(session, tool_count, call.name, call.arguments, False, 0, recovery_count < self._recovery_budget, code="INVALID_TOOL_ARGUMENTS", details={"reason": "schema_validation_failed"})
+                        self._log_tool_call(session, tool_count, call.name, arguments, False, 0, recovery_count < self._recovery_budget, code="INVALID_TOOL_ARGUMENTS", details={"reason": "schema_validation_failed"})
                         step["upstream_code"] = "INVALID_TOOL_ARGUMENTS"
                         step["detail"] = validation_error
                         if event_sink is not None:
@@ -301,10 +421,15 @@ class BoundedAgent:
                                 },
                             )
                         recovery_count = self._claim_recovery(recovery_count)
-                        messages.append(self._recovery_message(call.name, "INVALID_TOOL_ARGUMENTS", validation_error))
+                        recovery = self._recovery_message(call.name, "INVALID_TOOL_ARGUMENTS", validation_error)
+                        if profile.tools == "lazy" and call.name not in expanded:
+                            # 요약본만 보고 인자를 틀렸다 — 전체 정의를 오류와 함께 주고 이후 펼쳐 둔다.
+                            expanded.append(call.name)
+                            recovery = self._with_definition(recovery, definition)
+                        messages.append(recovery)
                         should_retry = True
                         break
-                    tool_arguments = self._bounded_arguments(call.name, call.arguments)
+                    tool_arguments = self._bounded_arguments(call.name, arguments)
                     tool_started = time.monotonic()
                     try:
                         result = await self._queryforge.call_tool(
@@ -347,7 +472,11 @@ class BoundedAgent:
                             if recovery_count >= self._recovery_budget:
                                 raise AgentQueryRejected(failure, tool_calls=tool_count, recovery_count=recovery_count)
                             recovery_count += 1
-                            messages.append(self._queryforge_recovery_message(call.name, failure))
+                            recovery = self._queryforge_recovery_message(call.name, failure)
+                            if profile.tools == "lazy" and call.name not in expanded:
+                                expanded.append(call.name)
+                                recovery = self._with_definition(recovery, definition)
+                            messages.append(recovery)
                             should_retry = True
                             break
                         raise AgentQueryRejected(failure, tool_calls=tool_count, recovery_count=recovery_count)
@@ -359,6 +488,10 @@ class BoundedAgent:
                         {key: value for key, value in bounded.items() if key not in _NON_FACT_KEYS},
                         facts,
                     )
+                    if fixes:
+                        # 근거 수집 뒤에 붙인다 — 고친 자리의 색인 숫자가 근거로 잡히면 안 된다.
+                        # 모델에 알려 다음 호출부터 바른 모양을 쓰게 한다.
+                        bounded["arguments_normalized"] = list(fixes)
                     if event_sink is not None:
                         await event_sink(
                             "tool_call",
@@ -451,10 +584,16 @@ class BoundedAgent:
         ordered = [primary, *(item for item in errors if item is not primary)]
         reported = [f"{BoundedAgent._error_path(item)}: {item.message}" for item in ordered[:3]]
         detail = " | ".join(reported)
+        if tool.name == "query":
+            # anyOf 가지가 긴 자리(filters 등)는 아래 기대 스키마가 400자를 넘어 빠진다.
+            # 그 자리의 바른 모양을 문장으로 붙인다(query_args 머리말 · 2026-11-08).
+            hint = query_args.shape_hint([BoundedAgent._error_path(item) for item in ordered[:3]])
+            if hint:
+                detail = f"{detail} | fix: {hint}"
         expected = json.dumps(primary.schema, ensure_ascii=False, separators=(",", ":"))
         if len(expected) <= 400:
             detail = f"{detail} | expected at {BoundedAgent._error_path(primary)}: {expected}"
-        return detail[:1024]
+        return detail[:2048]
 
     @staticmethod
     def _worst_usage(current: TokenUsage | None, candidate: TokenUsage | None) -> TokenUsage | None:
@@ -595,10 +734,20 @@ class BoundedAgent:
     ) -> ProviderMessage:
         error = {
             "code": failure.code,
+            # 무엇이 틀렸는지 한 줄("query requires select columns or aggregations")이 여기만 있다.
+            # 빼고 보내면 모델은 path 만 보고 추측한다(dlr_rDTXUMnNJoKruy0q4b38rHCK · 2026-11-08).
+            "message": failure.message,
             "retryable": failure.retryable,
             "hint": failure.hint,
             "details": deepcopy(failure.safe_metadata),
         }
+        if tool_name == "query":
+            # 스키마 검증을 지나 QueryForge 실행 단계에서 거절된 경우에도 그 자리의 바른 모양을 붙인다.
+            path = failure.safe_metadata.get("path")
+            if isinstance(path, list) and path:
+                fix = query_args.shape_hint(["/".join(str(item) for item in path)])
+                if fix:
+                    error["fix"] = fix
         return ProviderMessage(
             "tool",
             json.dumps({"ok": False, "error": error}, ensure_ascii=False, separators=(",", ":")),
@@ -687,7 +836,144 @@ class BoundedAgent:
             preview=tuple(item for item in preview[: self._preview_rows] if isinstance(item, dict)),
         )
 
-    def _context(self, session: Session, message: str, hints: str | None = None) -> list[ProviderMessage]:
+    async def preview(
+        self, session: Session, message: str, profile: Profile, timeout_seconds: float = 5.0
+    ) -> tuple[list[ProviderMessage], tuple[QueryForgeToolDefinition, ...], int, str | None]:
+        """모델을 부르지 않고 이 설정으로 조립될 입력을 돌려준다(설정 화면 미리보기).
+
+        회상 힌트는 실제 회상을 돌리지 않으므로 싣지 않는다 — 그 사실을 note 로 알린다.
+        """
+        note = None
+        tools: tuple[QueryForgeToolDefinition, ...] = ()
+        if profile.tools != "off":
+            try:
+                tools = tuple(await self._queryforge.discover_tools(timeout_seconds))
+            except (TimeoutError, QueryForgeUnavailable):
+                note = "QueryForge 도구 목록을 받지 못해 도구 정의를 0으로 셌다"
+            names = {tool.name for tool in tools}
+            tools = self._sent_tools(tools, profile.tools, [n for n in session.expanded_tools if n in names])
+        messages = self._context(session, message, None, profile)
+        if profile.memory:
+            note = (note + " · " if note else "") + "회상 힌트는 질문마다 달라 미리보기에 싣지 않았다"
+        return messages, tools, len(messages), note
+
+    def profile(self, mode: Mode = "agent") -> Profile:
+        if self._runtime is not None:
+            return self._runtime.profile(mode)
+        defaults = {"system_prompt": True, "session_context": True, "memory": True, "tools": "full", "history_items": 6}
+        if mode == "evidence":
+            defaults = {"system_prompt": True, "session_context": False, "memory": False, "tools": "off", "history_items": 6}
+        return Profile(mode=mode, params={}, **defaults)
+
+    @staticmethod
+    def _output_policy(profile: Profile) -> OutputPolicy:
+        params = profile.params
+        if not params:
+            return OutputPolicy()
+        return OutputPolicy(
+            options={key: params.get(key) for key in ("num_ctx", "temperature", "top_p", "top_k", "repeat_penalty", "num_predict")},
+            think=params.get("think"),
+            idle_timeout_seconds=params.get("idle_timeout_seconds"),
+            keep_alive=params.get("keep_alive"),
+        )
+
+    def _sent_tools(
+        self, tools: tuple[QueryForgeToolDefinition, ...], level: str, expanded: list[str]
+    ) -> tuple[QueryForgeToolDefinition, ...]:
+        if level == "summary":
+            return tuple(self._summarize_tool(tool) for tool in tools)
+        if level != "lazy" or not tools:
+            return tools
+        sent = tuple(tool if tool.name in expanded else self._lazy_tool(tool) for tool in tools)
+        return (*sent, self._tool_spec_definition(tools))
+
+    @staticmethod
+    def _lazy_tool(tool: QueryForgeToolDefinition) -> QueryForgeToolDefinition:
+        """lazy 요약 — 이름 · 설명 첫 줄(200자) · 최상위 인자의 type/enum/required 만.
+
+        실측(2026-11-04): 도구 5개 32,058자 → 약 3,100자. 인자 검증은 여전히 전체 스키마로 한다
+        (`tool_map`) — 요약은 모델에게 보여 주는 모양일 뿐 허용 범위를 넓히지 않는다.
+        """
+
+        def shallow(node: Any, depth: int) -> Any:
+            if not isinstance(node, dict):
+                return node
+            out = {key: node[key] for key in ("type", "enum", "required") if key in node}
+            if depth == 0 and isinstance(node.get("properties"), dict):
+                out["properties"] = {name: shallow(value, depth + 1) for name, value in node["properties"].items()}
+            return out
+
+        first = tool.description.strip().split("\n", 1)[0][:200]
+        description = f"{first} (요약본 — 전체 정의는 {TOOL_SPEC_NAME})"
+        return QueryForgeToolDefinition(name=tool.name, description=description, input_schema=shallow(tool.input_schema, 0))
+
+    @staticmethod
+    def _tool_spec_definition(tools: tuple[QueryForgeToolDefinition, ...]) -> QueryForgeToolDefinition:
+        return QueryForgeToolDefinition(
+            name=TOOL_SPEC_NAME,
+            description="도구의 전체 정의(설명·인자 스키마 전체)를 돌려준다. 요약본만으로 인자를 확신할 수 없을 때 그 도구를 부르기 전에 쓴다.",
+            input_schema={
+                "type": "object",
+                "required": ["name"],
+                "properties": {"name": {"type": "string", "enum": [tool.name for tool in tools]}},
+            },
+        )
+
+    @staticmethod
+    def _tool_spec_message(
+        arguments: Any, tool_map: dict[str, QueryForgeToolDefinition], expanded: list[str]
+    ) -> ProviderMessage:
+        name = arguments.get("name") if isinstance(arguments, dict) else None
+        tool = tool_map.get(name) if isinstance(name, str) else None
+        if tool is None:
+            body = {"ok": False, "error": {"code": "UNKNOWN_TOOL", "detail": f"available: {sorted(tool_map)}"}}
+        else:
+            if tool.name not in expanded:
+                expanded.append(tool.name)
+            body = {
+                "ok": True,
+                "tool": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+                "note": "이제 이 도구의 전체 정의가 도구 목록에도 실린다",
+            }
+        return ProviderMessage("tool", json.dumps(body, ensure_ascii=False, separators=(",", ":")), tool_name=TOOL_SPEC_NAME)
+
+    @staticmethod
+    def _with_definition(message: ProviderMessage, tool: QueryForgeToolDefinition) -> ProviderMessage:
+        body = json.loads(message.content)
+        body["tool_definition"] = {"description": tool.description, "input_schema": tool.input_schema}
+        body["note"] = "요약본만 보고 부른 호출이 거부됐다. 위 전체 정의를 보고 인자를 고쳐 다시 불러라"
+        return replace(message, content=json.dumps(body, ensure_ascii=False, separators=(",", ":")))
+
+    @staticmethod
+    def _summarize_tool(tool: QueryForgeToolDefinition) -> QueryForgeToolDefinition:
+        """스키마 "요약" — 도구 설명은 첫 문단만, 입력 스키마는 중첩 설명·예시를 걷는다.
+
+        도구 정의 5개가 약 31,000자다(2026-11-04 실측 · query 10K · transform 12K). 대부분이
+        중첩 필드의 description 과 examples 라 구조(type·enum·required)는 남기고 그것만 뺀다.
+        구조를 지우면 모델이 인자를 맞출 수 없어 검증 실패 → 복구 루프가 된다.
+        """
+
+        def strip(node: Any, depth: int, names: bool = False) -> Any:
+            # names=True 는 `properties` 아래 — 키가 필드 이름이라 "description" 필드도 지우면 안 된다.
+            if isinstance(node, dict):
+                return {
+                    key: strip(value, depth + 1, not names and key in {"properties", "$defs", "definitions"})
+                    for key, value in node.items()
+                    if names or not (key in {"examples", "example"} or (key == "description" and depth > 0))
+                }
+            if isinstance(node, list):
+                return [strip(item, depth + 1) for item in node]
+            return node
+
+        description = tool.description.strip().split("\n\n", 1)[0][:400]
+        return QueryForgeToolDefinition(name=tool.name, description=description, input_schema=strip(tool.input_schema, 0))
+
+    def _context(
+        self, session: Session, message: str, hints: str | None = None, profile: Profile | None = None
+    ) -> list[ProviderMessage]:
+        profile = profile or self.profile("agent")
         now = datetime.now(ZoneInfo(self._timezone))
         state = {
             "now": now.isoformat(timespec="seconds"),
@@ -700,13 +986,22 @@ class BoundedAgent:
             # dataset_id만 재사용할 수 있고, 없는 id를 지어내면 안 된다.
             "datasets": list(session.dataset_lineage),
         }
-        messages = [
-            ProviderMessage("system", load_system_prompt(session.locale)),
-            ProviderMessage("system", f"DataLens session context: {json.dumps(state, ensure_ascii=False)}"),
-        ]
+        if profile.mode == "evidence":
+            # 데이터셋 계보·활성 테이블은 조회 에이전트의 상태다. 도구가 없는 모드에는 시각만 의미가 있다.
+            state = {key: state[key] for key in ("now", "today", "timezone")}
+        messages: list[ProviderMessage] = []
+        if profile.system_prompt:
+            kind = "evidence" if profile.mode == "evidence" else "system"
+            prompt = load_system_prompt(session.locale, kind)
+            if profile.tools == "lazy":
+                prompt = f"{prompt}\n\n{_LAZY_HINT.get(session.locale, _LAZY_HINT['ko'])}"
+            messages.append(ProviderMessage("system", prompt))
+        if profile.session_context:
+            messages.append(ProviderMessage("system", f"DataLens session context: {json.dumps(state, ensure_ascii=False)}"))
         if hints:
             messages.append(ProviderMessage("system", f"DataLens memory:\n{hints}"))
-        for item in session.turn_state[-6:]:
+        history = session.turn_state[-profile.history_items:] if profile.history_items > 0 else ()
+        for item in history:
             role = item.get("role")
             content = item.get("content")
             if role in {"user", "assistant"} and isinstance(content, str):
@@ -723,8 +1018,10 @@ class BoundedAgent:
         new_lineage: tuple[dict[str, Any], ...],
         active_table: str | None,
         active_period: dict[str, str] | None,
+        expanded_tools: tuple[str, ...] | None = None,
     ) -> Session:
-        history = (*session.turn_state, {"role": "user", "content": user_message}, {"role": "assistant", "content": answer})[-12:]
+        # 저장 상한은 설정 화면이 고를 수 있는 history_items 의 최대치다(실을 수 있는 만큼은 남긴다).
+        history = (*session.turn_state, {"role": "user", "content": user_message}, {"role": "assistant", "content": answer})[-HISTORY_STORE_LIMIT:]
         # 같은 데이터셋이 다시 쓰이면 최신 자리로 옮긴다. 상한을 자를 때
         # 방금 재사용한 항목이 먼저 떨어져 나가면 안 되기 때문이다.
         merged: dict[str, dict[str, Any]] = {}
@@ -740,4 +1037,5 @@ class BoundedAgent:
             active_period=active_period,
             turn_state=tuple(history),
             dataset_lineage=lineage,
+            expanded_tools=session.expanded_tools if expanded_tools is None else expanded_tools,
         )

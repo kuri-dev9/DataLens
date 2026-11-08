@@ -20,6 +20,8 @@ class Session:
     # 이 세션에서 만들어진 데이터셋의 계보. 모델이 과거 데이터셋을 지어내지 않고
     # 그대로 재사용할 수 있도록 세션 컨텍스트로 노출된다 (ADR-035).
     dataset_lineage: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    # 도구 정의 lazy 모드에서 이 세션이 이미 전체 정의를 받은 도구들. 한 번 펼친 도구는 계속 펼쳐 둔다.
+    expanded_tools: tuple[str, ...] = field(default_factory=tuple)
 
     def public(self) -> dict[str, str]:
         return {

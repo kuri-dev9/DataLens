@@ -56,7 +56,17 @@ class Settings(BaseSettings):
     ollama_temperature: float = Field(0.2, ge=0)
     ollama_top_p: float = Field(0.95, ge=0, le=1)
     ollama_top_k: int = Field(64, gt=0)
+    # 1.0 = 끔(Ollama 기본 동작을 바꾸지 않는다). 증거 답의 값은 설정 화면이 모드별로 준다
+    # 이 값을 .env 로 주지 않으면 agent 모드는 1.1(초기값)을 쓴다 — runtime_config._MODE_PARAM_DEFAULTS
+    ollama_repeat_penalty: float = Field(1.0, ge=1.0, le=2.0)
+    # 비우면 보내지 않는다(Ollama 기본 5분). 예: 30m · 2h · -1(무기한, 메모리 상시 점유) · 0(즉시 내림)
+    ollama_keep_alive: str | None = None
     enable_thinking: bool = False
+    # 설정 화면(/ui)이 모드별 맥락·파라미터를 저장하는 파일. 비우면 저장하지 않는다(재시작 시 초기화).
+    # 메모리와 같은 볼륨(/var/lib/datalens)에 두어 컨테이너를 다시 만들어도 남게 한다.
+    runtime_config_path: str = "/var/lib/datalens/runtime.json"
+    # 설정 화면의 "최근 전송 원문"을 모드별로 몇 건 보관하나. 메모리에만 둔다(증거 원문이 들어 있다).
+    trace_keep: int = Field(5, ge=0, le=50)
     memory_enabled: bool = True
     memory_path: str = "/var/lib/datalens/memory.sqlite3"
     embedding_model: str = Field("bge-m3", min_length=1, max_length=128)

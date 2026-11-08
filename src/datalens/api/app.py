@@ -33,6 +33,13 @@ from datalens.application.agent import (
     AgentUpstreamUnavailable,
 )
 from datalens.application.memory import MemoryService
+from dataclasses import replace as dc_replace
+from datetime import UTC, datetime
+
+from datalens.application import answer_style
+from datalens.application.runtime_config import MODES, RuntimeConfig, RuntimeConfigError
+from datalens.application.trace import TurnLog, blocks
+from datalens.domain.session import Session
 from datalens.config import Settings
 from datalens.infrastructure.queryforge_mcp import McpQueryForgeClient
 from datalens.ports.queryforge import QueryForgeClient, QueryForgeHttpResult, QueryForgeUnavailable
@@ -66,6 +73,49 @@ class Readiness(Protocol):
 class MessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     message: str = Field(min_length=1, max_length=MESSAGE_MAX_CHARS)
+    # 요청 모드(2026-11-04). 생략하면 agent — 지금까지의 동작이다.
+    # evidence 는 보낸 맥락만으로 답한다(QueryForge 지침·데이터셋 목록·도구를 싣지 않는다).
+    # 무엇을 싣는지는 모드별로 설정 화면(/ui)이 정한다.
+    mode: Literal["agent", "evidence"] | None = None
+
+
+class RuntimeSettingsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: Literal["agent", "evidence"]
+    # 값으로 null 을 주면 그 항목의 화면 값을 지운다(→ .env·기본값).
+    context: dict[str, Any] | None = None
+    params: dict[str, Any] | None = None
+    reset: bool = False
+
+
+# 미리보기 내장 예시 — 실제 요청 기록이 없을 때의 바탕. RCA 응답 예시는 graphio 질의 모양을 줄여 옮겼다
+PREVIEW_EXAMPLES = {
+    "evidence": (
+        "너는 LTE 망 RCA 보조다. 아래 증거팩만 근거로 답한다. (graphio 질의 지시를 줄인 내장 예시)\n"
+        "1. 증거팩에 없는 수치·사실을 만들지 않는다. 문장마다 근거 증거 ID 를 붙인다.\n"
+        + answer_style.block(answer_style.DEFAULTS)
+        + "\n\n질문: 지금 결론이 무엇인가요? 근거와 영향 범위를 함께 설명해 주세요.\n"
+        "증거팩:\n{\"evidence\": [{\"id\": \"EV-00\", \"data\": {\"trigger\": \"C-02\", \"drop_pp\": -47.7}}]}"
+    ),
+    "agent": "지난주 서울 지역 일별 접속 성공률을 보여 줘",
+}
+
+
+class PreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: Literal["agent", "evidence"]
+    # 바탕 입력 — last: 그 모드의 가장 최근 실제 요청 · example: 내장 예시 · custom: message 그대로.
+    # 생략하면 message 가 있으면 custom, 없으면 last(없으면 example 로 물러난다).
+    baseline: Literal["last", "example", "custom"] | None = None
+    message: str | None = Field(default=None, min_length=1, max_length=MESSAGE_MAX_CHARS)
+    locale: Literal["ko", "ja"] | None = None
+    # 주면 그 세션의 실제 이력으로 조립한다(최근 전송의 세션 등). 없으면 이력 없이 조립한다.
+    session_id: str | None = Field(default=None, max_length=80)
+    # 저장하지 않은 화면 값 — "이렇게 바꾸면 얼마나 달라지나"를 저장 전에 본다.
+    context: dict[str, Any] | None = None
+    params: dict[str, Any] | None = None
+    # 저장하지 않은 답변 스타일(RCA 응답). 빠진 항목은 저장된 값 — answer_style.apply 로 실제와 같게 조립한다
+    answer_style: dict[str, Any] | None = None
 
 
 class GlossaryRequest(BaseModel):
@@ -280,7 +330,7 @@ class ApiKeyMiddleware:
             await self.app(scope, receive, send)
             return
         request = Request(scope, receive)
-        if request.url.path == "/v1/health":
+        if request.url.path in {"/v1/health", "/ui"}:
             await self.app(scope, receive, send)
             return
         supplied = request.headers.get("x-api-key", "")
@@ -345,6 +395,9 @@ def build_app(
     queryforge_client: QueryForgeClient | None = None,
     memory: MemoryService | None = None,
     closeables: tuple[Any, ...] = (),
+    runtime_config: RuntimeConfig | None = None,
+    turn_log: TurnLog | None = None,
+    previewer: Any = None,
 ) -> Starlette:
     store = InMemorySessionStore(settings.session_ttl_seconds, settings.default_locale)
     sessions = session_service or SessionService(store)
@@ -440,6 +493,8 @@ def build_app(
         except SessionBusy:
             return error_response(request, "DL_SESSION_BUSY", "Session is processing another turn", 409, retryable=True, session_id=session_id)
         turn_started = time.monotonic()
+        # 모드를 지정한 요청만 넘긴다 — 생략한 요청은 예전 호출 모양 그대로 간다.
+        mode_kwargs = {"mode": parsed.mode} if parsed.mode else {}
         if wants_sse(request):
             async def events() -> AsyncIterator[bytes]:
                 queue: asyncio.Queue[tuple[str, dict[str, Any]] | None] = asyncio.Queue()
@@ -456,6 +511,7 @@ def build_app(
                             request.state.request_id,
                             time.monotonic() + settings.request_deadline_seconds,
                             emit,
+                            **mode_kwargs,
                         )
                         sessions.touch(session_id)
                         await emit("done", result)
@@ -487,7 +543,7 @@ def build_app(
             return sse_response(events())
         try:
             deadline = time.monotonic() + settings.request_deadline_seconds
-            result = await handler.handle(session, parsed.message, request.state.request_id, deadline)
+            result = await handler.handle(session, parsed.message, request.state.request_id, deadline, **mode_kwargs)
             sessions.touch(session_id)
             return JSONResponse(result)
         except (
@@ -813,12 +869,200 @@ def build_app(
             }
         )
 
+    def runtime_unavailable(request: Request) -> JSONResponse:
+        return error_response(request, "DL_SETTINGS_DISABLED", "Runtime settings are not enabled", 404)
+
+    def runtime_payload() -> dict[str, Any]:
+        assert runtime_config is not None
+        described = runtime_config.describe()
+        described["limits"] = {
+            "message_max_chars": MESSAGE_MAX_CHARS,
+            "request_deadline_seconds": settings.request_deadline_seconds,
+            "session_ttl_seconds": settings.session_ttl_seconds,
+        }
+        return described
+
+    async def runtime_settings(request: Request) -> JSONResponse:
+        if runtime_config is None:
+            return runtime_unavailable(request)
+        if request.method == "GET":
+            return JSONResponse(runtime_payload())
+        try:
+            parsed = RuntimeSettingsRequest.model_validate(await request.json())
+        except ValidationError as exc:
+            return invalid_request(request, "Invalid settings request", exc)
+        except ValueError:
+            return invalid_request(request, "Invalid settings request", None)
+        try:
+            if parsed.reset:
+                runtime_config.reset(parsed.mode)
+            else:
+                runtime_config.update(parsed.mode, parsed.context, parsed.params)
+        except RuntimeConfigError as exc:
+            return error_response(request, "DL_INVALID_SETTINGS", str(exc), 400)
+        LOG.info(
+            "runtime_settings_updated",
+            extra={"request_id": request.state.request_id, "operation": "runtime_settings", "status": "completed"},
+        )
+        return JSONResponse(runtime_payload())
+
+    async def settings_traces(request: Request) -> JSONResponse:
+        if turn_log is None:
+            return runtime_unavailable(request)
+        mode = request.query_params.get("mode") or None
+        if mode is not None and mode not in MODES:
+            return error_response(request, "DL_INVALID_SETTINGS", "unknown mode", 400)
+        return JSONResponse({"keep": turn_log.keep, "traces": turn_log.traces(mode)})
+
+    async def settings_evidence_turns(request: Request) -> JSONResponse:
+        rows = turn_log.evidence_turns() if turn_log is not None else None
+        if rows is None:
+            return runtime_unavailable(request)
+        return JSONResponse({"rows": rows})
+
+    async def settings_answer_style(request: Request) -> JSONResponse:
+        # evidence 답 형식·길이 — graphio `[답변 형식]` 구역을 바꿔 끼울 값. 저장하면 다음 요청부터 적용
+        if runtime_config is None:
+            return runtime_unavailable(request)
+        if request.method == "GET":
+            return JSONResponse({"answer_style": runtime_config.answer_style(), "defaults": answer_style.DEFAULTS})
+        try:
+            body = await request.json()
+        except ValueError:
+            return invalid_request(request, "Invalid answer style request", None)
+        if not isinstance(body, dict):
+            return invalid_request(request, "Invalid answer style request", None)
+        try:
+            style = runtime_config.update_answer_style(body)
+        except RuntimeConfigError as exc:
+            return error_response(request, "DL_INVALID_SETTINGS", str(exc), 400)
+        LOG.info(
+            "answer_style_updated",
+            extra={"request_id": request.state.request_id, "operation": "answer_style", "status": "completed"},
+        )
+        return JSONResponse({"answer_style": style, "defaults": answer_style.DEFAULTS})
+
+    async def session_verdict(request: Request) -> JSONResponse:
+        # graphio 검증 판정 수신 — 그 세션의 가장 최근 evidence 기록에 붙여 재현 판정을 덮는다
+        if turn_log is None:
+            return runtime_unavailable(request)
+        try:
+            body = await request.json()
+        except ValueError:
+            return invalid_request(request, "Invalid verdict request", None)
+        if not isinstance(body, dict) or not isinstance(body.get("dropped", []), list):
+            return invalid_request(request, "Invalid verdict request", None)
+        at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        attached = turn_log.attach_verdict(request.path_params["session_id"], body, at)
+        if attached is None:
+            return error_response(request, "DL_SESSION_NOT_FOUND", "No evidence turn for this session", 404)
+        return JSONResponse({"attached": attached, "at": at})
+
+    async def settings_history(request: Request) -> JSONResponse:
+        if turn_log is None:
+            return runtime_unavailable(request)
+        return JSONResponse({"rows": turn_log.history()})
+
+    async def settings_preview(request: Request) -> JSONResponse:
+        if runtime_config is None or previewer is None:
+            return runtime_unavailable(request)
+        try:
+            parsed = PreviewRequest.model_validate(await request.json())
+        except ValidationError as exc:
+            return invalid_request(request, "Invalid preview request", exc)
+        except ValueError:
+            return invalid_request(request, "Invalid preview request", None)
+        profile = runtime_config.profile(parsed.mode)
+        try:
+            context = {k: RuntimeConfig._check_context(k, v) for k, v in (parsed.context or {}).items()}
+            params = {k: RuntimeConfig._check_param(k, v) for k, v in (parsed.params or {}).items()}
+        except RuntimeConfigError as exc:
+            return error_response(request, "DL_INVALID_SETTINGS", str(exc), 400)
+        profile = dc_replace(
+            profile,
+            **{k: v for k, v in context.items() if v is not None},
+            params={**profile.params, **{k: v for k, v in params.items() if v is not None}},
+        )
+        kind = parsed.baseline or ("custom" if parsed.message else "last")
+        if kind == "custom" and not parsed.message:
+            return invalid_request(request, "Invalid preview request", None)
+        basis: dict[str, Any] = {"kind": kind}
+        message_text = parsed.message or ""
+        if kind == "last":
+            last = turn_log.last_request(parsed.mode, answer_style.OPEN if parsed.mode == "evidence" else None) if turn_log else None
+            if last is None:
+                kind = basis["kind"] = "example"
+                basis["fallback"] = "이 모드의 실제 요청 기록이 없다"
+            else:
+                message_text = last["message"]
+                basis.update({"at": last["at"], "session_id": last["session_id"], "source": last["source"]})
+        if kind == "example":
+            message_text = PREVIEW_EXAMPLES[parsed.mode]
+        style_record = None
+        if parsed.mode == "evidence":
+            try:
+                style = answer_style.check({**runtime_config.answer_style(), **(parsed.answer_style or {})})
+            except answer_style.AnswerStyleError as exc:
+                return error_response(request, "DL_INVALID_SETTINGS", str(exc), 400)
+            # 실제 전송(chat.handle)과 같은 함수로 바꿔 끼운다 — 미리보기와 전송이 갈라지지 않게
+            message_text, style_record = answer_style.apply(message_text, style)
+        session = None
+        if parsed.session_id:
+            try:
+                session = sessions.require(parsed.session_id)
+            except SessionNotFound:
+                session = None
+        if session is None:
+            now = datetime.now(UTC)
+            session = Session("dls_preview", now, now, now, locale=parsed.locale or settings.default_locale)
+        messages, tools, base_len, note = await previewer.preview(
+            session, message_text, profile, settings.queryforge_timeout_seconds
+        )
+        if parsed.session_id and session.session_id == "dls_preview":
+            note = (note + " · " if note else "") + "그 세션이 만료돼 이력 없이 조립했다"
+        built = blocks(messages, tools, base_len, None, turn_log.chars_per_token(parsed.mode) if turn_log else None)
+        num_ctx = int(profile.params.get("num_ctx") or settings.ollama_num_ctx)
+        num_predict = int(profile.params.get("num_predict") or settings.ollama_num_predict)
+        need = built["tokens_est_total"] + num_predict
+        built.update(
+            {
+                "profile": profile.public(),
+                "num_ctx": num_ctx,
+                "num_predict": num_predict,
+                # 입력(추정) + 출력 예약이 컨텍스트 창을 얼마나 쓰나. ports.llm.TokenUsage.context_status 와 같은 판정.
+                "usage_pct": round(100 * need / num_ctx, 1),
+                "status_est": "truncated" if built["tokens_est_total"] >= num_ctx else ("tight" if need > num_ctx else "ok"),
+                "note": note,
+                "basis": basis,
+                "style": style_record,
+                # 요청 검증 상한은 graphio 가 보낸 메시지에 걸린다 — 바꿔 끼운 뒤 길이와 함께 보인다
+                "message_chars": len(message_text),
+                "message_max_chars": MESSAGE_MAX_CHARS,
+            }
+        )
+        return JSONResponse(built)
+
+    async def settings_ui(_: Request) -> Response:
+        # 화면 자체는 인증 없이 내려준다. 화면이 부르는 /v1/settings 는 x-api-key 가 필요하다.
+        from importlib.resources import files
+
+        html = files("datalens.ui").joinpath("settings.html").read_text(encoding="utf-8")
+        return Response(html, media_type="text/html; charset=utf-8")
+
     routes = [
         Route("/v1/health", health, methods=["GET"]),
+        Route("/ui", settings_ui, methods=["GET"]),
+        Route("/v1/settings", runtime_settings, methods=["GET", "PUT"]),
+        Route("/v1/settings/traces", settings_traces, methods=["GET"]),
+        Route("/v1/settings/evidence-turns", settings_evidence_turns, methods=["GET"]),
+        Route("/v1/settings/history", settings_history, methods=["GET"]),
+        Route("/v1/settings/answer-style", settings_answer_style, methods=["GET", "PUT"]),
+        Route("/v1/settings/preview", settings_preview, methods=["POST"]),
         Route("/v1/ready", ready, methods=["GET"]),
         Route("/v1/sessions", create_session, methods=["POST"]),
         Route("/v1/sessions/{session_id:str}/messages", message, methods=["POST"]),
         Route("/v1/sessions/{session_id:str}", delete_session, methods=["DELETE"]),
+        Route("/v1/sessions/{session_id:str}/verdict", session_verdict, methods=["POST"]),
         Route("/v1/sessions/{session_id:str}/datasets/{dataset_id:str}/rows", dataset_rows, methods=["GET"]),
         Route("/v1/sessions/{session_id:str}/datasets/{dataset_id:str}/meta", dataset_meta, methods=["GET"]),
         Route("/v1/sessions/{session_id:str}/catalog/tables", catalog_tables, methods=["GET"]),

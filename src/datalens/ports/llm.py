@@ -33,6 +33,14 @@ class TokenUsage:
     context_window: int | None = None
     reserved_output_tokens: int | None = None
     prompt_chars: int | None = None
+    # Ollama 가 알려 주는 단계별 시간(ms). load 는 모델을 메모리에 올린 시간이다 —
+    # 같은 입력의 응답 시간이 28~105초로 흔들린 원인(재적재 추정)을 가리는 값(2026-11-04).
+    load_ms: int | None = None
+    prompt_eval_ms: int | None = None
+    eval_ms: int | None = None
+
+    def timings(self) -> dict[str, int | None]:
+        return {"load_ms": self.load_ms, "prompt_eval_ms": self.prompt_eval_ms, "eval_ms": self.eval_ms}
 
     @property
     def context_status(self) -> str:
@@ -69,6 +77,14 @@ class TokenUsage:
 @dataclass(frozen=True, slots=True)
 class OutputPolicy:
     max_output_tokens: int | None = None
+    # 요청 모드별 런타임 덮어쓰기(2026-11-04 · 설정 화면 /ui). None 이면 기동 설정(.env)을 쓴다.
+    # 프로바이더 옵션(num_ctx·temperature·top_p·top_k·repeat_penalty·num_predict)만 담는다.
+    options: dict[str, Any] | None = None
+    think: bool | None = None
+    idle_timeout_seconds: float | None = None
+    # Ollama keep_alive — 응답 뒤 모델을 메모리에 붙잡아 둘 시간("5m"·"30m"·"-1"=무기한·"0"=즉시 내림).
+    # None 이면 보내지 않는다(Ollama 기본 5분).
+    keep_alive: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +106,15 @@ class LLMTimeout(LLMProviderError):
 
 class LLMInvalidResponse(LLMProviderError):
     pass
+
+
+class LLMEmptyResponse(LLMInvalidResponse):
+    """본문도 도구 호출도 없이 끝난 생성 (2026-11-08).
+
+    gemma4 가 도구 호출을 Ollama 파서가 읽지 못하는 모양으로 내면 이렇게 끝난다. 화면에
+    흘린 토큰이 없으므로 같은 요청을 한 번 더 보내도 출력이 겹치지 않는다 — 에이전트가
+    이 경우만 한 번 재시도한다. 스트림 파싱 실패처럼 토큰이 이미 나간 경우는 상위 클래스로 남는다.
+    """
 
 
 class LLMUnavailable(LLMProviderError):

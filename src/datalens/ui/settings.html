@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>DataLens 설정</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg:#14171c; --panel:#1c2028; --line:#2c323d; --text:#e4e7ec; --dim:#8b93a1; --accent:#5b9cf5; --warn:#e8b04a; --bad:#e5605b; --ok:#4fbf7f; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 -apple-system, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif; }
+  header { display:flex; gap:16px; align-items:center; padding:14px 24px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:0; }
+  .dim { color:var(--dim); font-size:12px; }
+  input, select, textarea { background:#0f1216; border:1px solid var(--line); color:var(--text); padding:5px 8px; border-radius:6px; font:inherit; }
+  header input { width:260px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:6px 12px; cursor:pointer; font-size:13px; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--text); }
+  button.small { padding:2px 8px; font-size:12px; }
+  nav { display:flex; gap:4px; padding:10px 24px 0; border-bottom:1px solid var(--line); }
+  nav button { background:transparent; color:var(--dim); border-radius:6px 6px 0 0; border:1px solid transparent; border-bottom:0; }
+  nav button.on { color:var(--text); border-color:var(--line); background:var(--panel); }
+  .page { display:none; padding:20px 24px; }
+  .page.on { display:block; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(540px, 1fr)); gap:20px; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px 18px; margin-bottom:16px; }
+  section h2 { font-size:15px; margin:0 0 4px; }
+  p.lead { color:var(--dim); font-size:12px; margin:0 0 12px; }
+  h3 { font-size:13px; margin:16px 0 6px; color:var(--dim); font-weight:600; }
+  table { width:100%; border-collapse:collapse; }
+  td, th { padding:5px 6px; border-bottom:1px solid var(--line); text-align:left; vertical-align:middle; }
+  th { color:var(--dim); font-weight:500; font-size:12px; }
+  td input[type=number], td select { width:110px; }
+  .src { font-size:11px; padding:1px 7px; border-radius:10px; border:1px solid var(--line); color:var(--dim); white-space:nowrap; }
+  .src.ui { color:var(--accent); border-color:var(--accent); }
+  .src.env { color:var(--warn); border-color:var(--warn); }
+  .hint { color:var(--dim); font-size:12px; }
+  .eff { color:#b9c3d3; font-size:12px; }
+  .eff em { color:var(--warn); font-style:normal; font-size:11px; }
+  .eff b { color:var(--ok); font-weight:500; font-size:11px; }
+  .row { display:flex; gap:8px; align-items:center; margin-top:12px; flex-wrap:wrap; }
+  #msg { margin-left:auto; font-size:12px; }
+  .bad { color:var(--bad); } .ok { color:var(--ok); } .warn { color:var(--warn); }
+  details { border:1px solid var(--line); border-radius:6px; margin:6px 0; background:#171a21; }
+  summary { cursor:pointer; padding:6px 10px; font-size:13px; display:flex; gap:10px; align-items:center; }
+  summary .n { margin-left:auto; color:var(--dim); font-size:12px; font-variant-numeric:tabular-nums; }
+  pre { margin:0; padding:8px 12px; white-space:pre-wrap; word-break:break-word; font:12px/1.45 ui-monospace, Menlo, monospace; color:#cfd6e2; max-height:420px; overflow:auto; border-top:1px solid var(--line); }
+  .bar { display:flex; height:22px; border-radius:5px; overflow:hidden; margin:8px 0 4px; background:#0f1216; border:1px solid var(--line); }
+  .bar span { display:block; height:100%; }
+  .legend { display:flex; gap:12px; flex-wrap:wrap; font-size:12px; color:var(--dim); }
+  .legend i { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:4px; vertical-align:-1px; }
+  tr.changed td { border-top:2px solid var(--warn); }
+  tr.changed td:first-child::before { content:"설정 변경 ▸ "; color:var(--warn); font-size:11px; }
+  .num { font-variant-numeric:tabular-nums; text-align:right; }
+  textarea { width:100%; min-height:90px; }
+  .diff { color:var(--warn); }
+  .subnav { display:flex; gap:6px; margin-bottom:14px; }
+  .subnav button { background:transparent; border:1px solid var(--line); color:var(--dim); }
+  .subnav button.on { color:var(--text); border-color:var(--accent); background:rgba(91,156,245,.14); }
+  .split { display:grid; grid-template-columns:minmax(520px, 1fr) minmax(480px, 1fr); gap:20px; align-items:start; }
+  .split > .right { position:sticky; top:12px; max-height:calc(100vh - 24px); overflow:auto; }
+  details.chg { border-color:var(--warn); }
+  details.chg > summary::after { content:"저장값과 다름"; color:var(--warn); font-size:11px; }
+  /* 켬/끔 스위치 — 체크박스를 그대로 쓰고(키보드·폼 동작 유지) 모양만 바꾼다 */
+  label.sw { display:inline-flex; align-items:center; gap:8px; cursor:pointer; user-select:none; }
+  label.sw input { appearance:none; -webkit-appearance:none; margin:0; width:36px; height:20px; border-radius:10px; padding:0;
+    background:#3a414d; border:1px solid var(--line); position:relative; cursor:pointer; transition:background .15s, border-color .15s; }
+  label.sw input::before { content:""; position:absolute; top:2px; left:2px; width:14px; height:14px; border-radius:50%;
+    background:#c9d0db; transition:transform .15s, background .15s; }
+  label.sw input:checked { background:var(--accent); border-color:var(--accent); }
+  label.sw input:checked::before { transform:translateX(16px); background:#fff; }
+  label.sw input:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  label.sw span { font-size:12px; color:var(--dim); min-width:2em; }
+  label.sw input:checked + span { color:var(--text); }
+  label.sw span::after { content:"끔"; }
+  label.sw input:checked + span::after { content:"켬"; }
+  .drop { text-decoration:line-through; color:var(--bad); background:rgba(220,60,60,.16); }
+</style>
+</head>
+<body>
+<header>
+  <h1>DataLens 설정</h1>
+  <span class="dim" id="model"></span>
+  <input id="key" type="password" placeholder="x-api-key (DATALENS_API_KEY)">
+  <button id="load">불러오기</button>
+  <span id="msg"></span>
+</header>
+<nav>
+  <button data-tab="settings" class="on">설정</button>
+  <button data-tab="traces">최근 전송 원문</button>
+  <button data-tab="history">효과 비교</button>
+  <button data-tab="turns">RCA 응답 기록</button>
+</nav>
+<div class="page on" id="page-settings">
+  <div class="subnav"><button data-mode-tab="evidence" class="on">RCA 응답</button><button data-mode-tab="agent">일반</button></div>
+  <div class="split"><div id="modes"></div><div class="right" id="preview"></div></div>
+  <div class="dim" id="foot"></div>
+</div>
+<div class="page" id="page-traces"><div id="traces"></div></div>
+<div class="page" id="page-history"><div id="history"></div></div>
+<div class="page" id="page-turns"><div id="turns"></div></div>
+<script>
+// 이 화면이 부르는 것: /v1/settings(설정) · /v1/settings/answer-style(RCA 응답 답변 형식)
+// · /v1/settings/traces(최근 전송) · /v1/settings/preview(미리보기, 모델 호출 없음 — 서버의 실제 조립 코드로 만든다)
+// · /v1/settings/history(효과 비교). 원문과 기록은 서버 메모리에만 있고 재시작하면 사라진다.
+// API 키는 이 브라우저의 localStorage 에만 둔다.
+// 화면 이름 — API·내부 이름(evidence · agent)은 그대로 두고 보이는 말만 바꾼다(사용자 11-04)
+const MODE_LABEL = { evidence: "RCA 응답", agent: "일반" };
+const MODE_INFO = {
+  agent:    { title: "일반 — 데이터 조회", lead: "QueryForge 지침·세션 맥락·도구 정의를 싣고 창고를 조회해 답한다. 요청에 mode 를 생략하면 이 모드다." },
+  evidence: { title: "RCA 응답 — graphio 증거팩으로 답하기", lead: "graphio AI 질의처럼 요청이 보낸 맥락(증거팩)만으로 답한다. QueryForge 를 부르지 않는다. 요청에 \"mode\": \"evidence\"." },
+};
+// [이름, 무엇인가, 효과]. <b>실측</b> · <em>추정</em> 을 구분해 적는다.
+const CONTEXT_INFO = {
+  system_prompt:   ["시스템 프롬프트", "일반은 prompts/<locale>/system.txt(조회 지침 5.8KB), RCA 응답은 evidence.txt(자료만으로 답하라, 약 400자)",
+                    "일반에서 끄면 파티션·기간 규칙을 몰라 도구 인자 오류가 늘어난다 <em>추정</em> · RCA 응답에서 끄면 \"자료 밖 단정 금지\" 지시가 빠진다 <em>추정</em>"],
+  session_context: ["세션 맥락", "now·today·활성 테이블·데이터셋 목록. RCA 응답에서는 시각만 싣는다",
+                    "\"오늘·어제\" 같은 상대 기간 해석에 쓰인다. 수백 자 수준 <em>추정</em>"],
+  memory:          ["메모리(회상 힌트)", "성공한 조회 계획 회상. DATALENS_MEMORY_ENABLED=false 이면 켜도 없다",
+                    "비슷한 질문의 조회 단계를 줄인다 — 도구가 없는 RCA 응답에서는 의미가 없다"],
+  tools:           ["QueryForge 스키마·도구", "off: 싣지 않음 · lazy: 이름·한 줄 설명·최상위 인자만, 모델이 get_tool_spec 으로 전체를 받음 · summary: 중첩 설명·예시 제거 · full: 전체",
+                    "full 32,058자 → summary 약 19,500자 → lazy 약 3,500자(메타 도구 포함) <b>실측 11-04</b> · lazy 는 모델이 get_tool_spec 을 한 번 더 부르는 만큼 왕복이 늘 수 있다 <em>추정</em> · off 면 조회를 못 하는 대신 입력이 그만큼 줄고 빨라진다 — graphio 질의 110초→29초·8,161→6,131토큰 <b>실측 11-04</b>"],
+  history_items:   ["이전 문답 항목 수", "user·assistant 각각 1항목. 6 = 3턴",
+                    "항목마다 그 질문·답 길이만큼 입력이 는다. 첫 턴에 증거를 보낸 이어 묻기는 그 턴이 창 밖으로 밀리면 증거를 잃는다"],
+};
+const PARAM_INFO = {
+  temperature: ["temperature", "낮을수록 같은 질문에 같은 답. 높이면 표현이 다양해지는 대신 수치·근거를 틀리게 옮길 위험이 커진다 <em>추정</em>"],
+  top_p: ["top_p", "다음 단어 후보를 누적 확률로 자른다. 보통 기본값 유지 <em>추정</em>"],
+  top_k: ["top_k", "다음 단어 후보 수 상한. 보통 기본값 유지 <em>추정</em>"],
+  repeat_penalty: ["repeat_penalty", "이미 쓴 말의 확률을 낮춘다. 1.0 = 끔. 같은 문장을 되풀이하며 출력 상한까지 가는 것을 막는다. 높이면 수치·이름을 다르게 옮길 위험이 있다 <em>추정</em>"],
+  num_ctx: ["num_ctx (컨텍스트 토큰)", "입력 + 출력 예약이 넘으면 앞부분이 조용히 잘린다(마지막 턴 context_status). 올리면 메모리·속도 비용 <em>추정</em>"],
+  num_predict: ["num_predict (출력 토큰 상한)", "실제 출력은 199~600토큰이라 2048 에서 잘리지 않는다 <b>실측 11-04</b>. 낮추면 답이 중간에 끊긴다(stop_reason=length)"],
+  think: ["thinking", "켜면 답 전에 추론한다 — 응답이 길어지고, gemma4 는 출력 상한을 추론에 다 써서 본문 0자로 끝난 적이 있다 <b>실측(ollama.py 주석)</b>"],
+  keep_alive: ["keep_alive (모델 상주 시간)", "응답 뒤 모델을 메모리에 붙잡아 두는 시간. 예 30m · 2h · -1(무기한) · 0(즉시 내림). 비우면 Ollama 기본 5분 — 5분 넘게 쉬면 다음 질의가 모델을 다시 올린다(효과 비교의 '적재' 열). 늘리면 GPU/메모리를 그만큼 상시 점유한다"],
+  idle_timeout_seconds: ["유휴 타임아웃(초)", "스트림 조각 사이 최대 공백. 총 응답 시간 상한이 아니다 — 첫 조각 전 프롬프트 처리가 이보다 길면 끊긴다"],
+};
+const KIND = {
+  system_prompt: ["시스템 프롬프트", "#5b9cf5"], session_context: ["세션 맥락", "#8f7cf0"], memory: ["메모리", "#c27cf0"],
+  history: ["이전 문답", "#e8b04a"], current_message: ["사용자 메시지", "#4fbf7f"], tools: ["도구 정의", "#e5605b"],
+  agent_step: ["모델 도구 호출", "#7a8494"], tool_result: ["도구 결과", "#a0632f"],
+};
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const fmt = (n) => n == null ? "—" : Number(n).toLocaleString();
+$("key").value = localStorage.getItem("datalens.key") || "";
+let state = null, previewTimer = null;
+
+function msg(text, cls) { $("msg").textContent = text; $("msg").className = cls || ""; }
+
+async function api(path, method = "GET", body) {
+  localStorage.setItem("datalens.key", $("key").value);
+  const res = await fetch(path, {
+    method, headers: { "x-api-key": $("key").value, "content-type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error((data.error && (data.error.message + " " + JSON.stringify(data.error.details || ""))) || res.status);
+  return data;
+}
+
+function badge(source) { return `<span class="src ${source}">${{ui: "화면", env: ".env", default: "기본값"}[source] || source}</span>`; }
+
+// ── 설정 — 모드 탭 하나 = 왼쪽 설정 · 오른쪽 실시간 미리보기 ─────────────
+let currentMode = "evidence", styleState = null;
+
+// 켬/끔 스위치 — attrs 는 data-* 속성 문자열
+const sw = (attrs, on) => `<label class="sw"><input type="checkbox" ${attrs} ${on ? "checked" : ""}><span></span></label>`;
+
+function styleRows(st, d) {
+  return `<h3>답변 형식 <span class="hint">RCA 응답의 답변 형식은 여기 값으로 정해진다. graphio 기본값은 DataLens 없이 모델에 바로 붙을 때만 쓰인다.
+      graphio 가 보낸 [답변 형식] 구역을 이 값으로 바꿔 보낸다 · 구역이 없는 요청(이어 묻기)은 첫 질문의 형식을 따른다 · 증거 규칙은 바꾸지 않는다</span></h3>
+    <table>
+      <tr><td>최소 문장 수</td><td><input type="number" data-s="min_sentences" min="1" max="50" value="${st.min_sentences}"></td><td class="hint">기본 ${d.min_sentences}</td></tr>
+      <tr><td>최대 문장 수</td><td><input type="number" data-s="max_sentences" min="1" max="50" value="${st.max_sentences}"></td><td class="hint">기본 ${d.max_sentences}</td></tr>
+      <tr><td>글자 수 상한</td><td><input type="number" data-s="max_chars" min="100" max="10000" placeholder="제한 없음" value="${st.max_chars ?? ""}"></td><td class="hint">비우면 제한 없음 · 100~10000</td></tr>
+      <tr><td>마크다운</td><td>${sw('data-s="markdown"', st.markdown)}</td><td class="hint">켜면 결론·근거·영향 범위·확인·조치 네 제목과 목록 · 끄면 평문 문단</td></tr>
+      <tr><td>추가 지시</td><td colspan="2"><input data-s="extra" style="width:100%" maxlength="300" placeholder="(선택) 한 줄" value="${esc(st.extra)}"></td></tr>
+    </table>`;
+}
+
+function renderSettings() {
+  $("model").textContent = `모델 ${state.model} · 메시지 상한 ${state.limits.message_max_chars.toLocaleString()}자 · 요청 마감 ${state.limits.request_deadline_seconds}초 · 세션 TTL ${state.limits.session_ttl_seconds}초`;
+  $("foot").textContent = state.persisted ? `화면 값 저장 위치: ${state.path} (재시작해도 남는다)` : "화면 값을 저장하지 않는다 — 재시작하면 .env 값으로 돌아간다";
+  document.querySelectorAll("[data-mode-tab]").forEach((b) => b.classList.toggle("on", b.dataset.modeTab === currentMode));
+  const mode = currentMode, cfg = state.modes[mode];
+  const ctx = Object.entries(cfg.context).map(([key, item]) => {
+    let input;
+    if (key === "tools") input = `<select data-k="${key}">${["off","lazy","summary","full"].map(v => `<option ${v===item.value?"selected":""}>${v}</option>`).join("")}</select>`;
+    else if (key === "history_items") input = `<input type="number" min="0" max="${state.history_store_limit}" data-k="${key}" value="${item.value}">`;
+    else input = sw(`data-k="${key}"`, item.value);
+    const [name, what, eff] = CONTEXT_INFO[key];
+    return `<tr><td>${name}<div class="hint">${what}</div><div class="eff">효과 — ${eff}</div></td><td>${input}</td><td>${badge(item.source)}</td>
+      <td>${item.source === "ui" ? `<button class="ghost small" data-clear-ctx="${key}">기본값으로</button>` : `<span class="hint">기본 ${item.default}</span>`}</td></tr>`;
+  }).join("");
+  const params = Object.entries(cfg.params).map(([key, item]) => {
+    const input = key === "think"
+      ? sw(`data-p="${key}"`, item.value)
+      : key === "keep_alive"
+      ? `<input type="text" data-p="${key}" value="${item.value ?? ""}" placeholder="(Ollama 기본 5m)" style="width:110px">`
+      : `<input type="number" step="any" data-p="${key}" value="${item.value}" ${item.range ? `min="${item.range[0]}" max="${item.range[1]}"` : ""}>`;
+    const [name, eff] = PARAM_INFO[key];
+    return `<tr><td>${name}<div class="hint">${item.env_var}</div><div class="eff">효과 — ${eff}</div></td><td>${input}</td><td>${badge(item.source)}</td>
+      <td>${item.source === "ui" ? `<button class="ghost small" data-clear-p="${key}">.env 값(${item.env_or_default})으로</button>` : ""}</td></tr>`;
+  }).join("");
+  const last = cfg.last_turn;
+  const lastHtml = last ? `<div class="hint">${last.at} · ${(last.duration_ms/1000).toFixed(1)}초 · 입력 ${last.context ? `${fmt(last.context.prompt_tokens)} / ${fmt(last.context.num_ctx)} 토큰 (${last.context.status})` : "—"} · 답 ${last.answer_chars}자 —
+      <a href="#" data-goto="traces" style="color:var(--accent)">원문 보기</a></div>` : `<span class="hint">이번 기동 이후 이 모드로 들어온 요청이 없다</span>`;
+  const style = mode === "evidence"
+    ? styleRows(styleState.answer_style, styleState.defaults)
+    : `<h3>답변 형식</h3><div class="hint">일반 모드에는 걸지 않는다 — 답 형식을 정하는 곳이 DataLens 조회 지침(system.txt)이고, 바꿔 끼울 [답변 형식] 표지를 보내는 호출자가 없다.</div>`;
+  $("modes").innerHTML = `<section data-mode="${mode}">
+    <h2>${MODE_INFO[mode].title}</h2><p class="lead">${MODE_INFO[mode].lead}</p>
+    <h3>무엇을 싣나</h3><table><tr><th>항목</th><th>값</th><th>출처</th><th></th></tr>${ctx}</table>
+    ${style}
+    <h3>모델 파라미터</h3><table><tr><th>항목</th><th>값</th><th>출처</th><th></th></tr>${params}</table>
+    <h3>마지막 턴</h3>${lastHtml}
+    <div class="row"><button data-save="${mode}">저장</button><button class="ghost" data-reset="${mode}">이 모드 화면 값 모두 지우기</button>
+      <span class="hint">저장하기 전에는 실제 전송에 영향이 없다 — 오른쪽은 미리보기다</span></div>
+  </section>`;
+  renderPreviewForm();
+  schedulePreview();
+}
+
+function collect(mode, onlyChanged = true) {
+  const sec = document.querySelector(`section[data-mode="${mode}"]`);
+  const cfg = state.modes[mode];
+  const context = {}, params = {};
+  if (!sec) return { context, params };
+  sec.querySelectorAll("[data-k]").forEach((el) => {
+    const key = el.dataset.k;
+    const value = el.type === "checkbox" ? el.checked : (key === "history_items" ? parseInt(el.value, 10) : el.value);
+    if (!onlyChanged || value !== cfg.context[key].value) context[key] = value;
+  });
+  sec.querySelectorAll("[data-p]").forEach((el) => {
+    const key = el.dataset.p;
+    const value = el.type === "checkbox" ? el.checked : (key === "keep_alive" ? (el.value.trim() || null) : Number(el.value));
+    if (!onlyChanged || value !== cfg.params[key].value) params[key] = value;
+  });
+  return { context, params };
+}
+
+function collectStyle(onlyChanged = true) {
+  const out = {};
+  if (!styleState) return out;
+  document.querySelectorAll("#modes [data-s]").forEach((el) => {
+    const key = el.dataset.s;
+    let value = el.type === "checkbox" ? el.checked : el.value;
+    if (key === "max_chars") value = el.value.trim() ? Number(el.value) : null;
+    else if (key === "min_sentences" || key === "max_sentences") value = parseInt(el.value, 10);
+    if (!onlyChanged || value !== styleState.answer_style[key]) out[key] = value;
+  });
+  return out;
+}
+
+async function saveMode(mode) {
+  const changed = collect(mode);
+  if (Object.keys(changed.context).length || Object.keys(changed.params).length) state = await api("/v1/settings", "PUT", { mode, ...changed });
+  if (mode === "evidence") {
+    const st = collectStyle();
+    if (Object.keys(st).length) styleState = await api("/v1/settings/answer-style", "PUT", st);
+  }
+  renderSettings();
+  msg(`${MODE_LABEL[mode]} 저장 — 다음 요청부터 적용`, "ok");
+}
+
+// ── 미리보기(오른쪽 칸) — 서버가 실제 전송과 같은 코드로 조립한다 ─────────
+function renderPreviewForm() {
+  // 저장·모드 전환으로 다시 그려도 바탕 선택과 입력은 남긴다
+  const keep = $("pv-basis") ? { basis: $("pv-basis").value, locale: $("pv-locale").value, session: $("pv-session").value, message: $("pv-message").value } : null;
+  $("preview").innerHTML = `<section>
+    <h2>미리보기 — ${MODE_LABEL[currentMode]} · 모델을 부르지 않는다</h2>
+    <p class="lead">왼쪽의 <b>저장하지 않은 값</b>으로 지금 보낼 프롬프트를 서버가 조립한다(실제 전송과 같은 코드). 바꾸면 0.3초 뒤 다시 그린다. 저장된 설정과 다른 메시지는 노란 테두리다.</p>
+    <div class="row">바탕 <select id="pv-basis"><option value="last">최근 실제 요청</option><option value="example">내장 예시</option><option value="custom">직접 입력</option></select>
+      언어 <select id="pv-locale"><option value="">기본</option><option>ko</option><option>ja</option></select>
+      세션 <input id="pv-session" placeholder="(선택) 이력을 실을 dls_…" style="width:200px"></div>
+    <textarea id="pv-message" style="display:none;margin-top:8px" placeholder="보낼 메시지"></textarea>
+    <div id="pv-out"></div>
+  </section>`;
+  if (keep) {
+    $("pv-basis").value = keep.basis; $("pv-locale").value = keep.locale; $("pv-session").value = keep.session; $("pv-message").value = keep.message;
+    $("pv-message").style.display = keep.basis === "custom" ? "block" : "none";
+  }
+  ["pv-basis", "pv-session", "pv-locale", "pv-message"].forEach((id) => $(id).addEventListener("input", () => {
+    $("pv-message").style.display = $("pv-basis").value === "custom" ? "block" : "none";
+    schedulePreview();
+  }));
+}
+
+function schedulePreview() { clearTimeout(previewTimer); previewTimer = setTimeout(runPreview, 300); }
+
+function basisNote(b) {
+  if (b.kind === "last") return `바탕: 최근 실제 요청 · ${esc(b.at)} · ${esc(b.session_id)}${b.source === "sqlite" ? " (RCA 응답 기록에서)" : ""}`;
+  if (b.kind === "example") return `바탕: 내장 예시${b.fallback ? ` — ${esc(b.fallback)}` : ""}`;
+  return "바탕: 직접 입력";
+}
+
+function styleNoteHtml(st) {
+  if (!st) return "";
+  if (!st.applied) return `<div class="hint">답변 형식 — 이 요청에는 [답변 형식] 구역이 없어 바꾸지 않는다(이어 묻기 등)</div>`;
+  if (st.same) return `<details><summary>답변 형식(${esc(st.lang)}) — graphio 가 보낸 구역과 같다</summary><pre>${esc(st.block)}</pre></details>`;
+  return `<details open class="chg"><summary>답변 형식(${esc(st.lang)}) — graphio 구역을 여기 값으로 바꿔 끼움</summary><pre><span class="drop">${esc(st.original)}</span>
+
+${esc(st.block)}</pre></details>`;
+}
+
+async function runPreview() {
+  if (!state || !$("pv-out")) return;
+  const mode = currentMode;
+  const basis = $("pv-basis").value;
+  const baseline = { mode, baseline: basis, session_id: $("pv-session").value || null, locale: $("pv-locale").value || null };
+  if (basis === "custom") baseline.message = $("pv-message").value || " ";
+  const overrides = collect(mode, false);
+  if (mode === "evidence") overrides.answer_style = collectStyle(false);
+  try {
+    const [now, saved] = await Promise.all([
+      api("/v1/settings/preview", "POST", { ...baseline, ...overrides }),
+      api("/v1/settings/preview", "POST", baseline),
+    ]);
+    if (mode !== currentMode) return;
+    const delta = now.total_chars - saved.total_chars;
+    const deltaHtml = delta ? `<span class="diff">저장된 설정 대비 ${delta > 0 ? "+" : ""}${fmt(delta)}자 · ≈${delta > 0 ? "+" : ""}${fmt(now.tokens_est_total - saved.tokens_est_total)}토큰</span>` : `<span class="hint">글자 수는 저장된 설정과 같다</span>`;
+    const cls = now.status_est === "ok" ? "ok" : "bad";
+    const over = now.message_chars > now.message_max_chars;
+    $("pv-out").innerHTML = `<div class="hint" style="margin-top:8px">${basisNote(now.basis)}</div>
+      <div>입력 <b>${fmt(now.total_chars)}자</b> · ≈<b>${fmt(now.tokens_est_total)}토큰</b>
+        (글자/토큰 ${now.chars_per_token}, ${now.ratio_measured ? "실측 비율" : "그 모드의 최근 실측 비율 또는 기본 2.15 — 추정"})
+        + 출력 예약 ${fmt(now.num_predict)} = num_ctx ${fmt(now.num_ctx)} 의 <b class="${cls}">${now.usage_pct}% (${now.status_est})</b> · ${deltaHtml}</div>
+      <div class="${over ? "bad" : "hint"}">보낸 메시지 ${fmt(now.message_chars)}자 / 메시지 상한 ${fmt(now.message_max_chars)}자${over ? " — 넘는다" : ""}</div>
+      ${now.note ? `<div class="warn" style="font-size:12px">※ ${esc(now.note)}</div>` : ""}
+      ${styleNoteHtml(now.style)}
+      ${bar(now.summary, now.total_chars)}
+      ${messageBlocks(now, saved)}`;
+  } catch (err) { $("pv-out").innerHTML = `<div class="bad">${esc(err.message || err)}</div>`; }
+}
+
+// ── 블록 표시(최근 전송·미리보기 공용) ─────────────────────────────
+function bar(summary, total) {
+  const order = ["system_prompt", "session_context", "memory", "history", "current_message", "agent_step", "tool_result", "tools"];
+  const parts = order.filter((k) => summary[k]);
+  return `<div class="bar">${parts.map((k) => `<span title="${KIND[k][0]} ${fmt(summary[k].chars)}자" style="width:${100*summary[k].chars/total}%;background:${KIND[k][1]}"></span>`).join("")}</div>
+    <div class="legend">${parts.map((k) => `<span><i style="background:${KIND[k][1]}"></i>${KIND[k][0]} ${summary[k].count > 1 ? summary[k].count + "개 · " : ""}${fmt(summary[k].chars)}자 · ≈${fmt(summary[k].tokens_est)}토큰 (${(100*summary[k].chars/total).toFixed(0)}%)</span>`).join("")}</div>`;
+}
+
+function messageBlocks(sent, saved) {
+  // saved 를 주면 같은 자리 메시지와 내용을 견줘 달라진 것을 표시하고 펼친다(미리보기)
+  const out = sent.messages.map((m, i) => {
+    const chg = saved && (!saved.messages[i] || saved.messages[i].content !== m.content);
+    const label = KIND[m.kind] ? KIND[m.kind][0] : m.kind;
+    const calls = m.tool_calls ? "\n\n[tool_calls] " + JSON.stringify(m.tool_calls, null, 1) : "";
+    return `<details${chg ? ' open class="chg"' : ""}><summary><span style="color:${(KIND[m.kind]||["","#888"])[1]}">■</span> #${i+1} ${label} <span class="dim">role=${m.role}</span>
+      <span class="n">${fmt(m.chars)}자 · ≈${fmt(m.tokens_est)}토큰</span></summary><pre>${esc(m.content)}${esc(calls)}</pre></details>`;
+  });
+  if (sent.tools.length) {
+    out.push(`<details><summary><span style="color:${KIND.tools[1]}">■</span> 도구 정의 ${sent.tools.length}개 <span class="dim">${sent.tools.map((t) => `${t.name} ${fmt(t.chars)}자`).join(" · ")}</span>
+      <span class="n">${fmt(sent.summary.tools.chars)}자 · ≈${fmt(sent.summary.tools.tokens_est)}토큰</span></summary><pre>${esc(JSON.stringify(sent.tools.map((t) => t.definition), null, 1))}</pre></details>`);
+  } else {
+    out.push(`<div class="hint">도구 정의 0개 — 싣지 않았다</div>`);
+  }
+  return out.join("");
+}
+
+// ── RCA 응답 기록 — 세션별 · 호출마다 4칸 (sqlite evidence_turns) ──────────
+async function renderTurns() {
+  const data = await api("/v1/settings/evidence-turns");
+  if (!data.rows.length) { $("turns").innerHTML = `<section><span class="hint">기록이 없다.</span></section>`; return; }
+  const bySession = new Map();
+  data.rows.slice().reverse().forEach((r) => { if (!bySession.has(r.session_id)) bySession.set(r.session_id, []); bySession.get(r.session_id).push(r); });
+  const sessions = [...bySession.entries()].reverse();
+  // "설정 꺼짐" 은 11-04 저녁 이전 판의 사유 — 그때는 graphio 기본 구역을 그대로 보냈다
+  const styleNote = (st) => !st || !Object.keys(st).length ? "" : st.applied ? `답변 형식 바꿔 끼움(${esc(st.lang)})`
+    : st.reason === "설정 꺼짐" ? "답변 형식 — graphio 기본 구역 그대로(이전 판)" : `답변 형식 그대로 — ${esc(st.reason || "")}`;
+  $("turns").innerHTML = `<p class="lead">버린 내용의 출처는 호출마다 적었다. <b>graphio 판정</b>은 graphio 가 보낸 정본이고, <b>재현</b>은 판정이 오지 않아 DataLens 가 같은 규칙으로 다시 돌린 것이다(△ 는 graphio 가 전체 증거팩으로 보므로 남겼을 수 있다).</p>` +
+    sessions.map(([sid, rows]) => `<section><h2>${esc(sid)} · ${rows.length}회</h2>` + rows.map((r) => `
+      <h3>${r.seq}번째 · ${esc(r.at)}</h3>
+      <div class="hint">버린 내용 출처: ${r.verdict_from === "graphio" ? `<span class="ok">graphio 판정</span> · ${esc(r.verdict_at)}` : `<span class="warn">재현</span>`} · ${styleNote(r.style)}</div>
+      <details><summary>1. 받은 원문 <span class="n">${fmt(r.received.length)}자</span></summary><pre>${esc(r.received)}</pre></details>
+      <details><summary>2. LLM 결과 <span class="n">${fmt(r.llm_raw.length)}자</span></summary><pre>${esc(r.llm_raw)}</pre></details>
+      <details open><summary>3. 버린 내용 <span class="n">${r.dropped.filter((d) => d.sure).length}줄</span></summary>${r.dropped.length ? r.dropped.map((d) => d.sure
+        ? `<pre><span class="drop">${esc(d.line)}</span>
+<span class="bad">✕ ${esc(d.reason)}</span></pre>`
+        : `<pre>${esc(d.line)}
+<span class="warn">△ ${esc(d.reason)}</span></pre>`).join("") : `<div class="hint">없음</div>`}</details>
+      <details open><summary>4. 최종 결과</summary><pre>${esc(r.final)}</pre></details>`).join("") + `</section>`).join("");
+}
+
+// ── 최근 전송 원문 ────────────────────────────────────────────────
+async function renderTraces() {
+  const data = await api("/v1/settings/traces");
+  if (!data.traces.length) { $("traces").innerHTML = `<section><span class="hint">이번 기동 이후 들어온 요청이 없다. 모드별 최근 ${data.keep}건을 메모리에만 보관한다(DATALENS_TRACE_KEEP).</span></section>`; return; }
+  $("traces").innerHTML = `<p class="lead">모델에 실제로 보낸 메시지 배열 그대로다(마지막 LLM 호출 기준). 모드별 최근 ${data.keep}건 · 토큰은 Ollama 가 알려 준 입력 토큰 합계를 글자 수 비율로 나눈 <em class="warn">추정</em>이다.</p>` +
+    data.traces.map((t) => {
+      const s = t.sent, r = t.response;
+      return `<section>
+        <h2>${t.at} · ${MODE_LABEL[t.mode] || t.mode} · ${esc(t.session_id)}</h2>
+        <div class="hint">입력 ${fmt(s.total_chars)}자 · ${fmt(s.prompt_tokens)}토큰(실측) · 글자/토큰 ${s.chars_per_token} · 출력 ${fmt(r.completion_tokens)}토큰 · 종료 ${esc(r.stop_reason)} · ${(r.duration_ms/1000).toFixed(1)}초(모델 적재 ${r.load_ms == null ? "—" : (r.load_ms/1000).toFixed(1) + "초"}) · 도구 호출 ${r.tool_calls}
+          · 설정: 시스템 ${t.settings.system_prompt ? "켬" : "끔"} · 스키마 ${t.settings.tools} · 이력 ${t.settings.history_items} · temp ${t.settings.temperature} · num_predict ${t.settings.num_predict} · think ${t.settings.think}</div>
+        ${bar(s.summary, s.total_chars)}
+        ${messageBlocks(s)}
+        <details open><summary><span style="color:var(--ok)">◀</span> 모델 응답 원문 <span class="n">${fmt(r.answer.length)}자 · ${fmt(r.completion_tokens)}토큰 · ${esc(r.stop_reason)}</span></summary><pre>${esc(r.answer)}</pre></details>
+        <div class="row"><button class="ghost small" data-preview-from="${esc(t.session_id)}" data-preview-mode-of="${t.mode}">이 세션 이력으로 설정 미리보기 →</button></div>
+      </section>`;
+    }).join("");
+}
+
+// ── 효과 비교 ────────────────────────────────────────────────────
+async function renderHistory() {
+  const data = await api("/v1/settings/history");
+  if (!data.rows.length) { $("history").innerHTML = `<section><span class="hint">이번 기동 이후 들어온 요청이 없다. 최근 50건을 메모리에만 보관한다.</span></section>`; return; }
+  const lastByMode = {};
+  const rows = data.rows.map((row) => {
+    const key = JSON.stringify(row.settings);
+    const changed = lastByMode[row.mode] !== undefined && lastByMode[row.mode] !== key;
+    lastByMode[row.mode] = key;
+    const s = row.settings, r = row.result;
+    return { changed, html: `<tr class="${changed ? "changed" : ""}">
+      <td>${row.at.slice(11, 19)}</td><td>${MODE_LABEL[row.mode] || row.mode}</td>
+      <td>${s.system_prompt ? "켬" : "끔"}</td><td>${s.tools}</td><td class="num">${s.history_items}</td><td class="num">${s.temperature}</td><td class="num">${fmt(s.num_predict)}</td><td>${s.think ? "켬" : "끔"}</td>
+      <td class="num">${fmt(r.prompt_chars)}</td><td class="num">${fmt(r.prompt_tokens)}</td><td class="num">${fmt(r.completion_tokens)}</td><td class="num">${(r.duration_ms/1000).toFixed(1)}</td><td class="num ${r.load_ms > 3000 ? "warn" : ""}">${r.load_ms == null ? "—" : (r.load_ms/1000).toFixed(1)}</td><td class="num">${r.prompt_eval_ms == null ? "—" : (r.prompt_eval_ms/1000).toFixed(1)}</td><td class="num">${r.eval_ms == null ? "—" : (r.eval_ms/1000).toFixed(1)}</td><td>${esc(s.keep_alive ?? "")}</td>
+      <td class="num">${r.tool_calls}</td><td class="num">${r.history_used ?? "—"}</td><td class="${r.context_status === "ok" ? "ok" : "bad"}">${r.context_status ?? "—"}</td><td>${esc(r.stop_reason)}</td><td class="num">${fmt(r.answer_chars)}</td></tr>` };
+  });
+  $("history").innerHTML = `<section><h2>효과 비교 — 질의 한 건이 한 줄</h2>
+    <p class="lead">왼쪽이 그때의 설정, 오른쪽이 결과다. 같은 모드에서 설정이 바뀐 줄에 구분선을 긋는다. 최근 50건 · 메모리에만 보관.</p>
+    <table><tr><th>시각</th><th>모드</th><th>시스템</th><th>스키마</th><th>이력</th><th>temp</th><th>num_predict</th><th>think</th>
+      <th class="num">입력 자</th><th class="num">입력 토큰</th><th class="num">출력 토큰</th><th class="num">초</th><th class="num">적재 초</th><th class="num">입력 처리 초</th><th class="num">생성 초</th><th>keep_alive</th><th class="num">도구</th><th class="num">실린 이력</th><th>컨텍스트</th><th>종료</th><th class="num">답 자</th></tr>
+      ${rows.reverse().map((r) => r.html).join("")}</table></section>`;
+}
+
+// ── 공통 ─────────────────────────────────────────────────────────
+async function showTab(tab) {
+  document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("on", b.dataset.tab === tab));
+  document.querySelectorAll(".page").forEach((p) => p.classList.toggle("on", p.id === `page-${tab}`));
+  if (!state) return;
+  try {
+    if (tab === "traces") await renderTraces();
+    if (tab === "turns") await renderTurns();
+    if (tab === "history") await renderHistory();
+  } catch (err) { msg(String(err.message || err), "bad"); }
+}
+
+document.addEventListener("input", (event) => { if (event.target.closest && event.target.closest("#modes")) schedulePreview(); });
+document.addEventListener("change", (event) => { if (event.target.closest && event.target.closest("#modes")) schedulePreview(); });
+document.addEventListener("click", async (event) => {
+  const el = event.target;
+  const section = el.closest && el.closest("section");
+  const mode = section && section.dataset.mode;
+  try {
+    if (el.dataset.tab) await showTab(el.dataset.tab);
+    else if (el.dataset.goto) { event.preventDefault(); await showTab(el.dataset.goto); }
+    else if (el.id === "load") {
+      [state, styleState] = await Promise.all([api("/v1/settings"), api("/v1/settings/answer-style")]);
+      renderSettings(); msg("불러왔다", "ok");
+    }
+    else if (el.dataset.modeTab) { currentMode = el.dataset.modeTab; if (state) renderSettings(); }
+    else if (el.dataset.previewFrom !== undefined) {
+      currentMode = el.dataset.previewModeOf; await showTab("settings"); renderSettings();
+      $("pv-session").value = el.dataset.previewFrom; schedulePreview();
+    }
+    else if (el.dataset.save) await saveMode(mode);
+    else if (el.dataset.reset) { state = await api("/v1/settings", "PUT", { mode, reset: true }); renderSettings(); msg(`${MODE_LABEL[mode]} 화면 값을 지웠다(답변 형식은 그대로)`, "ok"); }
+    else if (el.dataset.clearCtx) { state = await api("/v1/settings", "PUT", { mode, context: { [el.dataset.clearCtx]: null } }); renderSettings(); }
+    else if (el.dataset.clearP) { state = await api("/v1/settings", "PUT", { mode, params: { [el.dataset.clearP]: null } }); renderSettings(); }
+  } catch (err) { msg(String(err.message || err), "bad"); }
+});
+if ($("key").value) $("load").click();
+</script>
+</body>
+</html>
