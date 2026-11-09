@@ -353,11 +353,14 @@ async def test_other_tools_are_not_normalized():
 # ── 빈 출력 재시도 ────────────────────────────────────────────────────────────
 
 @pytest.mark.anyio
-async def test_one_empty_generation_is_retried_with_the_same_input():
+async def test_one_empty_generation_is_retried_with_the_same_input_plus_a_nudge():
     provider = FakeProvider([LLMEmptyResponse("neither content nor tool calls"), assistant("답")])
     result = await run(provider, FakeQueryForge())
     assert result.answer == "답" and len(provider.messages) == 2
-    assert [m.content for m in provider.messages[0]] == [m.content for m in provider.messages[1]]
+    first, second = provider.messages[0], provider.messages[1]
+    assert [m.content for m in second[:-1]] == [m.content for m in first]          # 앞은 같고 끝에 안내 한 줄만 늘었다
+    assert second[-1].role == "user" and second[-1].content.startswith("[DataLens 案内] 直前の出力を読み取れませんでした") \
+        or second[-1].content.startswith("[DataLens 안내] 직전 출력을 읽지 못했습니다")
 
 
 @pytest.mark.anyio

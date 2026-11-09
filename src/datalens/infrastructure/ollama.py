@@ -27,6 +27,8 @@ from datalens.ports.queryforge import QueryForgeToolDefinition
 
 
 LOG = logging.getLogger("datalens.llm")
+#: 빈 응답 진단에 남기는 원문·사고 앞부분 길이(글자). 진단 기록은 메모리 trace(최근 5건)에만 간다
+EMPTY_HEAD_CHARS = 500
 
 
 class OllamaProvider:
@@ -128,6 +130,9 @@ class OllamaProvider:
         )
         sanitizer = ThoughtStreamSanitizer()
         content_parts: list[str] = []
+        # 빈 응답 진단용 — 걸러지기 전 본문과 사고 블록의 앞부분(`LLMEmptyResponse.diagnostics`)
+        raw_head: list[str] = []
+        thinking_head: list[str] = []
         calls: tuple[ToolCall, ...] = ()
         final: dict[str, Any] = {}
         started = time.monotonic()
@@ -154,9 +159,13 @@ class OllamaProvider:
                     message = body.get("message") or {}
                     if message.get("thinking"):
                         thinking_chunk_count += 1
+                        if isinstance(message["thinking"], str) and sum(map(len, thinking_head)) < EMPTY_HEAD_CHARS:
+                            thinking_head.append(message["thinking"])
                     chunk = message.get("content") or ""
                     if not isinstance(chunk, str):
                         raise TypeError("content must be a string")
+                    if chunk and sum(map(len, raw_head)) < EMPTY_HEAD_CHARS:
+                        raw_head.append(chunk)
                     visible = sanitizer.feed(chunk)
                     if visible:
                         content_parts.append(visible)
@@ -240,7 +249,16 @@ class OllamaProvider:
             await on_token(tail)
         content = "".join(content_parts)
         if not content and not calls:
-            raise LLMEmptyResponse("Ollama returned neither content nor tool calls")
+            # Ollama 가 도구 호출 파서에 삼킨 출력은 여기까지 오지 않는다(F-227 실측: 토큰 145개 · 청크 1개 ·
+            # 원문 0자). 그래도 "아무것도 오지 않았다"는 것 자체가 그 경우를 가르는 사실이라 그대로 남긴다
+            raise LLMEmptyResponse("Ollama returned neither content nor tool calls", {
+                "raw_head": "".join(raw_head)[:EMPTY_HEAD_CHARS],
+                "thinking_head": "".join(thinking_head)[:EMPTY_HEAD_CHARS],
+                "chunks": chunk_count,
+                "thinking_chunks": thinking_chunk_count,
+                "eval_count": self._optional_int(final.get("eval_count")),
+                "done_reason": final.get("done_reason"),
+            })
         return AssistantTurn(
             content=content,
             tool_calls=calls,

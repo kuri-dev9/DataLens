@@ -252,6 +252,10 @@ class ChatApplicationService:
                     "load_ms": row["result"]["load_ms"],
                     "prompt_eval_ms": row["result"]["prompt_eval_ms"],
                     "eval_ms": row["result"]["eval_ms"],
+                    # 본문도 도구 호출도 없던 생성의 진단(원문·사고 앞 500자 · 청크 수) — 있을 때만
+                    **({"empty_outputs": raw["empty_outputs"]} if raw.get("empty_outputs") else {}),
+                    # 도구 0회 답의 근거 없는 수치로 한 번 다시 생성했다(첫 답 앞부분 · 걸린 수치)
+                    **({"unbacked_retry": raw["unbacked_retry"]} if raw.get("unbacked_retry") else {}),
                 },
                 "settings": row["settings"],
             }

@@ -51,12 +51,77 @@ _NON_FACT_KEYS = frozenset({"notice", "next_page"})
 TOOL_SPEC_NAME = "get_tool_spec"
 # 빈 출력이 재시도 뒤에도 이어질 때 도구 없이 한 번 더 부르며 붙이는 지시(2026-11-08).
 # 사용자 차례로 넣는다 — 대화 중간의 system 은 gemma 템플릿에서 첫 system 과 합쳐지지 않는다.
+# 실행하지 않은 조회를 "실행했지만 얻지 못했다"고 쓰지 않게 한 문장을 더했다(2026-11-09 · graphio 5번 F-222 ·
+# query 호출 0회인데 "クエリを実行しましたが…取得できなかった"로 답했다)
 _FINAL_WITHOUT_TOOLS = {
     "ko": "[DataLens 안내] 도구를 더 부를 수 없습니다. 지금까지의 도구 결과와 위 맥락만으로 질문에 답하세요. "
-          "조회하지 못한 것은 조회하지 못했다고 말하고, 받지 않은 수치는 쓰지 마세요.",
+          "조회하지 못한 것은 조회하지 못했다고 말하고, 받지 않은 수치는 쓰지 마세요. "
+          "실행하지 못한 조회를 실행했다고 쓰지 마세요 — 결과를 받은 조회만 실행한 것입니다.",
     "ja": "[DataLens 案内] これ以上ツールは呼べません。これまでのツール結果と上の文脈だけで質問に答えてください。"
-          "照会できなかったものは照会できなかったと述べ、受け取っていない数値は書かないでください。",
+          "照会できなかったものは照会できなかったと述べ、受け取っていない数値は書かないでください。"
+          "実行できなかった照会を実行したと書かないでください — 結果を受け取った照会だけが実行したものです。",
 }
+# 첫 빈 응답 뒤 다시 부를 때 붙이는 안내(2026-11-09). 전에는 **같은 입력**으로 다시 불러 같은 출력이 나왔다
+# (graphio 5번 · 토큰 149·145 · 청크 1 · 원문 0자 — Ollama 가 읽지 못한 도구 호출). 입력을 바꿔 다른 생성을 받는다
+_EMPTY_RETRY_NUDGE = {
+    "ko": "[DataLens 안내] 직전 출력을 읽지 못했습니다(본문도 도구 호출도 없음). 도구를 부르려던 것이면 도구를 다시 "
+          "호출하세요 — 인자는 사용자 메시지의 조회 안내대로, 한 번에 하나의 도구만 부릅니다. 도구가 필요 없으면 답을 쓰세요.",
+    "ja": "[DataLens 案内] 直前の出力を読み取れませんでした(本文もツール呼び出しもありません)。ツールを呼ぶつもりだったなら、"
+          "もう一度ツールを呼んでください — 引数はユーザーメッセージの照会案内どおりに、一度に一つのツールだけを呼びます。"
+          "ツールが不要なら回答を書いてください。",
+}
+# 도구를 한 번도 부르지 않은 답에 근거 없는 수치가 있을 때 한 번 더 부르며 붙이는 지시(2026-11-09 · graphio
+# 5·18번). 이어진 대화에서 모델이 앞 턴(도구 없이 답한 결론·상황 답)의 모양을 따라 도구 호출 0회로
+# 2,358/1,460·1,800/1,632 를 지어냈다(21~28초). 같은 질문을 새 대화로 보내면 도구 3회로 맞았다.
+_UNBACKED_RETRY = {
+    "ko": "[DataLens 안내] 방금 답에 도구로 조회하지 않은 수치({v})가 있습니다. 데이터 수치는 도구로 조회한 결과만 "
+          "씁니다. 질문이 데이터를 묻는다면 지금 query 도구를 호출해 조회한 뒤 답하세요. 사용자가 보낸 맥락에 있는 "
+          "수치만으로 답할 수 있는 질문이면 그 수치만 쓰고, 조회하지 못한 값은 0 이 아니라 '확인하지 못했다'고 쓰세요.",
+    "ja": "[DataLens 案内] 直前の回答に、ツールで照会していない数値({v})があります。データの数値はツールで照会した結果だけを"
+          "書きます。質問がデータを尋ねているなら、今 query ツールを呼んで照会してから答えてください。ユーザーが送った文脈に"
+          "ある数値だけで答えられる質問ならその数値だけを使い、照会できなかった値は 0 ではなく「確認できなかった」と書いてください。",
+}
+
+
+def _unbacked_numbers(answer: str, facts: set[str], user_texts: list[str]) -> list[str]:
+    """도구 없이 쓴 답의 수치 중 **어디에도 근거가 없는 것** — 이전 답·세션 상태(`facts`)와 사용자가 보낸 글
+    (맥락·질문)에 없는 수치. 날짜·작은 정수(목록 번호 등)는 세지 않는다. 계측이 실패하면 빈 목록이다."""
+    known = set(facts)
+    collect_facts(user_texts, known)
+    g = safe_measure(answer, known) or {}
+    out: list[str] = []
+    for u in g.get("ungrounded") or ():
+        if u.get("date") or u.get("small_int"):
+            continue
+        v = str(u.get("value", "")).strip()
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
+#: 조회 모드 이력에 싣는 **사용자 메시지 한 건의 상한(글자)** — 초기값(2026-11-09 · graphio 18번 F-218).
+#: 증거 모드로 시작한 세션을 조회 모드로 이어 물으면 첫 증거팩(15,360자)이 이력에 그대로 실려 컨텍스트가
+#: 16,384 토큰 중 15,683(`tight`)이 됐고, 모델이 도구를 부르지 않은 채 "照会結果は以下の通り"만 썼다. 다음
+#: 공지문 질의는 18,340 토큰(`truncated`)으로 앞이 잘려 근거 없는 약속("全力で対応")이 다시 나왔다.
+#: 호출부(graphio)는 이어 묻는 메시지마다 화면 맥락을 다시 싣는다 — 이력의 긴 원문은 중복이다.
+#: 넘는 사용자 메시지는 **끝부분**(질문이 있는 자리)만 남긴다. 증거 모드 이력은 자르지 않는다(이어 묻기가
+#: 앞 증거팩을 근거로 쓴다 · `ask_check`)
+HISTORY_USER_MAX_CHARS = 1200
+HISTORY_USER_TAIL_CHARS = 600
+_HISTORY_CUT = {
+    "ko": "[앞 질문 — 본문 {n}자 중 끝 {k}자만 싣는다. 증거·화면 맥락은 지금 메시지에 다시 있다]\n…",
+    "ja": "[前の質問 — 本文 {n}字のうち末尾 {k}字だけを載せる。証拠・画面の文脈は今のメッセージに改めてある]\n…",
+}
+
+
+def _history_content(role: str, content: str, mode: str, locale: str) -> str:
+    """이력 항목 하나를 싣는 모양 — 조회 모드의 긴 사용자 메시지만 끝부분으로 줄인다(`HISTORY_USER_MAX_CHARS`)."""
+    if mode == "evidence" or role != "user" or len(content) <= HISTORY_USER_MAX_CHARS:
+        return content
+    head = _HISTORY_CUT.get(locale, _HISTORY_CUT["ko"]).format(n=len(content), k=HISTORY_USER_TAIL_CHARS)
+    return head + content[-HISTORY_USER_TAIL_CHARS:]
+
+
 _LAZY_HINT = {
     "ko": "[도구 정의] 도구 목록의 정의는 요약본이다(이름·한 줄 설명·최상위 인자). 인자 구조가 확실하지 않으면 "
           f"그 도구를 부르기 전에 {TOOL_SPEC_NAME}(name)으로 전체 정의를 받아라. 한 번 받은 정의는 이후 도구 목록에 그대로 실린다.",
@@ -256,6 +321,10 @@ class BoundedAgent:
         empty_retried = False
         # 재시도도 비면 도구 없이 마지막 답을 한 번 더 받는다 — 빈손으로 502 를 내지 않는다.
         final_without_tools = False
+        # 빈 응답마다 프로바이더가 남긴 진단(`LLMEmptyResponse.diagnostics`) — trace 에만 싣는다(2026-11-09)
+        empty_outputs: list[dict[str, Any]] = []
+        # 근거 없는 수치 되묻기(`_UNBACKED_RETRY`)는 한 턴에 한 번 — 두 번째 답은 그대로 내보낸다
+        unbacked_retry: dict[str, Any] | None = None
 
         try:
             while True:
@@ -287,8 +356,9 @@ class BoundedAgent:
                     step["detail"] = str(exc)
                     raise AgentUpstreamUnavailable("LLM provider failed") from exc
                 except LLMEmptyResponse as exc:
+                    empty_outputs.append({"step": tool_count + 1, **(getattr(exc, "diagnostics", None) or {})})
                     # gemma4 의 도구 호출을 Ollama 가 읽지 못하면 아무것도 없이 끝난다. 흘린 토큰이
-                    # 없으니 같은 입력으로 한 번 더 부른다. 두 번째도 비면 도구를 빼고 지금까지 받은 것으로
+                    # 없으니 안내 한 줄(`_EMPTY_RETRY_NUDGE`)을 붙여 한 번 더 부른다. 두 번째도 비면 도구를 빼고 지금까지 받은 것으로
                     # 답하게 한 번 더 부른다. 그것도 비면 예전처럼 실패로 끝낸다.
                     if final_without_tools:
                         step["upstream_code"] = "LLM_INVALID_RESPONSE"
@@ -312,9 +382,14 @@ class BoundedAgent:
                         )
                         continue
                     empty_retried = True
+                    # 같은 입력이면 같은 출력이 나온다 — 안내 한 줄로 입력을 바꾼다. trace 의 `empty_outputs` 에
+                    # `retry: "nudged"` 로 남고, 안내 문장 자체도 보낸 메시지(`agent_step`)에 보인다
+                    empty_outputs[-1]["retry"] = "nudged"
+                    messages.append(ProviderMessage("user", _EMPTY_RETRY_NUDGE.get(session.locale, _EMPTY_RETRY_NUDGE["ko"])))
                     LOG.warning(
                         "llm_empty_retry",
-                        extra={"request_id": current_request_id(), "session_id": session.session_id, "step": tool_count + 1},
+                        extra={"request_id": current_request_id(), "session_id": session.session_id, "step": tool_count + 1,
+                               "nudged": True},
                     )
                     continue
                 except LLMInvalidResponse as exc:
@@ -335,6 +410,27 @@ class BoundedAgent:
                     answer = (turn.content or "").strip()
                     if not answer:
                         raise AgentInternalError("LLM returned an empty final answer")
+                    if (profile.mode != "evidence" and tool_count == 0 and unbacked_retry is None
+                            and not final_without_tools and sent_tools):
+                        unbacked = _unbacked_numbers(
+                            answer, facts, [m.content for m in messages if m.role == "user"])
+                        if unbacked:
+                            unbacked_retry = {"step": tool_count + 1, "values": unbacked[:10],
+                                              "first_answer_head": answer[:300]}
+                            warnings.append({
+                                "code": "DATALENS_UNBACKED_NUMBERS_RETRY",
+                                "action": "regenerated_once",
+                                "detail": "numbers not found in tool results or the provided context were answered "
+                                          "without any tool call; asked the model once to query",
+                                "values": unbacked[:10],
+                            })
+                            LOG.warning("agent_unbacked_numbers_retry",
+                                        extra={"request_id": current_request_id(), "session_id": session.session_id,
+                                               "values": unbacked[:10]})
+                            # 첫 답은 대화에 넣지 않는다 — 지어낸 수치가 다음 생성의 근거처럼 보이지 않게
+                            notice = _UNBACKED_RETRY.get(session.locale, _UNBACKED_RETRY["ko"])
+                            messages.append(ProviderMessage("user", notice.format(v=", ".join(unbacked[:5]))))
+                            continue
                     updated = self._updated_session(
                         session,
                         message,
@@ -362,6 +458,8 @@ class BoundedAgent:
                             "base_len": base_len,
                             "usage": turn.usage,
                             "stop_reason": turn.stop_reason,
+                            **({"empty_outputs": empty_outputs} if empty_outputs else {}),
+                            **({"unbacked_retry": unbacked_retry} if unbacked_retry else {}),
                         },
                     )
 
@@ -1005,7 +1103,7 @@ class BoundedAgent:
             role = item.get("role")
             content = item.get("content")
             if role in {"user", "assistant"} and isinstance(content, str):
-                messages.append(ProviderMessage(role, content))
+                messages.append(ProviderMessage(role, _history_content(role, content, profile.mode, session.locale)))
         messages.append(ProviderMessage("user", message))
         return messages
 

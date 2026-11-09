@@ -114,7 +114,14 @@ class LLMEmptyResponse(LLMInvalidResponse):
     gemma4 가 도구 호출을 Ollama 파서가 읽지 못하는 모양으로 내면 이렇게 끝난다. 화면에
     흘린 토큰이 없으므로 같은 요청을 한 번 더 보내도 출력이 겹치지 않는다 — 에이전트가
     이 경우만 한 번 재시도한다. 스트림 파싱 실패처럼 토큰이 이미 나간 경우는 상위 클래스로 남는다.
+
+    ``diagnostics`` — 무엇이 비었는지 사후에 보는 값(2026-11-09 · graphio 1번 F-227). 토큰 145개를 내고도
+    본문·호출이 0 이었는데 무엇을 냈는지 알 길이 없었다. 프로바이더가 받은 원문 앞부분만 싣는다.
     """
+
+    def __init__(self, message: str, diagnostics: dict | None = None) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics or {}
 
 
 class LLMUnavailable(LLMProviderError):
