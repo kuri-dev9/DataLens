@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     queryforge_call_timeout_seconds: float = Field(70.0, gt=0)
     agent_max_tool_calls: int = Field(12, gt=0)
     agent_recovery_budget: int = Field(5, ge=0)
+    # 빈 출력의 생성 토큰이 이 값 이상이면 깨진 query 호출로 보고 ``format`` 강제 조회로 한 번 받는다(2026-11-10).
+    # 실측 schema 호출 29~39 · query 호출 162~172 · 빈 출력 134~164 토큰. 0 이면 끈다. **초기값이다**
+    agent_structured_retry_min_eval: int = Field(100, ge=0)
     # QueryForge preview.max_rows와 같은 값. 그보다 줄이면 작은 모델이 받은 몇 행을
     # 전체 결과로 오인하는 사례가 많아 QueryForge가 실측 끝에 20으로 올린 값이다.
     agent_preview_rows: int = Field(20, ge=1, le=100)

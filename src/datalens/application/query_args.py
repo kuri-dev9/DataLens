@@ -139,11 +139,18 @@ def normalize(arguments: Any, partition_keys: dict[str, list[str]] | None = None
         grouped = {g for g in fixed.get("group_by") or () if isinstance(g, str)}
         pinned = {c.get("column") for c in ((fixed.get("filters") or {}).get("all") or ())
                   if isinstance(c, dict) and c.get("operator") == "eq"} if isinstance(fixed.get("filters"), dict) else set()
+        # group_by 가 없는 합계에서 **집계 대상 열 자체**를 select 에 둔 것도 뺀다(2026-11-10 · graphio 16번
+        # `sum(ATTEMPT)` + `select ATTEMPT` · 맥스 재현 10회 중 5회). 결과가 한 행 합계라 같은 열의 raw 값을 함께
+        # 고를 방법이 없고 QueryForge 가 거부한다. group_by 가 있으면 뜻이 모호해 두고 거부·hint 에 맡긴다
+        agg_cols = set() if grouped else {a.get("column") for a in fixed["aggregations"] if isinstance(a, dict)}
         keep = []
         for item in fixed["select"]:
             col = item.get("column") if isinstance(item, dict) else None
             if col and col not in grouped and col in pinned:
                 notes.append(f"select: {col} 는 eq 거름으로 고정된 열이라 집계와 함께 빼냄")
+                continue
+            if col and col in agg_cols:
+                notes.append(f"select: {col} 는 집계 대상 열이라 group_by 없는 합계에서 빼냄")
                 continue
             keep.append(item)
         if len(keep) != len(fixed["select"]):

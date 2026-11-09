@@ -267,6 +267,63 @@ class OllamaProvider:
             provider_request_id=str(final.get("id")) if final.get("id") is not None else None,
         )
 
+    async def complete_structured(
+        self,
+        messages: list[ProviderMessage],
+        schema: dict[str, Any],
+        deadline: float,
+        output_policy: OutputPolicy,
+    ) -> tuple[dict[str, Any], TokenUsage]:
+        """도구 없이 ``format``(JSON 스키마)으로 한 번 받는다 — 깨진 도구 호출의 대비 경로(2026-11-10).
+
+        gemma4 가 긴 query 호출을 쓰다 문자열 구분 토큰(`<|"|>`)과 보통 따옴표를 섞으면 Ollama 도구 파서가
+        출력을 통째로 버린다(빈 출력 · 맥스 원문 재현 10회 중 2회). ``format`` 은 제약 디코딩이라 따옴표가
+        어긋날 수 없고 도구 파서를 거치지 않는다. 사고는 끈다 — 인자 JSON 만 받는다. 스트리밍하지 않는다
+        (호출 하나 크기라 유휴 판정이 필요 없다). 받은 본문이 JSON 객체가 아니면 `LLMInvalidResponse`.
+        """
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise LLMTimeout("LLM deadline exhausted before request")
+        options = dict(self._options)
+        options.update({key: value for key, value in (output_policy.options or {}).items() if value is not None})
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "stream": False,
+            "messages": [self._message(message, index == 0, False) for index, message in enumerate(messages)],
+            "format": schema,
+            "options": options,
+            "think": False,
+        }
+        if output_policy.keep_alive:
+            value = output_policy.keep_alive
+            payload["keep_alive"] = int(value) if value.lstrip("-").isdigit() else value
+        try:
+            response = await self._client.post(
+                f"{self._base_url}/api/chat", json=payload,
+                timeout=httpx.Timeout(max(1.0, min(remaining, output_policy.idle_timeout_seconds or self._idle_timeout))),
+            )
+            response.raise_for_status()
+            body = response.json()
+        except httpx.TimeoutException as exc:
+            raise LLMTimeout("Ollama structured request timed out") from exc
+        except httpx.HTTPError as exc:
+            raise LLMUnavailable("Ollama structured request failed") from exc
+        except (TypeError, ValueError) as exc:
+            raise LLMInvalidResponse("Ollama returned an invalid structured response") from exc
+        content = str((body.get("message") or {}).get("content") or "")
+        try:
+            arguments = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise LLMInvalidResponse("structured output is not JSON") from exc
+        if not isinstance(arguments, dict):
+            raise LLMInvalidResponse("structured output is not a JSON object")
+        usage = TokenUsage(
+            prompt_tokens=self._optional_int(body.get("prompt_eval_count")),
+            completion_tokens=self._optional_int(body.get("eval_count")),
+            context_window=self._optional_int(options.get("num_ctx")),
+        )
+        return arguments, usage
+
     async def close(self) -> None:
         if self._owns_client:
             await self._client.aclose()

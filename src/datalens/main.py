@@ -56,6 +56,7 @@ def create_app():
         preview_rows=settings.agent_preview_rows,
         timezone=settings.timezone,
         runtime=runtime,
+        structured_retry_min_eval=settings.agent_structured_retry_min_eval,
     )
     memory = None
     if settings.memory_enabled:

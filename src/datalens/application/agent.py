@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -16,6 +17,7 @@ from datalens.domain.session import Session
 from datalens.prompts import load_system_prompt
 from datalens.application.runtime_config import HISTORY_STORE_LIMIT, Mode, Profile, RuntimeConfig
 from datalens.ports.llm import (
+    AssistantTurn,
     LLMEmptyResponse,
     LLMInvalidResponse,
     LLMProvider,
@@ -24,6 +26,7 @@ from datalens.ports.llm import (
     OutputPolicy,
     ProviderMessage,
     TokenUsage,
+    ToolCall,
 )
 from datalens.ports.queryforge import (
     QueryForgeClient,
@@ -139,6 +142,35 @@ _GAVE_UP_PHRASES = (
     "取得することができません", "取得できなかった",
     "取得できていない", "取得できていません", "照会結果が取得",
 )
+
+
+# 빈 출력이 query 호출 크기였을 때 ``format``(JSON 스키마)으로 한 번 더 받으며 붙이는 지시(2026-11-10 · graphio
+# 16·3·14번). 빈 출력은 gemma4 가 긴 query 호출을 쓰다 따옴표 표기를 섞어 Ollama 도구 파서가 버린 것이다(맥스 원문
+# 재현). 안내 문구로 다시 부르면 같은 표기가 또 깨진다 — 제약 디코딩으로 인자 JSON 만 받아 정상 도구 경로로 보낸다.
+# 이 문장은 그 한 번의 요청에만 붙이고 대화 기록에는 남기지 않는다
+_STRUCTURED_RETRY = {
+    "ko": "[DataLens 안내] 직전 query 도구 호출을 읽지 못했습니다. 같은 query 의 인자를 JSON 으로만 내세요. 사용자 "
+          "메시지의 조회 안내대로, 질문이 가리키는 대상(셀·장비 등)의 조건은 filters 에, 시간 창은 partition_scope 에, "
+          "집계는 aggregations 에 빠짐없이 넣습니다.",
+    "ja": "[DataLens 案内] 直前の query ツール呼び出しを読み取れませんでした。同じ query の引数を JSON だけで出してください。"
+          "ユーザーメッセージの照会案内どおりに、質問が指す対象(セル・装置など)の条件を filters に、時間窓を partition_scope "
+          "に、集計を aggregations に漏れなく入れます。",
+}
+#: 강제 조회 스키마에서 빼는 키 — 세션·DB·확인 토큰은 DataLens 가 다루고, 모델에게 맡기면 자리표시 값을 지어낸다
+#: (재현: `"session_id": "current_session_id_placeholder"`). 미리보기 키는 답과 무관하다
+_STRUCTURED_DROP = ("session_id", "database", "confirmation_token", "preview_rows", "preview_format")
+
+
+def _structured_query_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """query 입력 스키마의 강제 조회판 — 위 키를 빼고 ``source``·``partition_scope`` 를 필수로 둔다.
+
+    재현(16번 실패 세션 · gemma4:12b): 원래 스키마 그대로면 JSON 은 4/4 바르게 나와도 거름·시간 창이 3/4 빠졌다.
+    이 판과 위 지시로는 6/6 이 셀 거름·시간 창·집계까지 맞았다. 시간 창이 빠지면 QueryForge 가 거부하지만
+    (`MISSING_PARTITION_SCOPE`) 거름이 빠지면 **틀린 합계**가 나오므로 지시가 거름을 명시한다
+    """
+    props = {k: v for k, v in (schema.get("properties") or {}).items() if k not in _STRUCTURED_DROP}
+    required = [r for r in ("source", "partition_scope") if r in props]
+    return {**schema, "properties": props, "required": required}
 
 
 def _gave_up_without_query(answer: str) -> bool:
@@ -306,8 +338,12 @@ class BoundedAgent:
         preview_rows: int = 5,
         timezone: str = "Asia/Seoul",
         runtime: RuntimeConfig | None = None,
+        structured_retry_min_eval: int = 100,
     ) -> None:
         self._provider = provider
+        # 빈 출력의 생성 토큰이 이 값 이상이면 query 호출이 깨진 것으로 보고 강제 조회(`format`)로 한 번 받는다.
+        # 실측 schema 호출 29~39 · query 호출 162~172 · 빈 출력 134~164 토큰. 0 이면 끈다. **초기값이다**
+        self._structured_min_eval = structured_retry_min_eval
         self._queryforge = queryforge
         self._max_tool_calls = max_tool_calls
         self._recovery_budget = recovery_budget
@@ -389,6 +425,9 @@ class BoundedAgent:
         unbacked_retry: dict[str, Any] | None = None
         # 조회 없이 "확인하지 못했다"로 끝난 답 되묻기(`_NO_QUERY_RETRY`) — 한 턴에 한 번
         no_query_retry: dict[str, Any] | None = None
+        # 깨진 query 호출의 강제 조회(`complete_structured`) — 한 턴에 한 번. `pending` 이면 다음 생성을 그것으로 한다
+        structured_retry: dict[str, Any] | None = None
+        pending_structured = False
         query_calls = 0
         partition_keys: dict[str, list[str]] = {}
 
@@ -402,7 +441,13 @@ class BoundedAgent:
                 step.update({"index": tool_count + 1, "tool": "llm"})
                 sent_tools = () if final_without_tools else self._sent_tools(tools, profile.tools, expanded)
                 try:
-                    if event_sink is not None and hasattr(self._provider, "complete_stream"):
+                    if pending_structured:
+                        pending_structured = False
+                        if event_sink is not None:
+                            await event_sink("progress", {"stage": "structured_retry"})
+                        turn = await self._structured_turn(messages, tool_map["query"], deadline, policy, session.locale,
+                                                           structured_retry)
+                    elif event_sink is not None and hasattr(self._provider, "complete_stream"):
                         turn = await self._provider.complete_stream(
                             messages,
                             sent_tools,
@@ -423,6 +468,25 @@ class BoundedAgent:
                     raise AgentUpstreamUnavailable("LLM provider failed") from exc
                 except LLMEmptyResponse as exc:
                     empty_outputs.append({"step": tool_count + 1, **(getattr(exc, "diagnostics", None) or {})})
+                    # 생성 토큰이 query 호출 크기면 깨진 query 호출이다 — 안내 재시도보다 먼저 강제 조회로 한 번 받는다.
+                    # 실패하면(`_structured_turn` 이 빈 출력으로 바꿔 낸다) 아래 예전 경로를 그대로 탄다
+                    eval_count = empty_outputs[-1].get("eval_count")
+                    if (structured_retry is None and self._structured_min_eval > 0 and profile.mode != "evidence"
+                            and "query" in tool_map and hasattr(self._provider, "complete_structured")
+                            and isinstance(eval_count, int) and eval_count >= self._structured_min_eval):
+                        structured_retry = {"step": tool_count + 1, "eval_count": eval_count}
+                        empty_outputs[-1]["retry"] = "structured"
+                        pending_structured = True
+                        warnings.append({
+                            "code": "DATALENS_STRUCTURED_RETRY",
+                            "action": "structured_query_once",
+                            "detail": "the model's query call could not be parsed; asked once for the query arguments "
+                                      "as constrained JSON and ran them",
+                        })
+                        LOG.warning("agent_structured_retry",
+                                    extra={"request_id": current_request_id(), "session_id": session.session_id,
+                                           "step": tool_count + 1, "eval_count": eval_count})
+                        continue
                     # gemma4 의 도구 호출을 Ollama 가 읽지 못하면 아무것도 없이 끝난다. 흘린 토큰이
                     # 없으니 안내 한 줄(`_EMPTY_RETRY_NUDGE`)을 붙여 한 번 더 부른다. 두 번째도 비면 도구를 빼고 지금까지 받은 것으로
                     # 답하게 한 번 더 부른다. 그것도 비면 예전처럼 실패로 끝낸다.
@@ -465,7 +529,7 @@ class BoundedAgent:
                 step.clear()
                 worst_usage = self._worst_usage(worst_usage, turn.usage)
 
-                if final_without_tools and turn.tool_calls:
+                if final_without_tools and turn.tool_calls and turn.stop_reason != "structured":
                     # 도구 목록을 비웠는데도 호출을 냈다 — 본문이 있으면 그것을 답으로 쓰고 호출은 버린다.
                     if not (turn.content or "").strip():
                         step["upstream_code"] = "LLM_INVALID_RESPONSE"
@@ -547,6 +611,7 @@ class BoundedAgent:
                             **({"empty_outputs": empty_outputs} if empty_outputs else {}),
                             **({"unbacked_retry": unbacked_retry} if unbacked_retry else {}),
                             **({"no_query_retry": no_query_retry} if no_query_retry else {}),
+                            **({"structured_retry": structured_retry} if structured_retry else {}),
                         },
                     )
 
@@ -763,6 +828,38 @@ class BoundedAgent:
         if remaining <= 0:
             raise AgentTimeoutError("Agent turn deadline exhausted")
         return remaining
+
+    async def _structured_turn(
+        self,
+        messages: list[ProviderMessage],
+        query_tool: QueryForgeToolDefinition,
+        deadline: float,
+        policy: OutputPolicy,
+        locale: str,
+        record: dict[str, Any] | None,
+    ) -> AssistantTurn:
+        """강제 조회 한 번 — 받은 인자를 query 도구 호출 하나로 바꿔 정상 도구 경로(정규화·검증·실행)로 보낸다.
+
+        프로바이더가 실패하거나 JSON 객체가 아니면 `LLMEmptyResponse` 로 바꿔 낸다 — 호출부의 빈 출력 처리가
+        예전 경로(안내 재시도 → 도구 없는 답)를 그대로 탄다. 시간 초과는 그대로 올린다
+        """
+        notice = _STRUCTURED_RETRY.get(locale, _STRUCTURED_RETRY["ko"])
+        try:
+            arguments, usage = await self._provider.complete_structured(  # type: ignore[attr-defined]
+                [*messages, ProviderMessage("user", notice)],
+                _structured_query_schema(query_tool.input_schema), deadline, policy)
+        except (LLMInvalidResponse, LLMUnavailable) as exc:
+            if record is not None:
+                record.update({"ok": False, "error": str(exc)[:200]})
+            raise LLMEmptyResponse("structured query retry failed", {"structured_failed": str(exc)[:200]}) from exc
+        if record is not None:
+            record.update({"ok": True, "eval_count_structured": usage.completion_tokens})
+        return AssistantTurn(
+            content="",
+            tool_calls=(ToolCall(call_id=f"call_{uuid.uuid4().hex}", name="query", arguments=arguments),),
+            stop_reason="structured",
+            usage=usage,
+        )
 
     @staticmethod
     def _validate(tool: QueryForgeToolDefinition, arguments: Any) -> str | None:
