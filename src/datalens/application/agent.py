@@ -36,6 +36,43 @@ from datalens.application import query_args
 from datalens.application.grounding import collect_facts, safe_measure
 from datalens.observability import current_request_id, safe_log_value
 
+#: INFO 로그의 조회 조건 요약 상한(글자)
+QUERY_ARGS_LOG_MAX_CHARS = 500
+_QUERY_ARGS_SECRET = frozenset({"password", "secret", "api_key", "authorization", "dsn",
+                                "connection_string", "confirmation_token", "sql"})
+
+
+def _query_args_summary(arguments: dict[str, Any]) -> str:
+    """query 도구 인자에서 원인 추적에 필요한 칸만 — 테이블·거름(값 포함)·시간 범위·집계·묶음·선택 열.
+
+    `safe_log_value` 는 거름 값(`value`·`from`·`to`)까지 가린다. 그 값이 바로 "어떤 조건이 갔나"라서
+    여기서는 비밀 키만 가린다. 행·미리보기는 인자에 없다. 길면 `QUERY_ARGS_LOG_MAX_CHARS` 에서 자른다
+    """
+    def scrub(v: Any, key: str | None = None) -> Any:
+        if key in _QUERY_ARGS_SECRET:
+            return "***"
+        if isinstance(v, dict):
+            return {str(k): scrub(x, str(k).lower()) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [scrub(x) for x in v]
+        return v
+
+    source = arguments.get("source")
+    picked = {
+        "table": source.get("table") if isinstance(source, dict) else source,
+        "filters": arguments.get("filters"),
+        "partition_scope": arguments.get("partition_scope"),
+        "aggregations": [
+            {k: a.get(k) for k in ("function", "column", "alias", "where") if a.get(k) is not None}
+            for a in arguments.get("aggregations") or () if isinstance(a, dict)
+        ] or None,
+        "group_by": arguments.get("group_by"),
+        "select": [x.get("column") if isinstance(x, dict) else x for x in arguments.get("select") or ()] or None,
+    }
+    text = json.dumps(scrub({k: v for k, v in picked.items() if v is not None}),
+                      ensure_ascii=False, default=str, separators=(",", ":"))
+    return text if len(text) <= QUERY_ARGS_LOG_MAX_CHARS else text[:QUERY_ARGS_LOG_MAX_CHARS] + "…"
+
 
 LOG = logging.getLogger("datalens.agent")
 # 애플리케이션 계층이 가로채는 내부 이벤트. SSE로 내보내지 않는다.
@@ -659,6 +696,10 @@ class BoundedAgent:
         }
         if LOG.isEnabledFor(logging.DEBUG):
             fields["arguments"] = safe_log_value(arguments)
+        elif tool == "query" and isinstance(arguments, dict):
+            # 조회 조건 요약 — 값까지 남긴다(2026-11-10 · graphio 25·16번). 셀 하나를 물은 조회가 "조회할 수
+            # 없었다"로 끝났는데 키 이름만 남아 어떤 조건이 갔는지 알 수 없었다. 비밀 키는 가리고 500자에서 자른다
+            fields["query_args"] = _query_args_summary(arguments)
         LOG.log(logging.INFO if ok else logging.WARNING, "tool_call", extra=fields)
 
     @staticmethod
