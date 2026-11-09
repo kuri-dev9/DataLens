@@ -137,6 +137,7 @@ _GAVE_UP_PHRASES = (
     "確認できません", "確認できなかった", "確認できませんでした", "確認することができません",
     "照会できません", "照会することができません", "照会できなかった", "取得できません",
     "取得することができません", "取得できなかった",
+    "取得できていない", "取得できていません", "照会結果が取得",
 )
 
 
@@ -496,9 +497,16 @@ class BoundedAgent:
                             notice = _UNBACKED_RETRY.get(session.locale, _UNBACKED_RETRY["ko"])
                             messages.append(ProviderMessage("user", notice.format(v=", ".join(unbacked[:5]))))
                             continue
+                    # `final_without_tools`(빈 출력 두 번 → 도구를 빼고 답하게 한 경로)도 대상이다(2026-11-10 · graphio
+                    # 16번). 처음엔 도구가 빠진 요청에 "query 를 불러라"가 무의미해 뺐는데, 바로 그 경로가 "조회 없이
+                    # 포기"였다. 그때는 도구를 되돌려 한 번 더 부른다. 되묻기는 한 턴에 한 번이고, 다시 빈 출력이면
+                    # 빈 출력 처리(`empty_retried` 이미 참)가 곧바로 도구 없는 답으로 보내므로 끝없이 돌지 않는다
                     if (profile.mode != "evidence" and query_calls == 0 and no_query_retry is None
-                            and not final_without_tools and sent_tools and _gave_up_without_query(answer)):
-                        no_query_retry = {"step": tool_count + 1, "first_answer_head": answer[:300]}
+                            and "query" in tool_map and (sent_tools or final_without_tools)
+                            and _gave_up_without_query(answer)):
+                        no_query_retry = {"step": tool_count + 1, "first_answer_head": answer[:300],
+                                          **({"tools_restored": True} if final_without_tools else {})}
+                        final_without_tools = False
                         warnings.append({
                             "code": "DATALENS_NO_QUERY_RETRY",
                             "action": "regenerated_once",
