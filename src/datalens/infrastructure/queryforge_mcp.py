@@ -70,8 +70,17 @@ class McpQueryForgeClient:
             raise QueryForgeUnavailable("QueryForge client is closed")
         async with AsyncExitStack() as stack:
             try:
+                # 읽기 상한은 도구 호출 상한(`call_timeout`)이다. 전에는 httpx 기본값(전 구간 5초)이라
+                # QueryForge 가 22초 걸린 query 를 끝까지 돌려 성공했는데도(`ds_000000127`) 이쪽이 5초에
+                # 응답 SSE 를 끊고 `QueryForgeUnavailable` → 503 `DL_UPSTREAM_UNAVAILABLE` 로 올렸다
+                # (2026-11-10 백로그 데이터 질문 9건 중 8건). 연결·쓰기는 짧은 상한 그대로 — 원천이
+                # 아예 응답하지 않는 경우는 지금처럼 빨리 실패한다. 호출 전체는 `call_tool` 의
+                # `wait_for(remaining)` 이 턴 마감으로 다시 묶는다
                 client = await stack.enter_async_context(
-                    httpx.AsyncClient(headers={"x-api-key": self._api_key})
+                    httpx.AsyncClient(
+                        headers={"x-api-key": self._api_key},
+                        timeout=httpx.Timeout(self._default_timeout, read=max(self._call_timeout, timeout)),
+                    )
                 )
                 read_stream, write_stream, _ = await stack.enter_async_context(
                     streamable_http_client(self._endpoint, http_client=client)
