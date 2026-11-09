@@ -120,6 +120,30 @@ _UNBACKED_RETRY = {
 }
 
 
+# query 를 한 번도 부르지 않고 "확인하지 못했다"로 끝낸 답에 한 번 더 부르며 붙이는 지시(2026-11-10 · graphio
+# 25번). 셀 질문에서 schema 만 한 번 보고 "条件に合致するデータを確認できませんでした"로 답했다(원시 39건).
+# 같은 틀의 다른 셀은 query 3회로 조회했다 — 시도 자체가 빠진 경우만 되묻는다(두 번째 답은 그대로 낸다)
+_NO_QUERY_RETRY = {
+    "ko": "[DataLens 안내] 방금 답은 query 도구를 한 번도 부르지 않고 '확인하지 못했다'고 했습니다. 질문이 데이터를 "
+          "묻는다면 사용자 메시지의 조회 안내대로 지금 query 도구를 호출해 조회한 뒤 답하세요. 조회해도 행이 없으면 "
+          "그때 '확인하지 못했다'고 쓰세요.",
+    "ja": "[DataLens 案内] 直前の回答は query ツールを一度も呼ばずに「確認できなかった」としています。質問がデータを"
+          "尋ねているなら、ユーザーメッセージの照会案内どおりに今 query ツールを呼んで照会してから答えてください。照会しても"
+          "行がなければ、そのとき「確認できなかった」と書いてください。",
+}
+#: "조회하지 못했다" 계열 표현 — 조회 없이 포기한 답을 가린다(초기값)
+_GAVE_UP_PHRASES = (
+    "확인하지 못", "확인할 수 없", "조회하지 못", "조회할 수 없", "확인되지 않",
+    "確認できません", "確認できなかった", "確認できませんでした", "確認することができません",
+    "照会できません", "照会することができません", "照会できなかった", "取得できません",
+    "取得することができません", "取得できなかった",
+)
+
+
+def _gave_up_without_query(answer: str) -> bool:
+    return any(p in answer for p in _GAVE_UP_PHRASES)
+
+
 def _unbacked_numbers(answer: str, facts: set[str], user_texts: list[str]) -> list[str]:
     """도구 없이 쓴 답의 수치 중 **어디에도 근거가 없는 것** — 이전 답·세션 상태(`facts`)와 사용자가 보낸 글
     (맥락·질문)에 없는 수치. 날짜·작은 정수(목록 번호 등)는 세지 않는다. 계측이 실패하면 빈 목록이다."""
@@ -362,6 +386,10 @@ class BoundedAgent:
         empty_outputs: list[dict[str, Any]] = []
         # 근거 없는 수치 되묻기(`_UNBACKED_RETRY`)는 한 턴에 한 번 — 두 번째 답은 그대로 내보낸다
         unbacked_retry: dict[str, Any] | None = None
+        # 조회 없이 "확인하지 못했다"로 끝난 답 되묻기(`_NO_QUERY_RETRY`) — 한 턴에 한 번
+        no_query_retry: dict[str, Any] | None = None
+        query_calls = 0
+        partition_keys: dict[str, list[str]] = {}
 
         try:
             while True:
@@ -468,6 +496,19 @@ class BoundedAgent:
                             notice = _UNBACKED_RETRY.get(session.locale, _UNBACKED_RETRY["ko"])
                             messages.append(ProviderMessage("user", notice.format(v=", ".join(unbacked[:5]))))
                             continue
+                    if (profile.mode != "evidence" and query_calls == 0 and no_query_retry is None
+                            and not final_without_tools and sent_tools and _gave_up_without_query(answer)):
+                        no_query_retry = {"step": tool_count + 1, "first_answer_head": answer[:300]}
+                        warnings.append({
+                            "code": "DATALENS_NO_QUERY_RETRY",
+                            "action": "regenerated_once",
+                            "detail": "answered 'could not confirm' without any query call; asked the model once to query",
+                        })
+                        LOG.warning("agent_no_query_retry",
+                                    extra={"request_id": current_request_id(), "session_id": session.session_id,
+                                           "tool_calls": tool_count})
+                        messages.append(ProviderMessage("user", _NO_QUERY_RETRY.get(session.locale, _NO_QUERY_RETRY["ko"])))
+                        continue
                     updated = self._updated_session(
                         session,
                         message,
@@ -497,6 +538,7 @@ class BoundedAgent:
                             "stop_reason": turn.stop_reason,
                             **({"empty_outputs": empty_outputs} if empty_outputs else {}),
                             **({"unbacked_retry": unbacked_retry} if unbacked_retry else {}),
+                            **({"no_query_retry": no_query_retry} if no_query_retry else {}),
                         },
                     )
 
@@ -520,7 +562,7 @@ class BoundedAgent:
                     fixes: list[str] = []
                     if call.name == "query":
                         # 뜻이 같은 모양 고침만 한다(query_args 머리말). 고친 인자가 검증·호출·계보에 쓰인다.
-                        arguments, fixes = query_args.normalize(arguments)
+                        arguments, fixes = query_args.normalize(arguments, partition_keys)
                         if fixes:
                             step["normalized"] = list(fixes)
                             LOG.info(
@@ -650,7 +692,12 @@ class BoundedAgent:
                         lineage[reference.dataset_id] = self._lineage_entry(call.name, tool_arguments, result, reference)
                         if event_sink is not None:
                             await event_sink("dataset", reference.public())
+                    if call.name == "schema" and isinstance(bounded.get("partition"), dict) and bounded.get("table"):
+                        pkeys = bounded["partition"].get("keys")
+                        if isinstance(pkeys, list):
+                            partition_keys[str(bounded["table"])] = [str(k) for k in pkeys]
                     if call.name == "query":
+                        query_calls += 1
                         active_table = tool_arguments.get("source", {}).get("table", active_table)
                         scope = tool_arguments.get("partition_scope")
                         if isinstance(scope, dict) and scope.get("kind") == "time_range":

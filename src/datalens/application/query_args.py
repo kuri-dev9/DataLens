@@ -75,12 +75,26 @@ def shape_hint(error_paths: list[str]) -> str | None:
     return " || ".join(_SHAPES[key] for key in keys)
 
 
-def normalize(arguments: Any) -> tuple[Any, list[str]]:
-    """뜻이 바뀌지 않는 모양 고침만 한다. (고친 인자, 고친 내역) — 고칠 것이 없으면 내역이 빈다."""
+def normalize(arguments: Any, partition_keys: dict[str, list[str]] | None = None) -> tuple[Any, list[str]]:
+    """뜻이 바뀌지 않는 모양 고침만 한다. (고친 인자, 고친 내역) — 고칠 것이 없으면 내역이 빈다.
+
+    ``partition_keys`` — 이번 턴에 `schema` 로 본 표의 파티션 키(표 → 키 목록). 있으면 아래 두 가지도 고친다.
+    """
     if not isinstance(arguments, dict):
         return arguments, []
     fixed = deepcopy(arguments)
     notes: list[str] = []
+
+    # time_range 에 column 이 빠진 경우(2026-11-10 · graphio 16번) — 표의 파티션 키가 **하나뿐**이면 그 키다.
+    # 여럿이거나 이번 턴에 표를 보지 않았으면 고치지 않는다(지금처럼 거부되어 모델이 고친다)
+    scope = fixed.get("partition_scope")
+    source = fixed.get("source")
+    table = source.get("table") if isinstance(source, dict) else None
+    keys = (partition_keys or {}).get(str(table)) if table else None
+    if (isinstance(scope, dict) and scope.get("kind") == "time_range" and not scope.get("column")
+            and isinstance(keys, list) and len(keys) == 1):
+        scope["column"] = keys[0]
+        notes.append(f"partition_scope/column: 빠짐 → 표 {table} 의 파티션 키 {keys[0]}")
 
     filters = fixed.get("filters")
     if isinstance(filters, list):
@@ -118,6 +132,25 @@ def normalize(arguments: Any) -> tuple[Any, list[str]]:
             ):
                 group_by[index] = item["column"]
                 notes.append(f"group_by/{index}: {{column}} 객체 → 열 이름 문자열")
+    # 집계와 함께 보낸 select 열 중 **eq 거름으로 값이 하나로 고정된 열**은 뺀다(2026-11-10 · graphio 16번).
+    # QueryForge 는 group_by 에 없는 select 열을 거부한다(INVALID_QUERY_SPEC). 값이 하나인 열은 결과 행을
+    # 바꾸지 않으니 빼도 뜻이 같다. 고정되지 않은 열은 group_by 로 옮기면 합계가 분해로 바뀌어 뜻이 달라지므로 둔다
+    if fixed.get("aggregations") and isinstance(fixed.get("select"), list):
+        grouped = {g for g in fixed.get("group_by") or () if isinstance(g, str)}
+        pinned = {c.get("column") for c in ((fixed.get("filters") or {}).get("all") or ())
+                  if isinstance(c, dict) and c.get("operator") == "eq"} if isinstance(fixed.get("filters"), dict) else set()
+        keep = []
+        for item in fixed["select"]:
+            col = item.get("column") if isinstance(item, dict) else None
+            if col and col not in grouped and col in pinned:
+                notes.append(f"select: {col} 는 eq 거름으로 고정된 열이라 집계와 함께 빼냄")
+                continue
+            keep.append(item)
+        if len(keep) != len(fixed["select"]):
+            if keep:
+                fixed["select"] = keep
+            else:
+                fixed.pop("select")
     return fixed, notes
 
 
