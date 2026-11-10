@@ -68,6 +68,47 @@ def _question(message: str) -> str:
     return _head(message[-160:], 160)
 
 
+# graphio 가 질문 앞에 붙이는 표지(rca/llm.py) — 첫 질의·이어 묻기·일반 경로. 뒤에 붙는 「반드시 지킬 것」 꼬리는 뗀다
+_QUESTION_MARKERS = ("운영자 추가 질문:", "운영자 질문:", "[질문]", "[質問]")
+_QUESTION_TAILS = ("\n\n", "반드시 지킬 것", "必ず守ること")
+_EVENT_JSON = re.compile(r'"event":\s*\{"event_id":\s*"([^"]+)"')
+_EVENT_LINE = re.compile(r"사건 ID:\s*(EVT-[0-9a-f]+)")
+_PIECE_LINE = re.compile(r"조각 ID:\s*(IX[0-9a-f]+)")
+_ANY_ID = re.compile(r"\b(EVT-[0-9a-f]{6,}|IX[0-9a-f]{14})\b")
+_CONCLUSION = re.compile(r'"conclusion":\s*\{([^{}]*)')
+_UNIT = re.compile(r'"unit":\s*"([A-Z0-9_]+)"')
+_ROOT = re.compile(r'"root_code":\s*"([A-Z0-9_]+)"')
+
+
+def question_of(message: str) -> str:
+    """실제 운영자 질문만 — graphio 의 지시·증거팩·꼬리 문구를 뗀다. 표지가 없으면(직접 질문) 원문 그대로."""
+    found = [(message.rfind(m), m) for m in _QUESTION_MARKERS]
+    at, marker = max(found)
+    if at < 0:
+        return " ".join((message or "").split())
+    tail = message[at + len(marker):].lstrip()
+    for stop in _QUESTION_TAILS:
+        cut = tail.find(stop)
+        if cut > 0:
+            tail = tail[:cut]
+    return " ".join(tail.split())
+
+
+def link_of(message: str) -> dict[str, Any]:
+    """받은 원문에서 연결된 장애 — 사건/조각 ID · 판정 단위 · 결론 코드. 못 찾으면 빈 값(화면이 「연결 없음」)."""
+    text = message or ""
+    found = _EVENT_JSON.search(text) or _EVENT_LINE.search(text) or _PIECE_LINE.search(text) or _ANY_ID.search(text)
+    event_id = found.group(1) if found else None
+    unit = root = None
+    conclusion = _CONCLUSION.search(text)
+    if conclusion:
+        unit = (_UNIT.search(conclusion.group(1)) or [None, None])[1]
+        root = (_ROOT.search(conclusion.group(1)) or [None, None])[1]
+    if unit is None and event_id:
+        unit = "PIECE" if event_id.startswith("IX") else None
+    return {"event_id": event_id, "unit": unit, "root_code": root}
+
+
 def steps_from_blocks(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """blocks() 의 메시지 목록에서 도구 단계(호출 → 결과)만 뽑는다. 원래 결과와 새 결과를 같은 모양으로 본다."""
     steps: list[dict[str, Any]] = []
@@ -152,15 +193,25 @@ class LabService:
             rows.append({
                 "kind": "agent", "id": trace["id"], "at": trace.get("at", ""), "mode": "agent",
                 "session_id": trace.get("session_id", ""), "locale": trace.get("locale") or _guess_locale(message),
-                "question": _question(message), "tool_calls": response.get("tool_calls"),
+                "question": _question(message), "ask": question_of(message), **link_of(message),
+                "tool_calls": response.get("tool_calls"),
                 "warnings": _warning_codes(response.get("warnings")),
             })
         for row in store.recent():
             rows.append({
                 "kind": "evidence", "id": row["id"], "at": row["at"], "mode": "evidence",
                 "session_id": row["session_id"], "seq": row["seq"], "locale": _guess_locale(row["received"]),
-                "question": _question(row["received"]), "dropped": len(row.get("dropped") or []),
+                "question": _question(row["received"]), "ask": question_of(row["received"]), **link_of(row["received"]),
+                "dropped": len(row.get("dropped") or []),
             })
+        # 이어 묻기(「운영자 추가 질문」)는 증거팩이 없어 ID 가 안 보인다 — 같은 세션의 다른 기록에서 빌린다
+        by_session: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if row.get("event_id") and row.get("session_id"):
+                by_session.setdefault(row["session_id"], {k: row[k] for k in ("event_id", "unit", "root_code")})
+        for row in rows:
+            if not row.get("event_id") and row.get("session_id") in by_session:
+                row.update(by_session[row["session_id"]], link_from="session")
         rows.sort(key=lambda r: r["at"], reverse=True)
         return rows
 
@@ -349,6 +400,7 @@ class LabService:
                 "id": row["id"], "at": row["at"], "source_kind": row["source_kind"], "source_id": row["source_id"],
                 "mode": result.get("mode"), "locale": result.get("locale"),
                 "question": _question(row["request"].get("message") or ""),
+                "ask": question_of(row["request"].get("message") or ""), **link_of(row["request"].get("message") or ""),
                 "prompt_extra": _head(row["request"].get("prompt_extra") or "", 80),
                 "tool_calls": result.get("tool_calls"), "warnings": result.get("warnings"),
                 "error": (result.get("error") or {}).get("type"), "duration_ms": result.get("duration_ms"),

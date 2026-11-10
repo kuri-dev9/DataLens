@@ -73,6 +73,18 @@
   label.sw input:checked + span { color:var(--text); }
   label.sw span::after { content:"끔"; }
   label.sw input:checked + span::after { content:"켬"; }
+  /* 프롬프트 실험 목록·결과(2026-11-10 사용자: 날짜별로 접고, 장애와 잇고, 결과는 md 로) */
+  .lab-list { max-height:520px; overflow:auto; }
+  .lab-list details > summary { font-weight:600; }
+  .lab-row { display:flex; gap:6px; align-items:baseline; padding:3px 8px; cursor:pointer; border-radius:4px; font-size:12px; white-space:nowrap; overflow:hidden; }
+  .lab-row:hover { background:#232834; } .lab-row.on { background:rgba(91,156,245,.18); }
+  .lab-row .t { color:var(--dim); font-variant-numeric:tabular-nums; } .lab-row .q { overflow:hidden; text-overflow:ellipsis; }
+  .tag { font-size:11px; padding:0 6px; border-radius:8px; border:1px solid var(--line); color:var(--dim); }
+  .tag.ev { color:#c9a2f5; border-color:#6d4fa0; } .tag.none { opacity:.6; }
+  .md { font-size:13px; line-height:1.6; } .md h1,.md h2,.md h3,.md h4 { font-size:14px; margin:10px 0 4px; color:var(--text); }
+  .md table { margin:6px 0; } .md td, .md th { font-size:12px; } .md code { background:#0f1216; padding:0 4px; border-radius:3px; }
+  .md ul, .md ol { margin:4px 0; padding-left:20px; } .md p { margin:4px 0; }
+  table.steps td, table.steps th { font-size:12px; vertical-align:top; }
   .drop { text-decoration:line-through; color:var(--bad); background:rgba(220,60,60,.16); }
 </style>
 </head>
@@ -103,9 +115,9 @@
   <div id="lab-busy" class="hint"></div>
   <div class="split" style="grid-template-columns:minmax(380px,0.8fr) minmax(520px,1.2fr)">
     <div>
-      <section><h2>기록 고르기</h2><p class="lead">최근 전송 원문(일반, 최근 200건)과 RCA 응답 기록(200건)에서 하나를 고른다. 일반 질문은 2026-11-10 이후 질의부터 남는다.</p><div id="lab-sources"></div></section>
+      <section><h2>기록 고르기</h2><p class="lead">최근 전송 원문(일반, 최근 200건)과 RCA 응답 기록(200건)에서 하나를 고른다. 일반 질문은 2026-11-10 이후 질의부터 남는다.</p><div class="row" style="margin:0 0 6px"><input id="lab-filter" placeholder="장애·질문 거르기 (IX…, CHANGE_SUSPECTED, 앱…)" style="flex:1"><select id="lab-event"><option value="">모든 장애</option></select></div><div id="lab-sources" class="lab-list"></div></section>
       <section><h2>추가 지시 — 지금 실제 질의에 붙는 값</h2><p class="lead">시스템 지시문 끝에 붙는다. 모드×언어별로 따로다. 실험 결과에서 「추가 지시로 반영」을 누르면 여기 바뀌고 이력이 남는다.</p><div id="lab-extra-state"></div></section>
-      <section><h2>지난 실험</h2><p class="lead">실험 결과는 운영 기록·학습과 섞이지 않고 여기에만 남는다(최근 200건).</p><div id="lab-runs"></div></section>
+      <section><h2>지난 실험</h2><p class="lead">실험 결과는 운영 기록·학습과 섞이지 않고 여기에만 남는다(최근 200건).</p><div id="lab-runs" class="lab-list"></div></section>
     </div>
     <div>
       <section id="lab-edit"><h2>고치기</h2><p class="lead">기록을 고르면 실제로 보낸 원문이 칸별로 펼쳐진다.</p></section>
@@ -482,19 +494,54 @@ document.addEventListener("click", async (event) => {
 // 반영(추가 지시 저장)은 ②, 여러 건 같이 돌리기는 ③.
 let labSource = null, labBusyTimer = null, labLastRun = null, labExtraState = null;
 
+let labRows = [], labRunRows = [];
+const UNIT_LABEL = { PIECE: "조각", L1_BUNDLE: "L1 묶음", L2_EVENT: "L2 사건" };
+
+// 연결 장애 꼬리표 — graphio 원문에는 판정 단위의 대상 ID 가 실린다(조각이면 그 조각, L1·L2 는 핵 조각)
+function linkTag(r) {
+  if (!r.event_id) return `<span class="tag none">연결 없음</span>`;
+  const unit = UNIT_LABEL[r.unit] || "";
+  const who = r.unit && r.unit !== "PIECE" && r.event_id.startsWith("IX") ? `핵 ${r.event_id}` : r.event_id;
+  return `<span class="tag ev" title="${esc([unit, who, r.root_code].filter(Boolean).join(" · "))}">${esc([unit, who.slice(0, 12 + (who.startsWith("핵") ? 2 : 0)), r.root_code].filter(Boolean).join(" · "))}</span>`;
+}
+
+function shortAsk(r, n = 40) { const q = r.ask || r.question || ""; return q.length > n ? q.slice(0, n) + "…" : q; }
+
+// 날짜별 접는 목록. 최신 날짜가 위에 오고 그 날만 펼친다. 본문은 열지 않는다 — 누르면 가운데 편집칸에 열린다
+function grouped(rows, rowHtml) {
+  const days = {};
+  rows.forEach((r) => { (days[r.at.slice(0, 10)] = days[r.at.slice(0, 10)] || []).push(r); });
+  return Object.keys(days).sort().reverse().map((day, i) =>
+    `<details ${i === 0 ? "open" : ""}><summary>${esc(day)}<span class="n">${days[day].length}건</span></summary>${days[day].map(rowHtml).join("")}</details>`).join("");
+}
+
+function renderSourceList() {
+  const f = ($("lab-filter").value || "").trim().toLowerCase(), ev = $("lab-event").value;
+  const rows = labRows.filter((r) => (!ev || r.event_id === ev) &&
+    (!f || [r.event_id, r.root_code, r.unit, r.ask, r.question].some((x) => String(x || "").toLowerCase().includes(f))));
+  $("lab-sources").innerHTML = rows.length ? grouped(rows, (r) =>
+    `<div class="lab-row${labSource && labSource.kind === r.kind && String(labSource.id) === String(r.id) ? " on" : ""}" data-lab-src="${r.kind}/${r.id}" title="${esc(r.ask || r.question)}">
+      <span class="t">${esc(r.at.slice(11, 16))}</span><span class="tag">${MODE_LABEL[r.mode]} · ${r.locale}</span>${linkTag(r)}<span class="q">${esc(shortAsk(r))}</span>
+      ${r.warnings && r.warnings.length ? `<span class="warn">⚠</span>` : ""}</div>`)
+    : `<span class="hint">${labRows.length ? "거른 조건에 맞는 기록이 없다." : "아직 남은 기록이 없다."}</span>`;
+}
+
 async function renderLab() {
   await refreshBusy();
   const [src, runs] = await Promise.all([api("/v1/settings/lab/sources"), api("/v1/settings/lab/runs")]);
   await renderExtraState();
-  $("lab-sources").innerHTML = src.rows.length ? `<table><tr><th>시각</th><th>종류</th><th>질문</th><th></th></tr>${src.rows.map((r) =>
-    `<tr><td class="dim">${esc(r.at.replace("T", " ").slice(5, 19))}</td><td>${MODE_LABEL[r.mode]} · ${r.locale}</td>
-     <td>${esc(r.question)}${r.warnings && r.warnings.length ? ` <span class="warn">${esc(r.warnings.join(","))}</span>` : ""}</td>
-     <td><button class="small" data-lab-src="${r.kind}/${r.id}">열기</button></td></tr>`).join("")}</table>`
-    : `<span class="hint">아직 남은 기록이 없다.</span>`;
-  $("lab-runs").innerHTML = runs.rows.length ? `<table><tr><th>시각</th><th>질문</th><th>추가 지시</th><th>도구</th><th></th></tr>${runs.rows.map((r) =>
-    `<tr><td class="dim">${esc(r.at.replace("T", " ").slice(5, 19))}</td><td>${esc(r.question)}</td><td class="dim">${esc(r.prompt_extra || "—")}</td>
-     <td class="num">${r.error ? `<span class="bad">${esc(r.error)}</span>` : fmt(r.tool_calls)}</td>
-     <td><button class="small ghost" data-lab-run="${r.id}">보기</button></td></tr>`).join("")}</table>`
+  labRows = src.rows; labRunRows = runs.rows;
+  const events = {}; labRows.forEach((r) => { if (r.event_id) events[r.event_id] = r; });
+  const keep = $("lab-event").value;
+  $("lab-event").innerHTML = `<option value="">모든 장애</option>` + Object.values(events).map((r) =>
+    `<option value="${esc(r.event_id)}">${esc([UNIT_LABEL[r.unit], r.event_id, r.root_code].filter(Boolean).join(" · "))}</option>`).join("");
+  $("lab-event").value = keep;
+  renderSourceList();
+  $("lab-runs").innerHTML = labRunRows.length ? grouped(labRunRows, (r) =>
+    `<div class="lab-row" data-lab-run="${r.id}" title="${esc(r.ask || r.question)}">
+      <span class="t">#${r.id} ${esc(r.at.slice(11, 16))}</span>${linkTag(r)}<span class="q">${esc(shortAsk(r, 30))}</span>
+      ${r.prompt_extra ? `<span class="tag" title="${esc(r.prompt_extra)}">+지시</span>` : ""}
+      ${r.error ? `<span class="bad">${esc(r.error)}</span>` : `<span class="dim">도구 ${fmt(r.tool_calls)}</span>`}</div>`)
     : `<span class="hint">아직 실험이 없다.</span>`;
 }
 
@@ -521,19 +568,77 @@ function labEditor(d) {
     <div class="row"><button id="lab-run" data-lab-go="1">다시 보내기</button><span class="hint">한 번에 한 실험만 돈다. 20~200초 걸린다.</span></div>`;
 }
 
+// 작은 md 렌더러 — 제목·목록·표·굵게·코드. **먼저 전부 이스케이프하고** 그 위에 모양만 입힌다(모델 답에 HTML 이 와도 그대로 글자다)
+function mdInline(t) {
+  return t.replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>").replace(/(^|[^*])\*([^*\s][^*]*)\*/g, "$1<i>$2</i>");
+}
+function md(text) {
+  const lines = esc(text || "").split("\n"); const out = []; let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}/.test(lines[i + 1])) {
+      const cells = (l) => l.trim().replace(/^\||\|$/g, "").split("|").map((c) => mdInline(c.trim()));
+      const head = cells(line); i += 2; const body = [];
+      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) body.push(cells(lines[i++]));
+      out.push(`<table><tr>${head.map((c) => `<th>${c}</th>`).join("")}</tr>${body.map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join("")}</tr>`).join("")}</table>`);
+      continue;
+    }
+    const h = line.match(/^(#{1,4})\s+(.*)$/);
+    if (h) { out.push(`<h${h[1].length + 1}>${mdInline(h[2])}</h${h[1].length + 1}>`); i++; continue; }
+    if (/^\s*([-*•]|\d+[.)])\s+/.test(line)) {
+      const ordered = /^\s*\d+[.)]/.test(line); const items = [];
+      while (i < lines.length && /^\s*([-*•]|\d+[.)])\s+/.test(lines[i])) items.push(mdInline(lines[i++].replace(/^\s*([-*•]|\d+[.)])\s+/, "")));
+      out.push(`<${ordered ? "ol" : "ul"}>${items.map((x) => `<li>${x}</li>`).join("")}</${ordered ? "ol" : "ul"}>`);
+      continue;
+    }
+    if (!line.trim()) { i++; continue; }
+    const para = [];
+    while (i < lines.length && lines[i].trim() && !/^(#{1,4})\s/.test(lines[i]) && !/^\s*([-*•]|\d+[.)])\s+/.test(lines[i]) && !/^\s*\|.*\|\s*$/.test(lines[i])) para.push(mdInline(lines[i++]));
+    out.push(`<p>${para.join("<br>")}</p>`);
+  }
+  return `<div class="md">${out.join("")}</div>`;
+}
+
+// 도구 단계 한 줄 — 표·조건 요약을 인자에서 뽑는다
+function stepTable(a) {
+  if (!a || typeof a !== "object") return "";
+  const src = a.source && (typeof a.source.table === "object" ? a.source.table.name : a.source.table);
+  return src || a.table || a.from_table || a.name || a.name_pattern || a.dataset_id || "";
+}
+function stepCond(a) {
+  if (!a || typeof a !== "object") return "";
+  const parts = [];
+  const conds = (a.filters && (a.filters.all || [])) || [];
+  conds.forEach((c) => parts.push(`${c.column} ${c.operator} ${JSON.stringify(c.value)}`));
+  ((a.filters && a.filters.any_groups) || []).forEach((g) => parts.push("(" + (g || []).map((c) => `${c.column} ${c.operator} ${JSON.stringify(c.value)}`).join(" or ") + ")"));
+  const ps = a.partition_scope; if (ps && ps.from) parts.push(`${ps.column || "기간"} ${ps.from}~${ps.to || ""}`);
+  if (a.group_by) parts.push(`묶음 ${[].concat(a.group_by).join(",")}`);
+  (a.aggregations || []).forEach((g) => parts.push(`${g.function}(${g.column || "*"})${g.alias ? "→" + g.alias : ""}`));
+  if (a.select && !a.aggregations) parts.push("열 " + a.select.map((x) => x.column || x).join(","));
+  if (a.action) parts.unshift(a.action);
+  return parts.join("; ");
+}
+
 function labResult(r, title) {
-  if (!r) return `<div class="hint">—</div>`;
+  if (!r) return `<h3>${title}</h3><div class="hint">—</div>`;
   if (r.error && !r.answer) return `<h3>${title}</h3><div class="bad">${esc(r.error.type)}: ${esc(r.error.message)}</div>`;
-  const steps = (r.steps || []).map((s, i) => s.kind === "note" ? `<div class="dim">· ${esc(s.text)}</div>` :
-    `<details><summary>${i + 1}. ${esc(s.tool || "?")} ${s.ok === false ? `<span class="bad">${esc((s.error && s.error.code) || "실패")}</span>` : s.ok ? `<span class="ok">ok${s.row_count != null ? ` · ${fmt(s.row_count)}행` : ""}</span>` : ""}</summary>
-     <pre>인자 ${esc(JSON.stringify(s.arguments, null, 1))}${s.error ? `\n오류 ${esc(JSON.stringify(s.error))}` : ""}${s.aggregation_meaning ? `\n집계 ${esc(s.aggregation_meaning.join(" / "))}` : ""}${s.preview ? `\n미리보기 ${esc(JSON.stringify(s.preview))}` : ""}</pre></details>`).join("");
-  const dropped = (r.dropped || []).map((x) => `<div class="drop">${esc(x.line)} <span class="dim">(${esc(x.reason)})</span></div>`).join("");
+  const calls = (r.steps || []).filter((s) => s.kind !== "note");
+  const notes = (r.steps || []).filter((s) => s.kind === "note");
+  const table = calls.length ? `<table class="steps"><tr><th>#</th><th>도구</th><th>표</th><th>조건</th><th>행</th><th>오류</th><th>집계</th></tr>${calls.map((s, i) =>
+    `<tr><td>${i + 1}</td><td>${esc(s.tool || "?")}</td><td>${esc(stepTable(s.arguments))}</td><td>${esc(stepCond(s.arguments))}</td>
+     <td class="num">${s.row_count != null ? fmt(s.row_count) : s.ok ? "ok" : ""}</td>
+     <td>${s.ok === false ? `<span class="bad">${esc((s.error && s.error.code) || "실패")}</span>` : ""}</td>
+     <td class="dim">${esc((s.aggregation_meaning || []).join(" / "))}</td></tr>`).join("")}</table>` : `<div class="dim">도구 호출 없음</div>`;
+  const dropped = (r.dropped || []);
+  const sec = r.duration_ms != null ? (r.duration_ms / 1000).toFixed(1) + "초" : "—";
   return `<h3>${title}</h3>
-    <div class="dim">도구 ${fmt(r.tool_calls)}회 · ${r.duration_ms != null ? (r.duration_ms / 1000).toFixed(1) + "초" : "—"} · 입력 ${fmt(r.prompt_tokens)}토큰 · 출력 ${fmt(r.completion_tokens)}토큰${r.stop_reason ? " · " + esc(r.stop_reason) : ""}</div>
-    <div>경고 ${r.warnings && r.warnings.length ? `<span class="warn">${esc(r.warnings.join(", "))}</span>` : r.warnings_recorded === false ? `<span class="dim">기록 없음</span>` : "없음"}</div>
-    ${steps ? `<div style="margin-top:6px">${steps}</div>` : `<div class="dim">도구 호출 없음</div>`}
-    <pre style="border:1px solid var(--line);border-radius:6px;margin-top:8px">${esc(r.answer)}</pre>
-    ${dropped ? `<h3>검증에서 버려질 줄</h3>${dropped}` : ""}`;
+    <div class="dim">도구 ${fmt(r.tool_calls)}회 · ${sec} · 입력 ${fmt(r.prompt_tokens)} / 출력 ${fmt(r.completion_tokens)} 토큰${r.stop_reason ? " · " + esc(r.stop_reason) : ""}
+      · 경고 ${r.warnings && r.warnings.length ? `<span class="warn">${esc(r.warnings.join(", "))}</span>` : r.warnings_recorded === false ? "기록 없음" : "없음"}
+      ${r.dropped ? ` · 검증에서 버려질 줄 <span class="${dropped.length ? "bad" : ""}">${dropped.length}</span>` : ""}</div>
+    <div style="border:1px solid var(--line);border-radius:6px;padding:4px 12px;margin:8px 0">${md(r.answer)}</div>
+    ${table}${notes.length ? `<div class="dim" style="margin-top:4px">${notes.map((n) => "· " + esc(n.text)).join("<br>")}</div>` : ""}
+    ${dropped.length ? `<h3>검증에서 버려질 줄</h3>${dropped.map((x) => `<div class="drop">${esc(x.line)} <span class="dim">(${esc(x.reason)})</span></div>`).join("")}` : ""}
+    <details><summary>원본 JSON</summary><pre>${esc(JSON.stringify(r, null, 1))}</pre></details>`;
 }
 
 function labCompare(original, result) {
@@ -586,6 +691,7 @@ async function labRevert(id) {
 
 async function labOpen(ref) {
   labSource = await api(`/v1/settings/lab/sources/${ref}`);
+  renderSourceList();
   $("lab-edit").innerHTML = labEditor(labSource);
   labCompare(labSource.original, null);
   await refreshBusy();
@@ -615,8 +721,10 @@ async function labShowRun(id) {
   labCompare(original, run.result);
 }
 
+document.addEventListener("input", (event) => { if (event.target.id === "lab-filter") renderSourceList(); });
+document.addEventListener("change", (event) => { if (event.target.id === "lab-event") renderSourceList(); });
 document.addEventListener("click", async (event) => {
-  const el = event.target;
+  const el = event.target.closest ? (event.target.closest("[data-lab-src],[data-lab-run]") || event.target) : event.target;
   try {
     if (el.dataset.labSrc) await labOpen(el.dataset.labSrc);
     else if (el.dataset.labGo) await labGo();
