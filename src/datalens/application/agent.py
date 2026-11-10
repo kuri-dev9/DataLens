@@ -88,6 +88,44 @@ _LINEAGE_LIMIT = 8
 # notice의 응답 크기 추정치("~120 KB")나 next_page의 페이징 인자(count/offset)를
 # 근거로 인정하면 ADR-034 계측이 느슨해진다.
 _NON_FACT_KEYS = frozenset({"notice", "next_page"})
+# 집계 결과 열의 실제 계산식(2026-11-10). 모델은 자기가 붙인 별칭으로 값의 뜻을 짐작한다 — graphio 23번에서
+# `count` 를 `fail_cnt` 로 받고 행 수 4,257 을 "MME 접속 실패 4,257건"이라 답했다(실제 실패 0).
+# 별칭이 아니라 무엇을 셌는지를 결과 옆에 적는다. 표·사건과 무관한 일반 문구만 둔다.
+_AGG_MEANING = {
+    "count": "COUNT({c}) — number of rows with non-null {c}",
+    "count_distinct": "COUNT(DISTINCT {c}) — number of distinct {c} values",
+    "sum": "SUM({c}) — total of column {c}",
+    "mean": "AVG({c}) — average of {c} over rows (not a ratio of sums)",
+    "min": "MIN({c})",
+    "max": "MAX({c})",
+    "stddev": "STDDEV({c})",
+    "variance": "VARIANCE({c})",
+}
+_COUNT_ROWS = ("COUNT(*) — number of rows matching the filters (a row count, not an event/failure count; "
+               "for event totals sum the count column)")
+
+
+def _aggregation_meaning(arguments: dict[str, Any]) -> list[str]:
+    """query 인자의 집계마다 `별칭 = 계산식` 한 줄. 집계가 없으면 빈 목록."""
+    lines: list[str] = []
+    for item in arguments.get("aggregations") or ():
+        if not isinstance(item, dict) or not item.get("function"):
+            continue
+        fn, col = str(item["function"]), item.get("column")
+        if fn == "count" and not col:
+            text = _COUNT_ROWS
+        else:
+            text = _AGG_MEANING.get(fn, f"{fn.upper()}({{c}})").format(c=col or "*")
+        where = item.get("where")
+        if isinstance(where, dict) and where.get("column"):
+            text += f"; only rows where {where['column']} {where.get('operator', '')} {json.dumps(where.get('value'), ensure_ascii=False, default=str)}"
+        alias = item.get("alias") or f"{fn}_{col or 'rows'}"
+        lines.append(f"{alias} = {text}")
+    group_by = arguments.get("group_by")
+    if lines and group_by:
+        keys = ", ".join(group_by) if isinstance(group_by, list) else str(group_by)
+        lines.append(f"one value per group of ({keys})")
+    return lines
 # 도구 정의 lazy 모드의 메타 도구(2026-11-04). QueryForge 도구가 아니다 — DataLens 가 직접 답한다.
 TOOL_SPEC_NAME = "get_tool_spec"
 # 빈 출력이 재시도 뒤에도 이어질 때 도구 없이 한 번 더 부르며 붙이는 지시(2026-11-08).
@@ -833,6 +871,11 @@ class BoundedAgent:
                         # 근거 수집 뒤에 붙인다 — 고친 자리의 색인 숫자가 근거로 잡히면 안 된다.
                         # 모델에 알려 다음 호출부터 바른 모양을 쓰게 한다.
                         bounded["arguments_normalized"] = list(fixes)
+                    if call.name == "query":
+                        # 근거 수집 뒤에 붙인다 — 조건 값(where)의 숫자가 근거로 잡히면 안 된다
+                        meaning = _aggregation_meaning(tool_arguments)
+                        if meaning:
+                            bounded["aggregation_meaning"] = meaning
                     if event_sink is not None:
                         await event_sink(
                             "tool_call",
