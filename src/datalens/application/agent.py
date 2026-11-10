@@ -665,6 +665,19 @@ class BoundedAgent:
                         active_period,
                         tuple(expanded),
                     )
+                    if (structured_retry is not None and structured_retry.get("ok") is True
+                            and not structured_retry.get("queries_ok")):
+                        # 강제 조회는 실행됐지만(거름 확인 통과) 그 뒤 query 가 하나도 성공하지 못했다(2026-11-10 ·
+                        # graphio 22번 「영향 받은 앱」 `dlr_uJOPK8…` — UNKNOWN_COLUMN 두 번). 경고가 `STRUCTURED_RETRY`
+                        # 그대로면 graphio 가 "위 답은 그 조회를 거쳐 나온 것"이라고 적는다(불변규칙 18). 실행하지 않은
+                        # `_DROPPED` 와 구분해 사실대로 둔다 — 답은 조회 결과가 아니다
+                        for w in warnings:
+                            if w.get("code") == "DATALENS_STRUCTURED_RETRY":
+                                w.update({"code": "DATALENS_STRUCTURED_RETRY_FAILED", "action": "structured_query_failed",
+                                          "detail": "asked once for the query arguments as constrained JSON and ran them, "
+                                                    "but no query after that succeeded "
+                                                    f"(failed {int(structured_retry.get('queries_failed') or 0)})"})
+                        structured_retry["result"] = "failed"
                     return AgentResult(
                         answer=answer,
                         grounding=safe_measure(answer, facts),
@@ -772,6 +785,10 @@ class BoundedAgent:
                         # 턴이 끝나기 전에도 dataset을 조회할 수 있도록 즉시 알린다.
                         await event_sink(QUERYFORGE_SESSION_EVENT, {"application_session_id": qf_session_id})
                     elapsed_ms = int((time.monotonic() - tool_started) * 1000)
+                    if call.name == "query" and structured_retry is not None and structured_retry.get("ok") is True:
+                        # 강제 조회 이후의 query 결과를 센다 — 하나도 성공하지 못하면 경고를 `_FAILED` 로 바꾼다(아래 반환 전)
+                        key = "queries_ok" if result.ok else "queries_failed"
+                        structured_retry[key] = int(structured_retry.get(key) or 0) + 1
                     if not result.ok:
                         failure = self._failure_of(result)
                         step["upstream_code"] = failure.code
