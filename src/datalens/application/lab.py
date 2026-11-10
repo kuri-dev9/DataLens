@@ -29,12 +29,10 @@ from typing import Any
 
 from datalens.application import answer_style, ask_check
 from datalens.application.agent import AgentError
-from datalens.application.runtime_config import HISTORY_STORE_LIMIT, MODES, RuntimeConfig
+from datalens.application.runtime_config import HISTORY_STORE_LIMIT, MODES, PROMPT_EXTRA_MAX_CHARS, RuntimeConfig
 from datalens.application.trace import blocks
 from datalens.prompts import load_system_prompt
 
-# 추가 지시 한 칸의 상한 — 초기값. 지시문 실험이 맥락 창을 잡아먹지 않게 한다
-PROMPT_EXTRA_MAX_CHARS = 2000
 # 도구 결과 미리보기 행 수 — 비교 화면에서 "무엇을 받았나"만 보이면 된다
 STEP_PREVIEW_ROWS = 3
 _KANA = re.compile(r"[぀-ヿ]")
@@ -198,6 +196,7 @@ class LabService:
                 "stop_reason": response.get("stop_reason"),
             }
             return {"kind": kind, "id": source_id, "at": trace.get("at"), "mode": "agent", "locale": locale,
+                    "prompt_extra_saved": self._saved_extra("agent", locale),
                     "session_id": trace.get("session_id"), "system_prompt": system, "history": history,
                     "message": message, "settings": trace.get("settings"), "original": original,
                     "note": "세션 맥락(데이터셋 계보)은 새 임시 세션 기준으로 다시 만든다 — 원래 세션과 다를 수 있다"}
@@ -214,11 +213,18 @@ class LabService:
                 "verdict_from": row.get("verdict_from"), "steps": [], "warnings": [], "warnings_recorded": False,
             }
             return {"kind": kind, "id": source_id, "at": row["at"], "mode": "evidence", "locale": locale,
+                    "prompt_extra_saved": self._saved_extra("evidence", locale),
                     "session_id": row["session_id"], "system_prompt": load_system_prompt(locale, "evidence"),
                     "history": history[-HISTORY_STORE_LIMIT:], "message": row["received"], "original": original,
                     "note": "받은 원문은 [답변 형식] 을 바꿔 끼우기 전 것이다 — 다시 보낼 때 지금 답변 형식 설정으로 바꿔 끼운다. "
                             "이전 문답은 같은 세션의 앞 기록(받은 원문·모델 원답)으로 다시 채운다"}
         raise LabError("kind 는 agent | evidence")
+
+    def _saved_extra(self, mode: str, locale: str) -> str:
+        # 지금 실제 질의에 붙는 추가 지시 — 실험 칸의 시작값이다(실험은 이 칸을 통째로 바꿔 보낸다)
+        if self._runtime is None:
+            return ""
+        return self._runtime.prompt_extra()["current"].get(mode, {}).get(locale, "")
 
     # ── 다시 보내기 ──────────────────────────────────────────────────────
     async def run(self, request: dict[str, Any], deadline: float) -> dict[str, Any]:

@@ -1101,6 +1101,53 @@ def build_app(
             return error_response(request, "DL_LAB_RUN_NOT_FOUND", "No such lab run", 404)
         return JSONResponse(found)
 
+    # ── 추가 지시 반영·이력·되돌리기(프롬프트 실험 ②) ──────────────────────────
+    async def prompt_extra(request: Request) -> JSONResponse:
+        if runtime_config is None:
+            return runtime_unavailable(request)
+        if request.method == "GET":
+            return JSONResponse(runtime_config.prompt_extra())
+        try:
+            body = await request.json()
+        except ValueError:
+            return invalid_request(request, "Invalid prompt extra request", None)
+        if not isinstance(body, dict):
+            return invalid_request(request, "Invalid prompt extra request", None)
+        source_run = body.get("source_run")
+        if source_run is not None and (isinstance(source_run, bool) or not isinstance(source_run, int)):
+            return error_response(request, "DL_INVALID_SETTINGS", "source_run must be an integer", 400)
+        try:
+            entry = runtime_config.set_prompt_extra(
+                body.get("mode"), body.get("locale"), body.get("text"), source_run=source_run,
+                at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            )
+        except RuntimeConfigError as exc:
+            return error_response(request, "DL_INVALID_SETTINGS", str(exc), 400)
+        LOG.info("prompt_extra_updated", extra={"request_id": request.state.request_id, "operation": "prompt_extra",
+                                                "status": "completed" if entry else "unchanged"})
+        return JSONResponse({**runtime_config.prompt_extra(), "applied": entry})
+
+    async def prompt_extra_revert(request: Request) -> JSONResponse:
+        if runtime_config is None:
+            return runtime_unavailable(request)
+        try:
+            body = await request.json()
+        except ValueError:
+            return invalid_request(request, "Invalid revert request", None)
+        history_id = body.get("history_id") if isinstance(body, dict) else None
+        if isinstance(history_id, bool) or not isinstance(history_id, int):
+            return error_response(request, "DL_INVALID_SETTINGS", "history_id must be an integer", 400)
+        try:
+            entry = runtime_config.revert_prompt_extra(history_id, at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+        except RuntimeConfigError as exc:
+            # 없는 이력 번호만 404 — 저장 실패 등은 400 으로 사유를 그대로 보인다
+            if str(exc) == "unknown history id":
+                return error_response(request, "DL_PROMPT_EXTRA_HISTORY_NOT_FOUND", str(exc), 404)
+            return error_response(request, "DL_INVALID_SETTINGS", str(exc), 400)
+        LOG.info("prompt_extra_reverted", extra={"request_id": request.state.request_id, "operation": "prompt_extra",
+                                                 "status": "completed" if entry else "unchanged"})
+        return JSONResponse({**runtime_config.prompt_extra(), "applied": entry})
+
     async def settings_ui(_: Request) -> Response:
         # 화면 자체는 인증 없이 내려준다. 화면이 부르는 /v1/settings 는 x-api-key 가 필요하다.
         from importlib.resources import files
@@ -1117,6 +1164,8 @@ def build_app(
         Route("/v1/settings/history", settings_history, methods=["GET"]),
         Route("/v1/settings/answer-style", settings_answer_style, methods=["GET", "PUT"]),
         Route("/v1/settings/preview", settings_preview, methods=["POST"]),
+        Route("/v1/settings/prompt-extra", prompt_extra, methods=["GET", "PUT"]),
+        Route("/v1/settings/prompt-extra/revert", prompt_extra_revert, methods=["POST"]),
         Route("/v1/settings/lab/busy", lab_busy, methods=["GET"]),
         Route("/v1/settings/lab/sources", lab_sources, methods=["GET"]),
         Route("/v1/settings/lab/sources/{kind:str}/{source_id:int}", lab_source, methods=["GET"]),

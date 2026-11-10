@@ -113,6 +113,12 @@ _PARAM_RANGES: dict[str, tuple[float, float]] = {
 }
 
 
+# 추가 지시(시스템 지시문 끝에 붙는 문장) — 모드×언어 한 칸의 상한과 이력 보관 수. 둘 다 초기값(2026-11-10)
+PROMPT_EXTRA_MAX_CHARS = 2000
+PROMPT_EXTRA_HISTORY_LIMIT = 20
+LOCALES = ("ko", "ja")
+
+
 class RuntimeConfigError(ValueError):
     pass
 
@@ -158,6 +164,11 @@ class RuntimeConfig:
         self._last_turn: dict[str, dict[str, Any]] = {}
         # evidence 답의 형식·길이 — graphio `[답변 형식]` 구역을 바꿔 끼울 값(answer_style.py)
         self._answer_style: dict[str, Any] = dict(answer_style.DEFAULTS)
+        # 추가 지시 — 프롬프트 실험에서 고른 문장을 반영하는 자리(2026-11-10 ②). 기본 지시문 파일은 고치지 않는다.
+        # 언어별로 따로 둔다(사용자 결정) — 일본 PoC 는 ja 가 운영이라 ko 실험 문장이 넘어가면 안 된다
+        self._prompt_extra: dict[str, dict[str, str]] = {mode: {loc: "" for loc in LOCALES} for mode in MODES}
+        # 반영·되돌리기 이력(최신이 뒤). 되돌리기도 한 항목으로 남는다
+        self._prompt_extra_history: list[dict[str, Any]] = []
         self._load()
 
     # ── 조회 ──────────────────────────────────────────────────────────
@@ -169,7 +180,9 @@ class RuntimeConfig:
             override = deepcopy(self._overrides[mode])
         context = {**_CONTEXT_DEFAULTS[mode], **override["context"]}
         params = {key: override["params"].get(key, self._base_param(key, mode)) for key in _PARAM_FIELDS}
-        return Profile(mode=mode, params=params, **context)
+        with self._lock:
+            extra = {loc: text for loc, text in self._prompt_extra[mode].items() if text}
+        return Profile(mode=mode, params=params, prompt_extra=extra, **context)
 
     def describe(self) -> dict[str, Any]:
         """화면용 — 값마다 실효값과 출처(default | env | ui)를 단다."""
@@ -205,6 +218,7 @@ class RuntimeConfig:
             "path": self._path,
             "persisted": bool(self._path),
             "history_store_limit": HISTORY_STORE_LIMIT,
+            "prompt_extra": self.prompt_extra()["current"],
         }
 
     # ── 변경 ──────────────────────────────────────────────────────────
@@ -252,9 +266,66 @@ class RuntimeConfig:
         self._save(snapshot)
         return deepcopy(style)
 
+    # ── 추가 지시(프롬프트 실험 ②) ────────────────────────────────────────
+
+    def prompt_extra(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "current": deepcopy(self._prompt_extra),
+                "history": deepcopy(list(reversed(self._prompt_extra_history))),
+                "max_chars": PROMPT_EXTRA_MAX_CHARS,
+                "history_limit": PROMPT_EXTRA_HISTORY_LIMIT,
+            }
+
+    @staticmethod
+    def _check_prompt_extra(mode: Any, locale: Any, text: Any) -> str:
+        if mode not in MODES:
+            raise RuntimeConfigError(f"unknown mode: {mode}")
+        if locale not in LOCALES:
+            raise RuntimeConfigError("locale must be ko | ja")
+        if not isinstance(text, str):
+            raise RuntimeConfigError("text must be a string")
+        text = text.strip()
+        if len(text) > PROMPT_EXTRA_MAX_CHARS:
+            raise RuntimeConfigError(f"text must be at most {PROMPT_EXTRA_MAX_CHARS} chars")
+        return text
+
+    def set_prompt_extra(
+        self, mode: Mode, locale: str, text: str, *, source_run: int | None = None, at: str = "",
+        action: str = "set", reverted_from: int | None = None,
+    ) -> dict[str, Any]:
+        """그 모드×언어 칸을 바꾸고 이력 한 항목을 남긴다. 값이 같으면 아무것도 남기지 않는다(None 반환)."""
+        text = self._check_prompt_extra(mode, locale, text)
+        with self._lock:
+            before = self._prompt_extra[mode][locale]
+            if before == text:
+                return None  # type: ignore[return-value]
+            entry = {
+                "id": max((item["id"] for item in self._prompt_extra_history), default=0) + 1,
+                "at": at, "mode": mode, "locale": locale, "action": action,
+                "before": before, "after": text, "source_run": source_run,
+                **({"reverted_from": reverted_from} if reverted_from is not None else {}),
+            }
+            self._prompt_extra[mode][locale] = text
+            self._prompt_extra_history = [*self._prompt_extra_history, entry][-PROMPT_EXTRA_HISTORY_LIMIT:]
+            snapshot = self._snapshot()
+        self._save(snapshot)
+        return deepcopy(entry)
+
+    def revert_prompt_extra(self, history_id: int, at: str = "") -> dict[str, Any] | None:
+        """이력 한 항목을 그 반영 전 값으로 되돌린다. 되돌린 것도 이력에 남는다. 값이 이미 같으면 None."""
+        with self._lock:
+            found = next((item for item in self._prompt_extra_history if item["id"] == history_id), None)
+        if found is None:
+            raise RuntimeConfigError("unknown history id")
+        return self.set_prompt_extra(found["mode"], found["locale"], found["before"], at=at,
+                                     action="revert", reverted_from=history_id)
+
     def _snapshot(self) -> dict[str, Any]:
-        # 호출자가 잠금을 쥐고 부른다. 모드 키 옆에 answer_style 을 함께 저장한다
-        return {**deepcopy(self._overrides), "answer_style": deepcopy(self._answer_style)}
+        # 호출자가 잠금을 쥐고 부른다. 모드 키 옆에 answer_style·추가 지시를 함께 저장한다
+        return {**deepcopy(self._overrides), "answer_style": deepcopy(self._answer_style),
+                "prompt_extra": deepcopy(self._prompt_extra),
+                "prompt_extra_history": deepcopy(self._prompt_extra_history)}
 
     def record_turn(self, mode: Mode, summary: dict[str, Any]) -> None:
         with self._lock:
@@ -328,6 +399,19 @@ class RuntimeConfig:
                     "context": {k: v for k, v in context.items() if v is not None},
                     "params": {k: v for k, v in params.items() if v is not None},
                 }
+            if isinstance(stored.get("prompt_extra"), dict):
+                for mode in MODES:
+                    for loc in LOCALES:
+                        value = (stored["prompt_extra"].get(mode) or {}).get(loc, "")
+                        try:
+                            self._prompt_extra[mode][loc] = self._check_prompt_extra(mode, loc, value)
+                        except RuntimeConfigError:
+                            LOG.warning("prompt_extra_load_failed", extra={"status": "failed", "error_code": "invalid"})
+            if isinstance(stored.get("prompt_extra_history"), list):
+                self._prompt_extra_history = [
+                    item for item in stored["prompt_extra_history"]
+                    if isinstance(item, dict) and isinstance(item.get("id"), int)
+                ][-PROMPT_EXTRA_HISTORY_LIMIT:]
             if isinstance(stored.get("answer_style"), dict):
                 try:
                     self._answer_style = answer_style.check(stored["answer_style"])

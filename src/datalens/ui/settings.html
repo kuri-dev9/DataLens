@@ -104,6 +104,7 @@
   <div class="split" style="grid-template-columns:minmax(380px,0.8fr) minmax(520px,1.2fr)">
     <div>
       <section><h2>기록 고르기</h2><p class="lead">최근 전송 원문(일반, 최근 200건)과 RCA 응답 기록(200건)에서 하나를 고른다. 일반 질문은 2026-11-10 이후 질의부터 남는다.</p><div id="lab-sources"></div></section>
+      <section><h2>추가 지시 — 지금 실제 질의에 붙는 값</h2><p class="lead">시스템 지시문 끝에 붙는다. 모드×언어별로 따로다. 실험 결과에서 「추가 지시로 반영」을 누르면 여기 바뀌고 이력이 남는다.</p><div id="lab-extra-state"></div></section>
       <section><h2>지난 실험</h2><p class="lead">실험 결과는 운영 기록·학습과 섞이지 않고 여기에만 남는다(최근 200건).</p><div id="lab-runs"></div></section>
     </div>
     <div>
@@ -479,11 +480,12 @@ document.addEventListener("click", async (event) => {
 // ── 프롬프트 실험 ①(2026-11-10) — /v1/settings/lab/* ────────────────────────
 // 고른 기록의 원문을 칸별로 고쳐 실제 흐름(agent.run)으로 다시 돌리고 원래 결과와 나란히 본다.
 // 반영(추가 지시 저장)은 ②, 여러 건 같이 돌리기는 ③.
-let labSource = null, labBusyTimer = null;
+let labSource = null, labBusyTimer = null, labLastRun = null, labExtraState = null;
 
 async function renderLab() {
   await refreshBusy();
   const [src, runs] = await Promise.all([api("/v1/settings/lab/sources"), api("/v1/settings/lab/runs")]);
+  await renderExtraState();
   $("lab-sources").innerHTML = src.rows.length ? `<table><tr><th>시각</th><th>종류</th><th>질문</th><th></th></tr>${src.rows.map((r) =>
     `<tr><td class="dim">${esc(r.at.replace("T", " ").slice(5, 19))}</td><td>${MODE_LABEL[r.mode]} · ${r.locale}</td>
      <td>${esc(r.question)}${r.warnings && r.warnings.length ? ` <span class="warn">${esc(r.warnings.join(","))}</span>` : ""}</td>
@@ -510,8 +512,8 @@ function labEditor(d) {
   return `<h2>고치기 — ${MODE_LABEL[d.mode]} · ${d.locale} · ${esc((d.at || "").replace("T", " ").slice(0, 19))}</h2>
     <p class="lead">${esc(d.note || "")}</p>
     <details><summary>시스템 지시문 (읽기만)<span class="n">${fmt(d.system_prompt.length)}자</span></summary><pre>${esc(d.system_prompt)}</pre></details>
-    <h3>추가 지시 — 시스템 지시문 끝에 붙는다(${d.locale}). 이번 실험에만 쓰고 저장하지 않는다</h3>
-    <textarea id="lab-extra" placeholder="예: 앱 분류(PAY 등)와 앱 이름은 다르다. 앱 이름을 물으면 앱 표를 조회한다."></textarea>
+    <h3>추가 지시 — 시스템 지시문 끝에 붙는다(${MODE_LABEL[d.mode]} · ${d.locale}). 지금 저장된 값으로 시작한다 — 이번 실험은 이 칸 그대로 보낸다(비우면 추가 지시 없이)</h3>
+    <textarea id="lab-extra" placeholder="예: 앱 분류(PAY 등)와 앱 이름은 다르다. 앱 이름을 물으면 앱 표를 조회한다.">${esc(d.prompt_extra_saved || "")}</textarea>
     <h3>이전 문답 ${d.history.length ? "— 체크를 풀면 빼고 보낸다" : "— 없음"}</h3>${hist}
     <h3>이번 메시지 — graphio 맥락·질문. 고쳐서 실험할 수 있다(이 칸은 graphio 코드라 반영 대상이 아니다)</h3>
     <textarea id="lab-message" style="min-height:220px">${esc(d.message)}</textarea>
@@ -535,8 +537,51 @@ function labResult(r, title) {
 }
 
 function labCompare(original, result) {
+  const apply = result && labLastRun ? `<div class="row"><button data-lab-apply="1">추가 지시로 반영</button>
+    <span class="hint">실험 #${labLastRun.id}의 추가 지시를 ${MODE_LABEL[labLastRun.mode]} · ${labLastRun.locale} 칸에 저장한다. 저장 전에 바뀌는 내용을 보여 준다</span></div><div id="lab-apply-box"></div>` : "";
   $("lab-compare").innerHTML = `<h2>비교</h2><div class="grid" style="grid-template-columns:1fr 1fr">
-    <div>${labResult(original, "원래 결과")}</div><div>${labResult(result, "새 결과")}</div></div>`;
+    <div>${labResult(original, "원래 결과")}</div><div>${labResult(result, "새 결과")}</div></div>${apply}`;
+}
+
+// ── ② 반영·이력·되돌리기 ─────────────────────────────────────────
+async function renderExtraState() {
+  labExtraState = await api("/v1/settings/prompt-extra");
+  const cur = labExtraState.current;
+  const cells = Object.keys(cur).flatMap((mode) => ["ko", "ja"].map((loc) =>
+    `<tr><td>${MODE_LABEL[mode]} · ${loc}</td><td>${cur[mode][loc] ? `<pre style="border:0;padding:0;max-height:120px">${esc(cur[mode][loc])}</pre>` : `<span class="dim">없음</span>`}</td></tr>`)).join("");
+  const hist = labExtraState.history.map((h) => `<tr><td class="dim">#${h.id} ${esc((h.at || "").replace("T", " ").slice(5, 19))}</td>
+    <td>${MODE_LABEL[h.mode]} · ${h.locale}</td>
+    <td>${h.action === "revert" ? `되돌림(#${h.reverted_from})` : `반영${h.source_run ? ` · 실험 #${h.source_run}` : ""}`}</td>
+    <td><span class="drop">${esc(h.before ? h.before.slice(0, 40) : "(없음)")}</span> → ${esc(h.after ? h.after.slice(0, 40) : "(없음)")}</td>
+    <td><button class="small ghost" data-extra-revert="${h.id}" title="이 항목 전 값으로 되돌린다">되돌리기</button></td></tr>`).join("");
+  $("lab-extra-state").innerHTML = `<table>${cells}</table>
+    <h3>이력 (최근 ${labExtraState.history_limit}건)</h3>${hist ? `<table>${hist}</table>` : `<span class="hint">아직 없다.</span>`}`;
+}
+
+function labApplyPreview() {
+  const r = labLastRun; if (!r || !labExtraState) return;
+  const before = labExtraState.current[r.mode][r.locale] || "";
+  const after = (r.prompt_extra || "").trim();
+  $("lab-apply-box").innerHTML = before === after
+    ? `<div class="hint">저장된 값과 같다 — 바꿀 것이 없다.</div>`
+    : `<div class="grid" style="grid-template-columns:1fr 1fr;margin-top:8px">
+        <div><h3>지금 (${MODE_LABEL[r.mode]} · ${r.locale})</h3><pre class="drop" style="border:1px solid var(--line)">${esc(before || "(없음)")}</pre></div>
+        <div><h3>반영 후</h3><pre style="border:1px solid var(--ok)">${esc(after || "(없음 — 추가 지시를 지운다)")}</pre></div></div>
+       <div class="row"><button data-lab-apply-ok="1">이대로 저장</button><span class="hint warn">저장하면 다음 실제 질의부터 붙는다. 한 건만 보고 반영하면 다른 질문을 망칠 수 있다 — 다른 기록 몇 건에도 돌려 본 뒤 저장하길 권한다</span></div>`;
+}
+
+async function labApply() {
+  const r = labLastRun;
+  const res = await api("/v1/settings/prompt-extra", "PUT", { mode: r.mode, locale: r.locale, text: r.prompt_extra || "", source_run: r.id });
+  msg(res.applied ? `추가 지시를 저장했다(이력 #${res.applied.id})` : "바뀐 것이 없다", "ok");
+  $("lab-apply-box").innerHTML = ""; await renderExtraState();
+}
+
+async function labRevert(id) {
+  const h = labExtraState && labExtraState.history.find((x) => String(x.id) === String(id));
+  if (h && !confirm(`${MODE_LABEL[h.mode]} · ${h.locale} 추가 지시를 #${h.id} 전 값으로 되돌린다:\n\n${h.before || "(없음)"}`)) return;
+  const res = await api("/v1/settings/prompt-extra/revert", "POST", { history_id: Number(id) });
+  msg(res.applied ? `되돌렸다(이력 #${res.applied.id})` : "이미 그 값이다", "ok"); await renderExtraState();
 }
 
 async function labOpen(ref) {
@@ -556,6 +601,7 @@ async function labGo() {
   clearInterval(labBusyTimer); labBusyTimer = setInterval(() => refreshBusy().catch(() => {}), 5000);
   try {
     const ran = await api("/v1/settings/lab/runs", "POST", body);
+    labLastRun = { id: ran.id, mode: body.mode, locale: body.locale, prompt_extra: body.prompt_extra };
     labCompare(labSource.original, ran.result); msg(`실험 #${ran.id} 끝`, "ok");
     await renderLab();
   } finally { clearInterval(labBusyTimer); await refreshBusy().catch(() => {}); }
@@ -563,6 +609,7 @@ async function labGo() {
 
 async function labShowRun(id) {
   const run = await api(`/v1/settings/lab/runs/${id}`);
+  labLastRun = { id: run.id, mode: run.request.mode, locale: run.request.locale, prompt_extra: run.request.prompt_extra };
   let original = null;
   try { const src = await api(`/v1/settings/lab/sources/${run.source_kind}/${run.source_id}`); original = src.original; } catch (_) { /* 원래 기록이 밀려났다 */ }
   labCompare(original, run.result);
@@ -574,6 +621,9 @@ document.addEventListener("click", async (event) => {
     if (el.dataset.labSrc) await labOpen(el.dataset.labSrc);
     else if (el.dataset.labGo) await labGo();
     else if (el.dataset.labRun) await labShowRun(el.dataset.labRun);
+    else if (el.dataset.labApply) { if (!labExtraState) await renderExtraState(); labApplyPreview(); }
+    else if (el.dataset.labApplyOk) await labApply();
+    else if (el.dataset.extraRevert) await labRevert(el.dataset.extraRevert);
   } catch (err) { msg(String(err.message || err), "bad"); }
 });
 if ($("key").value) $("load").click();
