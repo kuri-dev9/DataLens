@@ -143,7 +143,7 @@ def _result_summary(content: str) -> dict[str, Any]:
     out: dict[str, Any] = {"ok": body.get("ok")}
     if error:
         out["error"] = {k: error.get(k) for k in ("code", "message", "detail", "hint", "fix") if error.get(k)}
-    for key in ("row_count", "notice", "aggregation_meaning", "arguments_normalized", "table"):
+    for key in ("row_count", "notice", "aggregation_meaning", "scope_note", "arguments_normalized", "table"):
         if body.get(key) is not None:
             out[key] = body[key]
     if isinstance(body.get("preview"), list):

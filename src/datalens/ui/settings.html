@@ -628,7 +628,7 @@ function labResult(r, title) {
     `<tr><td>${i + 1}</td><td>${esc(s.tool || "?")}</td><td>${esc(stepTable(s.arguments))}</td><td>${esc(stepCond(s.arguments))}</td>
      <td class="num">${s.row_count != null ? fmt(s.row_count) : s.ok ? "ok" : ""}</td>
      <td>${s.ok === false ? `<span class="bad">${esc((s.error && s.error.code) || "실패")}</span>` : ""}</td>
-     <td class="dim">${esc((s.aggregation_meaning || []).join(" / "))}</td></tr>`).join("")}</table>` : `<div class="dim">도구 호출 없음</div>`;
+     <td class="dim">${esc((s.aggregation_meaning || []).join(" / "))}${s.scope_note ? `<div class="warn">범위: ${esc(s.scope_note)}</div>` : ""}</td></tr>`).join("")}</table>` : `<div class="dim">도구 호출 없음</div>`;
   const dropped = (r.dropped || []);
   const sec = r.duration_ms != null ? (r.duration_ms / 1000).toFixed(1) + "초" : "—";
   return `<h3>${title}</h3>

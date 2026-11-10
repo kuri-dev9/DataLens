@@ -7,7 +7,7 @@ import time
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
@@ -275,6 +275,99 @@ def _missing_targets(message: str, arguments: Any) -> list[str]:
         if not (has(("ENB",), enb) and has(("CELL",), cell)):
             missing.append(f"{enb}-{cell}")
     return missing
+
+
+# graphio 사건 맥락의 「조회 범위(이 판정 단위): 시각 창 T0 ~ T1(끝 포함) · Core 노드 SGW-5 · eNB 123, 456」 줄
+# (graphio rca/llm.py `context_lines`). eNB 가 많으면 「eNB 45곳(목록이 길어 싣지 않음)」으로 개수만 온다
+_SCOPE_LINE_RE = re.compile(r"조회 범위\(이 판정 단위\):\s*([^\n]+)")
+_SCOPE_WINDOW_RE = re.compile(r"시각 창 (\S+) ~ (\S+?)\(끝 포함\)")
+_SCOPE_ENBS_RE = re.compile(r"eNB ((?:\d+)(?:,\s*\d+)*)(?=\s*(?:·|$))")
+#: 조회 창이 사건 창에서 이만큼(분) 넘게 벗어나면 적는다 — 초기값. 사건 창은 분 단위로 잘려 있어 몇 분 차는 같은 창이다
+SCOPE_WINDOW_SLACK_MINUTES = 5
+
+
+def _incident_scope(message: str) -> dict[str, Any] | None:
+    """메시지의 사건 조회 범위 — 없으면 None(사건을 보지 않는 질문)."""
+    found = _SCOPE_LINE_RE.findall(message or "")
+    if not found:
+        return None
+    line = found[-1]
+    window = _SCOPE_WINDOW_RE.search(line)
+    enbs = _SCOPE_ENBS_RE.search(line)
+    return {
+        "window": (window.group(1), window.group(2)) if window else None,
+        "nodes": list(dict.fromkeys((t.upper(), str(int(n))) for t, n in _TARGET_NODE_RE.findall(line))),
+        # None 이면 개수만 왔다 — 어떤 eNB 거름이든 "사건 쪽으로 좁혔다"로 본다(목록을 모르므로 값은 대조하지 못한다)
+        "enbs": [e.strip() for e in enbs.group(1).split(",")] if enbs else None,
+        "has_enb": "eNB " in line,
+    }
+
+
+def _local_naive(text: Any, timezone: str | None) -> datetime:
+    """조회·사건 시각을 같은 기준으로 — 오프셋이 붙은 값(`+09:00`·`Z`)은 로컬 시각으로 바꾸고 tzinfo 를 지운다.
+    사건 창은 graphio 가 로컬 시각(오프셋 없음)으로 보낸다. 섞인 채 비교하면 TypeError 다(2026-11-10 에스터)."""
+    value = datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    if value.tzinfo is not None:
+        value = value.astimezone(ZoneInfo(timezone) if timezone else None).replace(tzinfo=None)
+    return value
+
+
+def _scope_note(message: str, arguments: Any, timezone: str | None = None) -> str | None:
+    """표시는 보조 정보다 — 어떤 입력에서도 예외로 조회 턴을 막지 않는다(실패하면 표시 없이 넘어간다)."""
+    try:
+        return _scope_note_inner(message, arguments, timezone)
+    except Exception:  # noqa: BLE001
+        LOG.warning("scope_note_failed", exc_info=True)
+        return None
+
+
+def _scope_note_inner(message: str, arguments: Any, timezone: str | None = None) -> str | None:
+    """사건을 보며 한 조회가 사건 범위로 걸러지지 않았으면 그 사실 한 줄(2026-11-10 · graphio 2번 F-253).
+
+    모델이 사건 셀(59개) 대신 `PM_COR_LTE_CALL_1M` 전 지역 합계를 내고 「影響セル 1,866個」라고 답했다. 결과 옆에
+    "이 값은 사건 범위가 아니다"를 적어 모델이 조회 값을 사건 값으로 옮기지 않게 한다. 결과는 그대로 둔다 — 전체
+    값이 필요한 질문도 있다. 표·사건과 무관한 일반 문구만 쓴다. 질문이 대상을 짚었는데 그 거름이 없는 경우는
+    강제 조회의 `_missing_targets` 판단을 그대로 쓴다.
+    """
+    scope = _incident_scope(message)
+    if scope is None or not isinstance(arguments, dict):
+        return None
+    conds = _filter_conditions(arguments.get("filters"))
+    notes: list[str] = []
+    keyed = bool(scope["nodes"]) or scope["has_enb"]
+    if keyed:
+        def hits(col_keys: tuple[str, ...], values: list[str] | None) -> bool:
+            return any(any(k in col for k in col_keys) and (values is None or set(vals) & set(values))
+                       for col, vals in conds)
+
+        node_hit = any(hits((typ, "NODE"), [num]) for typ, num in scope["nodes"])
+        enb_hit = scope["has_enb"] and hits(("ENB",), scope["enbs"])
+        if not (node_hit or enb_hit):
+            targeted = any(any(k in col for k in ("ENB", "CELL", "MME", "SGW", "PGW", "NODE")) for col, _ in conds)
+            notes.append(
+                "filters restrict to other cells/eNBs/nodes than the incident's query scope — not the incident's value"
+                if targeted else
+                "filters do not restrict to the incident's cells/eNBs/nodes — this is a whole-network value, "
+                "not the incident's"
+            )
+    missing = _missing_targets(message, arguments)
+    if missing:
+        notes.append("filters lack the target named in the question: " + ", ".join(missing))
+    window = scope["window"]
+    ps = arguments.get("partition_scope")
+    if window and isinstance(ps, dict) and ps.get("from") and ps.get("to"):
+        try:
+            t0, t1 = (_local_naive(x, timezone) for x in window)
+            q0, q1 = (_local_naive(ps[k], timezone) for k in ("from", "to"))
+            # 날짜만 준 to 는 그날 끝까지다
+            if len(str(ps["to"])) <= 10:
+                q1 = q1.replace(hour=23, minute=59)
+            slack = timedelta(minutes=SCOPE_WINDOW_SLACK_MINUTES)
+            if q0 < t0 - slack or q1 > t1 + slack or q1 < t0 or q0 > t1:
+                notes.append(f"time window {ps['from']}~{ps['to']} differs from the incident window {window[0]}~{window[1]}")
+        except Exception:  # noqa: BLE001 — 시각 형식·시간대(ZoneInfoNotFoundError) 무엇이든 창 표시만 건너뛴다
+            pass  # 대상 표시는 그대로 낸다
+    return "; ".join(notes) or None
 
 
 def _gave_up_without_query(answer: str) -> bool:
@@ -878,6 +971,10 @@ class BoundedAgent:
                         meaning = _aggregation_meaning(tool_arguments)
                         if meaning:
                             bounded["aggregation_meaning"] = meaning
+                        # 사건을 보며 한 조회가 사건 범위로 걸러졌나 — 아니면 결과 옆에 적는다(근거 수집 뒤)
+                        note = _scope_note(message, tool_arguments, self._timezone)
+                        if note:
+                            bounded["scope_note"] = note
                     if event_sink is not None:
                         await event_sink(
                             "tool_call",
