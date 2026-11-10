@@ -38,7 +38,7 @@ import os
 import re
 import threading
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from datalens.application import answer_style
@@ -128,10 +128,13 @@ class Profile:
     tools: ToolsLevel
     history_items: int
     params: dict[str, Any]
+    # 시스템 지시문 끝에 붙는 추가 지시 — 언어별(ko·ja)(2026-11-10 프롬프트 실험). 비면 지금 동작과 같다
+    prompt_extra: dict[str, str] = field(default_factory=dict)
 
     def public(self) -> dict[str, Any]:
         return {
             "mode": self.mode,
+            **({"prompt_extra": dict(self.prompt_extra)} if any(self.prompt_extra.values()) else {}),
             "context": {
                 "system_prompt": self.system_prompt,
                 "session_context": self.session_context,

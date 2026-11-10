@@ -464,9 +464,11 @@ class BoundedAgent:
         event_sink: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
         hints: str | None = None,
         mode: Mode = "agent",
+        profile: Profile | None = None,
     ) -> AgentResult:
         self._remaining(deadline)
-        profile = self.profile(mode)
+        # 프롬프트 실험(lab)만 실효 설정을 직접 준다 — 저장하지 않은 화면 값으로 한 번 돌린다
+        profile = profile or self.profile(mode)
         if profile.tools == "off":
             # 증거 전용 모드는 QueryForge 를 부르지도 않는다 — QueryForge 가 내려가 있어도 답한다.
             tools: tuple[QueryForgeToolDefinition, ...] = ()
@@ -1430,6 +1432,10 @@ class BoundedAgent:
             prompt = load_system_prompt(session.locale, kind)
             if profile.tools == "lazy":
                 prompt = f"{prompt}\n\n{_LAZY_HINT.get(session.locale, _LAZY_HINT['ko'])}"
+            extra = (profile.prompt_extra or {}).get(session.locale, "").strip()
+            if extra:
+                # 추가 지시는 기본 지시문 파일을 고치지 않고 끝에 붙인다 — 비우면 지금과 같다
+                prompt = f"{prompt}\n\n{extra}"
             messages.append(ProviderMessage("system", prompt))
         if profile.session_context:
             messages.append(ProviderMessage("system", f"DataLens session context: {json.dumps(state, ensure_ascii=False)}"))

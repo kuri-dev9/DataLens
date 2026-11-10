@@ -41,11 +41,27 @@ class ChatApplicationService:
         self._memory = memory
         self._runtime = runtime
         self._turn_log = turn_log
+        # 진행 중인 실제 턴(request_id → 시작 시각). 프롬프트 실험은 이것이 비었을 때만 모델을 쓴다(사용자 질의 우선)
+        self._active: dict[str, tuple[float, str]] = {}
+
+    def active_turns(self) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        return [{"request_id": rid, "mode": mode, "elapsed_s": round(now - began, 1)}
+                for rid, (began, mode) in list(self._active.items())]
 
     async def handle(
         self, session: Session, message: str, request_id: str, deadline: float, mode: Mode = "agent"
     ) -> dict:
         started = time.monotonic()
+        self._active[request_id] = (started, mode)
+        try:
+            return await self._handle(session, message, request_id, deadline, mode, started)
+        finally:
+            self._active.pop(request_id, None)
+
+    async def _handle(
+        self, session: Session, message: str, request_id: str, deadline: float, mode: Mode, started: float
+    ) -> dict:
         context = bind_request_id(request_id)
         received, style = message, None
         if mode == "evidence" and self._runtime is not None:
@@ -61,7 +77,7 @@ class ChatApplicationService:
             reset_request_id(context)
         await self._remember(session, message, recall, result, mode)
         committed = self._sessions.commit(result.updated_session)
-        self._record(mode, result, started, committed.session_id, message, received, style)
+        self._record(mode, result, started, committed.session_id, message, received, style, session.locale)
         logging.getLogger("datalens.agent").info(
             "agent_turn_completed",
             extra={
@@ -107,6 +123,22 @@ class ChatApplicationService:
         mode: Mode = "agent",
     ) -> dict:
         started = time.monotonic()
+        self._active[request_id] = (started, mode)
+        try:
+            return await self._handle_stream(session, message, request_id, deadline, event_sink, mode, started)
+        finally:
+            self._active.pop(request_id, None)
+
+    async def _handle_stream(
+        self,
+        session: Session,
+        message: str,
+        request_id: str,
+        deadline: float,
+        event_sink: Callable[[str, dict[str, Any]], Awaitable[None]],
+        mode: Mode,
+        started: float,
+    ) -> dict:
         context = bind_request_id(request_id)
 
         async def sink(event: str, data: dict[str, Any]) -> None:
@@ -131,7 +163,7 @@ class ChatApplicationService:
             reset_request_id(context)
         await self._remember(session, message, recall, result, mode)
         committed = self._sessions.commit(result.updated_session)
-        self._record(mode, result, started, committed.session_id, message)
+        self._record(mode, result, started, committed.session_id, message, locale=session.locale)
         duration_ms = int((time.monotonic() - started) * 1000)
         logging.getLogger("datalens.agent").info(
             "agent_turn_completed",
@@ -179,6 +211,7 @@ class ChatApplicationService:
         message: str = "",
         received: str | None = None,
         style: dict[str, Any] | None = None,
+        locale: str | None = None,
     ) -> None:
         at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         duration_ms = int((time.monotonic() - started) * 1000)
@@ -242,6 +275,8 @@ class ChatApplicationService:
                 "mode": mode,
                 "session_id": session_id,
                 "question_chars": len(message),
+                # 프롬프트 실험이 같은 언어로 다시 돌리려면 필요하다(지시문·단위가 언어별이다)
+                "locale": locale,
                 "sent": sent,
                 "response": {
                     "answer": result.answer,
@@ -249,6 +284,8 @@ class ChatApplicationService:
                     "stop_reason": raw.get("stop_reason"),
                     "duration_ms": duration_ms,
                     "tool_calls": result.tool_calls,
+                    # 강제 조회·실패 같은 경고 — 실험 비교에서 "무엇이 달라졌나"의 한 칸이다
+                    "warnings": list(result.warnings),
                     "load_ms": row["result"]["load_ms"],
                     "prompt_eval_ms": row["result"]["prompt_eval_ms"],
                     "eval_ms": row["result"]["eval_ms"],

@@ -24,6 +24,9 @@ from pathlib import Path
 from typing import Any
 
 KEEP = 200
+# agent(일반 질문) 원문 · 프롬프트 실험 결과 보관 수 — 초기값(2026-11-10 사용자 결정 "200건")
+AGENT_KEEP = 200
+LAB_KEEP = 200
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS evidence_turns (
@@ -41,11 +44,28 @@ CREATE TABLE IF NOT EXISTS evidence_turns (
     UNIQUE(at, session_id)
 );
 CREATE INDEX IF NOT EXISTS evidence_turns_session ON evidence_turns(session_id, seq);
+CREATE TABLE IF NOT EXISTS agent_traces (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    trace_json TEXT NOT NULL,
+    UNIQUE(at, session_id)
+);
+CREATE TABLE IF NOT EXISTS lab_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    source_kind TEXT NOT NULL,
+    source_id INTEGER NOT NULL,
+    request_json TEXT NOT NULL,
+    result_json TEXT NOT NULL
+);
 """
 
 
 class SqliteTurnStore:
-    def __init__(self, path: str | Path, keep: int = KEEP) -> None:
+    def __init__(self, path: str | Path, keep: int = KEEP, agent_keep: int = AGENT_KEEP, lab_keep: int = LAB_KEEP) -> None:
+        self._agent_keep = agent_keep
+        self._lab_keep = lab_keep
         self._path = Path(path)
         if str(self._path) != ":memory:":
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -146,6 +166,87 @@ class SqliteTurnStore:
                 "SELECT * FROM evidence_turns ORDER BY at DESC, id DESC LIMIT ?", (limit,)
             ).fetchall()
         return [{**dict(row), "dropped": json.loads(row["dropped"]), "style": json.loads(row["style"] or "{}")} for row in rows]
+
+    # ── agent 원문(2026-11-10) ─────────────────────────────────────────────
+    # 일반 질문은 메모리 trace(모드별 5건)뿐이라 재시작하면 사라졌다. 프롬프트 실험이 "어제 그 질문"을
+    # 고르려면 남아야 한다. 모양이 evidence 4칸과 달라(도구 단계가 있다) trace 를 통째로 둔다.
+    def save_agent(self, trace: dict[str, Any]) -> None:
+        if self._agent_keep <= 0:
+            return
+        with self._lock:
+            self._connection.execute(
+                "INSERT OR IGNORE INTO agent_traces (at, session_id, trace_json) VALUES (?, ?, ?)",
+                (trace.get("at", ""), trace.get("session_id", ""), json.dumps(trace, ensure_ascii=False, default=str)),
+            )
+            self._connection.execute(
+                "DELETE FROM agent_traces WHERE id NOT IN (SELECT id FROM agent_traces ORDER BY at DESC, id DESC LIMIT ?)",
+                (self._agent_keep,),
+            )
+            self._connection.commit()
+
+    def recent_agent(self, limit: int = AGENT_KEEP) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT id, trace_json FROM agent_traces ORDER BY at DESC, id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [{"id": row["id"], **json.loads(row["trace_json"])} for row in rows]
+
+    def agent_trace(self, trace_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute("SELECT id, trace_json FROM agent_traces WHERE id = ?", (trace_id,)).fetchone()
+        return None if row is None else {"id": row["id"], **json.loads(row["trace_json"])}
+
+    def evidence_turn(self, turn_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute("SELECT * FROM evidence_turns WHERE id = ?", (turn_id,)).fetchone()
+        if row is None:
+            return None
+        return {**dict(row), "dropped": json.loads(row["dropped"]), "style": json.loads(row["style"] or "{}")}
+
+    def evidence_before(self, session_id: str, seq: int) -> list[dict[str, Any]]:
+        """같은 세션의 앞 호출들(오래된 것부터) — evidence 실험의 이전 문답을 다시 채운다."""
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT received, llm_raw, final FROM evidence_turns WHERE session_id = ? AND seq < ? ORDER BY seq",
+                (session_id, seq),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    # ── 프롬프트 실험 결과 ──────────────────────────────────────────────────
+    # 운영 기록(evidence_turns·agent_traces)과 섞지 않는다 — 실험은 이 표에만 남는다.
+    def save_lab(self, source_kind: str, source_id: int, request: dict[str, Any], result: dict[str, Any], at: str) -> int:
+        with self._lock:
+            cursor = self._connection.execute(
+                "INSERT INTO lab_runs (at, source_kind, source_id, request_json, result_json) VALUES (?, ?, ?, ?, ?)",
+                (at, source_kind, source_id, json.dumps(request, ensure_ascii=False, default=str),
+                 json.dumps(result, ensure_ascii=False, default=str)),
+            )
+            self._connection.execute(
+                "DELETE FROM lab_runs WHERE id NOT IN (SELECT id FROM lab_runs ORDER BY id DESC LIMIT ?)",
+                (self._lab_keep,),
+            )
+            self._connection.commit()
+            return int(cursor.lastrowid)
+
+    def lab_runs(self, limit: int = LAB_KEEP) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT id, at, source_kind, source_id, request_json, result_json FROM lab_runs ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [self._lab_row(row) for row in rows]
+
+    def lab_run(self, run_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT id, at, source_kind, source_id, request_json, result_json FROM lab_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        return None if row is None else self._lab_row(row)
+
+    @staticmethod
+    def _lab_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {"id": row["id"], "at": row["at"], "source_kind": row["source_kind"], "source_id": row["source_id"],
+                "request": json.loads(row["request_json"]), "result": json.loads(row["result_json"])}
 
     def close(self) -> None:
         self._connection.close()

@@ -70,6 +70,8 @@ class Settings(BaseSettings):
     runtime_config_path: str = "/var/lib/datalens/runtime.json"
     # 설정 화면의 "최근 전송 원문"을 모드별로 몇 건 보관하나. 메모리에만 둔다(증거 원문이 들어 있다).
     trace_keep: int = Field(5, ge=0, le=50)
+    # agent(일반 질문) 원문을 sqlite 에 몇 건 남기나 — 초기값 200(2026-11-10 사용자 결정). 0 이면 남기지 않는다
+    agent_trace_keep: int = Field(200, ge=0, le=2000)
     memory_enabled: bool = True
     memory_path: str = "/var/lib/datalens/memory.sqlite3"
     embedding_model: str = Field("bge-m3", min_length=1, max_length=128)

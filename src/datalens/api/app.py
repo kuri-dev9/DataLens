@@ -398,6 +398,7 @@ def build_app(
     runtime_config: RuntimeConfig | None = None,
     turn_log: TurnLog | None = None,
     previewer: Any = None,
+    lab: Any = None,
 ) -> Starlette:
     store = InMemorySessionStore(settings.session_ttl_seconds, settings.default_locale)
     sessions = session_service or SessionService(store)
@@ -1042,6 +1043,64 @@ def build_app(
         )
         return JSONResponse(built)
 
+    # ── 프롬프트 실험 ①(2026-11-10) — application/lab.py ──────────────────────
+    def lab_unavailable(request: Request) -> JSONResponse:
+        return error_response(request, "DL_SETTINGS_DISABLED", "Prompt lab is not enabled", 404)
+
+    async def lab_busy(request: Request) -> JSONResponse:
+        if lab is None:
+            return lab_unavailable(request)
+        return JSONResponse(lab.busy())
+
+    async def lab_sources(request: Request) -> JSONResponse:
+        if lab is None:
+            return lab_unavailable(request)
+        return JSONResponse({"rows": lab.sources()})
+
+    async def lab_source(request: Request) -> JSONResponse:
+        if lab is None:
+            return lab_unavailable(request)
+        from datalens.application.lab import LabError
+
+        try:
+            return JSONResponse(lab.source(request.path_params["kind"], request.path_params["source_id"]))
+        except LabError as exc:
+            return error_response(request, "DL_LAB_SOURCE_NOT_FOUND", str(exc), 404)
+
+    async def lab_runs(request: Request) -> JSONResponse:
+        if lab is None:
+            return lab_unavailable(request)
+        from datalens.application.lab import LabBusy, LabError
+
+        if request.method == "GET":
+            return JSONResponse({"rows": lab.runs()})
+        try:
+            body = await request.json()
+        except ValueError:
+            return invalid_request(request, "Invalid lab request", None)
+        if not isinstance(body, dict):
+            return invalid_request(request, "Invalid lab request", None)
+        if len(body.get("message") or "") > MESSAGE_MAX_CHARS:
+            return error_response(request, "DL_INVALID_LAB_REQUEST", f"message exceeds {MESSAGE_MAX_CHARS} chars", 400)
+        try:
+            ran = await lab.run(body, time.monotonic() + settings.request_deadline_seconds)
+        except LabBusy as exc:
+            # 사용자 질의가 먼저다 — 실험은 기다렸다가 다시 누른다(대기 줄은 ③)
+            return error_response(request, "DL_MODEL_BUSY", "Model is serving another request", 409, retryable=True,
+                                  details={"active": exc.active, "lab_running": exc.lab_running})
+        except LabError as exc:
+            return error_response(request, "DL_INVALID_LAB_REQUEST", str(exc), 400)
+        LOG.info("lab_run_completed", extra={"request_id": request.state.request_id, "operation": "lab_run", "status": "completed"})
+        return JSONResponse(ran)
+
+    async def lab_run(request: Request) -> JSONResponse:
+        if lab is None:
+            return lab_unavailable(request)
+        found = lab.run_detail(request.path_params["run_id"])
+        if found is None:
+            return error_response(request, "DL_LAB_RUN_NOT_FOUND", "No such lab run", 404)
+        return JSONResponse(found)
+
     async def settings_ui(_: Request) -> Response:
         # 화면 자체는 인증 없이 내려준다. 화면이 부르는 /v1/settings 는 x-api-key 가 필요하다.
         from importlib.resources import files
@@ -1058,6 +1117,11 @@ def build_app(
         Route("/v1/settings/history", settings_history, methods=["GET"]),
         Route("/v1/settings/answer-style", settings_answer_style, methods=["GET", "PUT"]),
         Route("/v1/settings/preview", settings_preview, methods=["POST"]),
+        Route("/v1/settings/lab/busy", lab_busy, methods=["GET"]),
+        Route("/v1/settings/lab/sources", lab_sources, methods=["GET"]),
+        Route("/v1/settings/lab/sources/{kind:str}/{source_id:int}", lab_source, methods=["GET"]),
+        Route("/v1/settings/lab/runs", lab_runs, methods=["GET", "POST"]),
+        Route("/v1/settings/lab/runs/{run_id:int}", lab_run, methods=["GET"]),
         Route("/v1/ready", ready, methods=["GET"]),
         Route("/v1/sessions", create_session, methods=["POST"]),
         Route("/v1/sessions/{session_id:str}/messages", message, methods=["POST"]),

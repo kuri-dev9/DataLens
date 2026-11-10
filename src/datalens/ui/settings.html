@@ -89,6 +89,7 @@
   <button data-tab="traces">최근 전송 원문</button>
   <button data-tab="history">효과 비교</button>
   <button data-tab="turns">RCA 응답 기록</button>
+  <button data-tab="lab">프롬프트 실험</button>
 </nav>
 <div class="page on" id="page-settings">
   <div class="subnav"><button data-mode-tab="evidence" class="on">RCA 응답</button><button data-mode-tab="agent">일반</button></div>
@@ -98,6 +99,19 @@
 <div class="page" id="page-traces"><div id="traces"></div></div>
 <div class="page" id="page-history"><div id="history"></div></div>
 <div class="page" id="page-turns"><div id="turns"></div></div>
+<div class="page" id="page-lab">
+  <div id="lab-busy" class="hint"></div>
+  <div class="split" style="grid-template-columns:minmax(380px,0.8fr) minmax(520px,1.2fr)">
+    <div>
+      <section><h2>기록 고르기</h2><p class="lead">최근 전송 원문(일반, 최근 200건)과 RCA 응답 기록(200건)에서 하나를 고른다. 일반 질문은 2026-11-10 이후 질의부터 남는다.</p><div id="lab-sources"></div></section>
+      <section><h2>지난 실험</h2><p class="lead">실험 결과는 운영 기록·학습과 섞이지 않고 여기에만 남는다(최근 200건).</p><div id="lab-runs"></div></section>
+    </div>
+    <div>
+      <section id="lab-edit"><h2>고치기</h2><p class="lead">기록을 고르면 실제로 보낸 원문이 칸별로 펼쳐진다.</p></section>
+      <section id="lab-compare"><h2>비교</h2><p class="lead">다시 보내면 원래 결과와 나란히 보인다. 화면 질의가 진행 중이면 시작하지 않는다(사용자 질의 우선).</p></section>
+    </div>
+  </div>
+</div>
 <script>
 // 이 화면이 부르는 것: /v1/settings(설정) · /v1/settings/answer-style(RCA 응답 답변 형식)
 // · /v1/settings/traces(최근 전송) · /v1/settings/preview(미리보기, 모델 호출 없음 — 서버의 실제 조립 코드로 만든다)
@@ -433,6 +447,7 @@ async function showTab(tab) {
     if (tab === "traces") await renderTraces();
     if (tab === "turns") await renderTurns();
     if (tab === "history") await renderHistory();
+    if (tab === "lab") await renderLab();
   } catch (err) { msg(String(err.message || err), "bad"); }
 }
 
@@ -458,6 +473,107 @@ document.addEventListener("click", async (event) => {
     else if (el.dataset.reset) { state = await api("/v1/settings", "PUT", { mode, reset: true }); renderSettings(); msg(`${MODE_LABEL[mode]} 화면 값을 지웠다(답변 형식은 그대로)`, "ok"); }
     else if (el.dataset.clearCtx) { state = await api("/v1/settings", "PUT", { mode, context: { [el.dataset.clearCtx]: null } }); renderSettings(); }
     else if (el.dataset.clearP) { state = await api("/v1/settings", "PUT", { mode, params: { [el.dataset.clearP]: null } }); renderSettings(); }
+  } catch (err) { msg(String(err.message || err), "bad"); }
+});
+
+// ── 프롬프트 실험 ①(2026-11-10) — /v1/settings/lab/* ────────────────────────
+// 고른 기록의 원문을 칸별로 고쳐 실제 흐름(agent.run)으로 다시 돌리고 원래 결과와 나란히 본다.
+// 반영(추가 지시 저장)은 ②, 여러 건 같이 돌리기는 ③.
+let labSource = null, labBusyTimer = null;
+
+async function renderLab() {
+  await refreshBusy();
+  const [src, runs] = await Promise.all([api("/v1/settings/lab/sources"), api("/v1/settings/lab/runs")]);
+  $("lab-sources").innerHTML = src.rows.length ? `<table><tr><th>시각</th><th>종류</th><th>질문</th><th></th></tr>${src.rows.map((r) =>
+    `<tr><td class="dim">${esc(r.at.replace("T", " ").slice(5, 19))}</td><td>${MODE_LABEL[r.mode]} · ${r.locale}</td>
+     <td>${esc(r.question)}${r.warnings && r.warnings.length ? ` <span class="warn">${esc(r.warnings.join(","))}</span>` : ""}</td>
+     <td><button class="small" data-lab-src="${r.kind}/${r.id}">열기</button></td></tr>`).join("")}</table>`
+    : `<span class="hint">아직 남은 기록이 없다.</span>`;
+  $("lab-runs").innerHTML = runs.rows.length ? `<table><tr><th>시각</th><th>질문</th><th>추가 지시</th><th>도구</th><th></th></tr>${runs.rows.map((r) =>
+    `<tr><td class="dim">${esc(r.at.replace("T", " ").slice(5, 19))}</td><td>${esc(r.question)}</td><td class="dim">${esc(r.prompt_extra || "—")}</td>
+     <td class="num">${r.error ? `<span class="bad">${esc(r.error)}</span>` : fmt(r.tool_calls)}</td>
+     <td><button class="small ghost" data-lab-run="${r.id}">보기</button></td></tr>`).join("")}</table>`
+    : `<span class="hint">아직 실험이 없다.</span>`;
+}
+
+async function refreshBusy() {
+  const b = await api("/v1/settings/lab/busy");
+  const parts = b.active.map((a) => `화면 질의(${MODE_LABEL[a.mode] || a.mode}) ${a.elapsed_s}초째`);
+  if (b.lab) parts.push(`실험 ${b.lab.elapsed_s}초째`);
+  $("lab-busy").innerHTML = b.busy ? `<span class="warn">모델 사용 중: ${esc(parts.join(" · "))}</span>` : `<span class="ok">모델 비어 있음</span>`;
+  const run = $("lab-run"); if (run) run.disabled = b.busy;
+  return b;
+}
+
+function labEditor(d) {
+  const hist = d.history.map((h, i) => `<details><summary><label><input type="checkbox" data-lab-hist="${i}" checked> ${h.role === "user" ? "이전 질문" : "이전 답"}</label><span class="n">${fmt(h.content.length)}자</span></summary><pre>${esc(h.content)}</pre></details>`).join("");
+  return `<h2>고치기 — ${MODE_LABEL[d.mode]} · ${d.locale} · ${esc((d.at || "").replace("T", " ").slice(0, 19))}</h2>
+    <p class="lead">${esc(d.note || "")}</p>
+    <details><summary>시스템 지시문 (읽기만)<span class="n">${fmt(d.system_prompt.length)}자</span></summary><pre>${esc(d.system_prompt)}</pre></details>
+    <h3>추가 지시 — 시스템 지시문 끝에 붙는다(${d.locale}). 이번 실험에만 쓰고 저장하지 않는다</h3>
+    <textarea id="lab-extra" placeholder="예: 앱 분류(PAY 등)와 앱 이름은 다르다. 앱 이름을 물으면 앱 표를 조회한다."></textarea>
+    <h3>이전 문답 ${d.history.length ? "— 체크를 풀면 빼고 보낸다" : "— 없음"}</h3>${hist}
+    <h3>이번 메시지 — graphio 맥락·질문. 고쳐서 실험할 수 있다(이 칸은 graphio 코드라 반영 대상이 아니다)</h3>
+    <textarea id="lab-message" style="min-height:220px">${esc(d.message)}</textarea>
+    ${d.mode === "agent" ? `<div class="row">도구 정의 <select id="lab-tools"><option value="">설정값</option><option>lazy</option><option>summary</option><option>full</option></select></div>` : ""}
+    <div class="row"><button id="lab-run" data-lab-go="1">다시 보내기</button><span class="hint">한 번에 한 실험만 돈다. 20~200초 걸린다.</span></div>`;
+}
+
+function labResult(r, title) {
+  if (!r) return `<div class="hint">—</div>`;
+  if (r.error && !r.answer) return `<h3>${title}</h3><div class="bad">${esc(r.error.type)}: ${esc(r.error.message)}</div>`;
+  const steps = (r.steps || []).map((s, i) => s.kind === "note" ? `<div class="dim">· ${esc(s.text)}</div>` :
+    `<details><summary>${i + 1}. ${esc(s.tool || "?")} ${s.ok === false ? `<span class="bad">${esc((s.error && s.error.code) || "실패")}</span>` : s.ok ? `<span class="ok">ok${s.row_count != null ? ` · ${fmt(s.row_count)}행` : ""}</span>` : ""}</summary>
+     <pre>인자 ${esc(JSON.stringify(s.arguments, null, 1))}${s.error ? `\n오류 ${esc(JSON.stringify(s.error))}` : ""}${s.aggregation_meaning ? `\n집계 ${esc(s.aggregation_meaning.join(" / "))}` : ""}${s.preview ? `\n미리보기 ${esc(JSON.stringify(s.preview))}` : ""}</pre></details>`).join("");
+  const dropped = (r.dropped || []).map((x) => `<div class="drop">${esc(x.line)} <span class="dim">(${esc(x.reason)})</span></div>`).join("");
+  return `<h3>${title}</h3>
+    <div class="dim">도구 ${fmt(r.tool_calls)}회 · ${r.duration_ms != null ? (r.duration_ms / 1000).toFixed(1) + "초" : "—"} · 입력 ${fmt(r.prompt_tokens)}토큰 · 출력 ${fmt(r.completion_tokens)}토큰${r.stop_reason ? " · " + esc(r.stop_reason) : ""}</div>
+    <div>경고 ${r.warnings && r.warnings.length ? `<span class="warn">${esc(r.warnings.join(", "))}</span>` : r.warnings_recorded === false ? `<span class="dim">기록 없음</span>` : "없음"}</div>
+    ${steps ? `<div style="margin-top:6px">${steps}</div>` : `<div class="dim">도구 호출 없음</div>`}
+    <pre style="border:1px solid var(--line);border-radius:6px;margin-top:8px">${esc(r.answer)}</pre>
+    ${dropped ? `<h3>검증에서 버려질 줄</h3>${dropped}` : ""}`;
+}
+
+function labCompare(original, result) {
+  $("lab-compare").innerHTML = `<h2>비교</h2><div class="grid" style="grid-template-columns:1fr 1fr">
+    <div>${labResult(original, "원래 결과")}</div><div>${labResult(result, "새 결과")}</div></div>`;
+}
+
+async function labOpen(ref) {
+  labSource = await api(`/v1/settings/lab/sources/${ref}`);
+  $("lab-edit").innerHTML = labEditor(labSource);
+  labCompare(labSource.original, null);
+  await refreshBusy();
+}
+
+async function labGo() {
+  if (!labSource) return;
+  const history = labSource.history.filter((_, i) => { const c = document.querySelector(`[data-lab-hist="${i}"]`); return !c || c.checked; });
+  const body = { source: { kind: labSource.kind, id: labSource.id }, mode: labSource.mode, locale: labSource.locale,
+    message: $("lab-message").value, prompt_extra: $("lab-extra").value, history };
+  const tools = $("lab-tools") && $("lab-tools").value; if (tools) body.context = { tools };
+  $("lab-run").disabled = true; msg("실험 중 — 모델 응답을 기다린다", "warn");
+  clearInterval(labBusyTimer); labBusyTimer = setInterval(() => refreshBusy().catch(() => {}), 5000);
+  try {
+    const ran = await api("/v1/settings/lab/runs", "POST", body);
+    labCompare(labSource.original, ran.result); msg(`실험 #${ran.id} 끝`, "ok");
+    await renderLab();
+  } finally { clearInterval(labBusyTimer); await refreshBusy().catch(() => {}); }
+}
+
+async function labShowRun(id) {
+  const run = await api(`/v1/settings/lab/runs/${id}`);
+  let original = null;
+  try { const src = await api(`/v1/settings/lab/sources/${run.source_kind}/${run.source_id}`); original = src.original; } catch (_) { /* 원래 기록이 밀려났다 */ }
+  labCompare(original, run.result);
+}
+
+document.addEventListener("click", async (event) => {
+  const el = event.target;
+  try {
+    if (el.dataset.labSrc) await labOpen(el.dataset.labSrc);
+    else if (el.dataset.labGo) await labGo();
+    else if (el.dataset.labRun) await labShowRun(el.dataset.labRun);
   } catch (err) { msg(String(err.message || err), "bad"); }
 });
 if ($("key").value) $("load").click();

@@ -9,6 +9,7 @@ from datalens.application.sessions import SessionService
 from datalens.config import get_settings
 from datalens.application.memory import MemoryService
 from datalens.application.runtime_config import RuntimeConfig
+from datalens.application.lab import LabService
 from datalens.application.trace import TurnLog
 from datalens.infrastructure.sqlite_turns import SqliteTurnStore
 from datalens.infrastructure.ollama import OllamaProvider
@@ -75,8 +76,9 @@ def create_app():
             max_recipes=settings.memory_max_recipes,
             timeout_seconds=settings.memory_timeout_seconds,
         )
-    turn_log = TurnLog(settings.trace_keep, SqliteTurnStore(settings.memory_path))
+    turn_log = TurnLog(settings.trace_keep, SqliteTurnStore(settings.memory_path, agent_keep=settings.agent_trace_keep))
     chat = ChatApplicationService(sessions, agent, memory, runtime, turn_log)
+    lab = LabService(agent, sessions, runtime, turn_log, chat, settings)
     return build_app(
         settings,
         session_service=sessions,
@@ -89,6 +91,7 @@ def create_app():
         runtime_config=runtime,
         turn_log=turn_log,
         previewer=agent,
+        lab=lab,
     )
 
 

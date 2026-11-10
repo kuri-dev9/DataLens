@@ -9,7 +9,8 @@
 **기본은 메모리에만 둔다.** 원문에는 호출부가 보낸 증거(graphio 증거팩 등)가 그대로 들어 있다.
 예외는 evidence 모드다(2026-11-04 사용자 결정) — graphio 검증기가 버린 줄을 시연에서 다시
 보이려고 store(memory.sqlite3 의 evidence_turns — 받은 원문·LLM 결과·버린 줄·최종 답 4칸,
-최근 200건)에도 쓴다. 로그에는 쓰지 않는다.
+최근 200건)에도 쓴다. agent 모드도 2026-11-10 부터 store 의 agent_traces 에 통째로 남긴다(최근 200건 ·
+프롬프트 실험의 재료 · 사용자 결정). 로그에는 쓰지 않는다.
 조회는 /v1/settings 와 같이 API 키가 필요하다.
 
 블록별 토큰은 **추정**이다. Ollama 는 프롬프트 전체의 토큰 수(prompt_eval_count)만 알려 주므로
@@ -138,6 +139,12 @@ class TurnLog:
                     self._store.save(trace)
                 except Exception:  # noqa: BLE001 — 보관 실패가 답을 막으면 안 된다
                     pass
+        elif trace is not None and mode == "agent" and self._store is not None and hasattr(self._store, "save_agent"):
+            # 일반 질문 원문도 sqlite 에 남긴다(2026-11-10 사용자 결정 · 최근 200건 초기값) — 프롬프트 실험의 재료
+            try:
+                self._store.save_agent(trace)
+            except Exception:  # noqa: BLE001 — 보관 실패가 답을 막으면 안 된다
+                pass
         with self._lock:
             if trace is not None and self._keep > 0:
                 self._traces.setdefault(mode, deque(maxlen=self._keep)).append(deepcopy(trace))
@@ -185,6 +192,10 @@ class TurnLog:
     def attach_verdict(self, session_id: str, verdict: dict[str, Any], at: str) -> dict[str, Any] | None:
         """graphio 정본 판정을 sqlite 기록에 붙인다. 붙일 행이 없으면 None."""
         return None if self._store is None else self._store.attach_verdict(session_id, verdict, at)
+
+    @property
+    def store(self) -> Any:
+        return self._store
 
     def history(self) -> list[dict[str, Any]]:
         with self._lock:
