@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import uuid
 from copy import deepcopy
@@ -171,6 +172,71 @@ def _structured_query_schema(schema: dict[str, Any]) -> dict[str, Any]:
     props = {k: v for k, v in (schema.get("properties") or {}).items() if k not in _STRUCTURED_DROP}
     required = [r for r in ("source", "partition_scope") if r in props]
     return {**schema, "properties": props, "required": required}
+
+
+#: 질문이 가리키는 대상 — 노드 이름(`MME-2`)과 셀 키(`143010-0`). graphio 맥락의 노드·셀 규칙(`llm.cell_rule_line`)과
+#: 같은 꼴이다. 강제 조회의 거름 확인(`_missing_targets`)에만 쓴다
+_TARGET_NODE_RE = re.compile(r"(?<![A-Za-z0-9])(MME|SGW|PGW)-(\d{1,4})(?!\d)", re.IGNORECASE)
+_TARGET_CELL_RE = re.compile(r"(?<![\d-])(\d{3,8})-(\d{1,3})(?![\d-])")
+#: graphio 메시지의 질문 칸 머리. 맥락 칸에는 규칙 설명의 예("SGW-5 는 SGW_ID '5'")가 있어 질문 칸만 본다
+_QUESTION_HEADS = ("[질문]", "[質問]", "[Question]")
+
+
+def _question_text(message: str) -> str:
+    """메시지에서 질문 칸만 — 머리가 없으면 메시지 전체(다른 호출자는 질문만 보낸다)."""
+    for head in _QUESTION_HEADS:
+        at = message.rfind(head)
+        if at >= 0:
+            body = message[at + len(head):]
+            nxt = body.find("\n[")
+            return body[:nxt] if nxt >= 0 else body
+    return message
+
+
+def _filter_conditions(filters: Any) -> list[tuple[str, list[str]]]:
+    """``filters``(all · any_groups) 의 긍정 조건을 (열 이름 대문자, 값 문자열 목록)으로 편다."""
+    out: list[tuple[str, list[str]]] = []
+    if not isinstance(filters, dict):
+        return out
+    conds = list(filters.get("all") or ())
+    for group in filters.get("any_groups") or ():
+        conds.extend(group if isinstance(group, list) else ())
+    for c in conds:
+        if not isinstance(c, dict) or c.get("operator") in ("ne", "not_in", "is_null", "is_not_null"):
+            continue
+        raw = c.get("values") if isinstance(c.get("values"), list) else [c.get("value")]
+        vals = []
+        for v in raw:
+            if isinstance(v, bool) or v is None:
+                continue
+            s = str(v).strip()
+            vals.append(str(int(float(s))) if isinstance(v, float) and float(s).is_integer() else s)
+        out.append((str(c.get("column") or "").upper(), vals))
+    return out
+
+
+def _missing_targets(message: str, arguments: Any) -> list[str]:
+    """질문이 가리키는 대상 중 강제 조회 인자의 ``filters`` 에 거름이 없는 것(2026-11-10 · graphio 4번 F-246).
+
+    강제 조회가 `PM_COR_EPC_1M` 을 MME_ID 거름 없이 조회해 전 노드 합계(시도 51,309)를 MME-2 값(원시 3,144)처럼
+    답했다. 틀린 값은 "확인 못 함"보다 나쁘므로, 질문 칸에 노드·셀 키가 있는데 그 거름이 없으면 이 결과를 쓰지
+    않는다. 노드는 열 이름에 그 종류(MME 등)나 NODE 가 든 조건의 값이 번호와 같아야 하고, 셀은 ENB 열 값과 CELL 열
+    값이 둘 다 맞아야 한다. 대상이 없는 질문(전체 합계)은 그대로 둔다 — `filters` 를 필수로 하지 않는 이유다
+    """
+    q = _question_text(message or "")
+    conds = _filter_conditions((arguments or {}).get("filters") if isinstance(arguments, dict) else None)
+
+    def has(col_keys: tuple[str, ...], value: str) -> bool:
+        return any(any(k in col for k in col_keys) and value in vals for col, vals in conds)
+
+    missing: list[str] = []
+    for typ, num in dict.fromkeys((t.upper(), str(int(n))) for t, n in _TARGET_NODE_RE.findall(q)):
+        if not has((typ, "NODE"), num):
+            missing.append(f"{typ}-{num}")
+    for enb, cell in dict.fromkeys((e, str(int(c))) for e, c in _TARGET_CELL_RE.findall(q)):
+        if not (has(("ENB",), enb) and has(("CELL",), cell)):
+            missing.append(f"{enb}-{cell}")
+    return missing
 
 
 def _gave_up_without_query(answer: str) -> bool:
@@ -446,7 +512,7 @@ class BoundedAgent:
                         if event_sink is not None:
                             await event_sink("progress", {"stage": "structured_retry"})
                         turn = await self._structured_turn(messages, tool_map["query"], deadline, policy, session.locale,
-                                                           structured_retry)
+                                                           structured_retry, message)
                     elif event_sink is not None and hasattr(self._provider, "complete_stream"):
                         turn = await self._provider.complete_stream(
                             messages,
@@ -468,6 +534,14 @@ class BoundedAgent:
                     raise AgentUpstreamUnavailable("LLM provider failed") from exc
                 except LLMEmptyResponse as exc:
                     empty_outputs.append({"step": tool_count + 1, **(getattr(exc, "diagnostics", None) or {})})
+                    if structured_retry is not None and structured_retry.get("ok") is False:
+                        # 강제 조회를 실행하지 못했다(실패·대상 거름 없음) — 경고를 "조회를 거쳤다"로 남기면 graphio 가
+                        # 답 아래에 "그 조회를 거친 답"이라고 적는다(불변규칙 18). 다른 코드로 바꿔 사실대로 둔다
+                        for w in warnings:
+                            if w.get("code") == "DATALENS_STRUCTURED_RETRY":
+                                w.update({"code": "DATALENS_STRUCTURED_RETRY_DROPPED", "action": "structured_query_dropped",
+                                          "detail": "asked once for the query arguments as constrained JSON but did not "
+                                                    "run them (" + str(structured_retry.get("error") or "failed") + ")"})
                     # 생성 토큰이 query 호출 크기면 깨진 query 호출이다 — 안내 재시도보다 먼저 강제 조회로 한 번 받는다.
                     # 실패하면(`_structured_turn` 이 빈 출력으로 바꿔 낸다) 아래 예전 경로를 그대로 탄다
                     eval_count = empty_outputs[-1].get("eval_count")
@@ -837,6 +911,7 @@ class BoundedAgent:
         policy: OutputPolicy,
         locale: str,
         record: dict[str, Any] | None,
+        question: str = "",
     ) -> AssistantTurn:
         """강제 조회 한 번 — 받은 인자를 query 도구 호출 하나로 바꿔 정상 도구 경로(정규화·검증·실행)로 보낸다.
 
@@ -852,6 +927,15 @@ class BoundedAgent:
             if record is not None:
                 record.update({"ok": False, "error": str(exc)[:200]})
             raise LLMEmptyResponse("structured query retry failed", {"structured_failed": str(exc)[:200]}) from exc
+        # 질문이 가리키는 대상의 거름이 빠진 인자는 실행하지 않는다 — 전체 합계를 그 대상 값처럼 답한다(4번 F-246)
+        missing = _missing_targets(question, arguments)
+        if missing:
+            if record is not None:
+                record.update({"ok": False, "error": "filters missing question target", "missing": missing,
+                               "eval_count_structured": usage.completion_tokens})
+            LOG.warning("agent_structured_retry_dropped",
+                        extra={"request_id": current_request_id(), "missing": missing})
+            raise LLMEmptyResponse("structured query lacked the target filter", {"structured_missing": missing})
         if record is not None:
             record.update({"ok": True, "eval_count_structured": usage.completion_tokens})
         return AssistantTurn(
