@@ -105,6 +105,17 @@ _COUNT_ROWS = ("COUNT(*) — number of rows matching the filters (a row count, n
                "for event totals sum the count column)")
 
 
+def _group_key(item: Any) -> str:
+    """`group_by` 원소 하나를 읽을 이름으로. 문자열 열 이름과 시간 버킷 사전(`{"alias","bucket","column"}`)이
+    섞여 온다 — 사전을 그대로 `join` 하다 `TypeError` 로 턴 전체가 500 이 됐다(2026-11-10 graphio 4번 F-260)."""
+    if not isinstance(item, dict):
+        return str(item)
+    name = item.get("alias") or item.get("column")
+    if item.get("bucket"):
+        return f"{name} = time({item.get('column')}, {item['bucket']})"
+    return str(name)
+
+
 def _aggregation_meaning(arguments: dict[str, Any]) -> list[str]:
     """query 인자의 집계마다 `별칭 = 계산식` 한 줄. 집계가 없으면 빈 목록."""
     lines: list[str] = []
@@ -123,7 +134,7 @@ def _aggregation_meaning(arguments: dict[str, Any]) -> list[str]:
         lines.append(f"{alias} = {text}")
     group_by = arguments.get("group_by")
     if lines and group_by:
-        keys = ", ".join(group_by) if isinstance(group_by, list) else str(group_by)
+        keys = ", ".join(_group_key(g) for g in (group_by if isinstance(group_by, list) else [group_by]))
         lines.append(f"one value per group of ({keys})")
     return lines
 # 도구 정의 lazy 모드의 메타 도구(2026-11-04). QueryForge 도구가 아니다 — DataLens 가 직접 답한다.
@@ -286,6 +297,29 @@ _SCOPE_ENBS_RE = re.compile(r"eNB ((?:\d+)(?:,\s*\d+)*)(?=\s*(?:·|$))")
 SCOPE_WINDOW_SLACK_MINUTES = 5
 
 
+#: 축 사건 범위 키(graphio `context_lines` 「조회 범위」의 ` · ` 조각) → (표시 이름, 거름 열)(2026-11-11 · graphio 8번
+#: F-264 · 기종 사건에서 기종 거름 없이 전국 합계를 냈다). 노드·eNB 는 따로 본다. 값은 대소문자를 그대로 비교한다 —
+#: APN 은 대소문자만 다른 값이 공존한다(graphio 불변규칙 14). 지역은 `AREA_CD` 만 본다 — 단위(`AREA_LEVEL`) 표를
+#: 여기 또 두면 graphio `_XP_AREA_LEVEL` 과 두 벌이 된다
+_SCOPE_AXES = {"기종 ": ("device model", ("VENDOR", "MODEL")), "APN ": ("APN", ("APN",)),
+               "도메인 ": ("domain", ("HOST_SITE",)), "지역 ": ("area", ("AREA_CD",))}
+
+
+def _scope_axes(line: str) -> dict[str, list[str]]:
+    """범위 줄의 축 키 → ID 목록. 지역 키는 「지역 MESH500 a, b」 — 단위 낱말 뒤가 코드 목록이다."""
+    out: dict[str, list[str]] = {}
+    for key in (k.strip() for k in line.split(" · ")):
+        for head in _SCOPE_AXES:
+            if key.startswith(head):
+                rest = key[len(head):].strip()
+                if head == "지역 ":
+                    ids = [i.strip() for i in rest.partition(" ")[2].split(",") if i.strip()]
+                else:
+                    ids = [rest] if rest else []
+                out.setdefault(head, []).extend(ids)
+    return out
+
+
 def _incident_scope(message: str) -> dict[str, Any] | None:
     """메시지의 사건 조회 범위 — 없으면 None(사건을 보지 않는 질문)."""
     found = _SCOPE_LINE_RE.findall(message or "")
@@ -300,6 +334,7 @@ def _incident_scope(message: str) -> dict[str, Any] | None:
         # None 이면 개수만 왔다 — 어떤 eNB 거름이든 "사건 쪽으로 좁혔다"로 본다(목록을 모르므로 값은 대조하지 못한다)
         "enbs": [e.strip() for e in enbs.group(1).split(",")] if enbs else None,
         "has_enb": "eNB " in line,
+        "axes": _scope_axes(line),
     }
 
 
@@ -334,7 +369,38 @@ def _scope_note_inner(message: str, arguments: Any, timezone: str | None = None)
         return None
     conds = _filter_conditions(arguments.get("filters"))
     notes: list[str] = []
-    keyed = bool(scope["nodes"]) or scope["has_enb"]
+
+    def vals(name: str) -> set[str]:
+        return {v for col, vs in conds if name in col for v in vs}
+
+    # 축 사건(기종·APN·도메인·지역) — 그 축의 거름 열로 사건 ID 를 걸렀나. 노드·eNB 와 같은 일반 문구, ID 는 싣지 않는다
+    axis_hit = False
+    for head, ids in scope["axes"].items():
+        label, cols = _SCOPE_AXES[head]
+        # **엄격하다** — 거름 값이 모두 사건 ID 안일 때만 맞은 것으로 본다. `in` 에 다른 값이 섞이면 여러 값의
+        # 합계라 사건 값이 아니다(2026-11-11 케이). 노드·eNB 판정(아래 `hits`)은 겹침만 본다 — 바꾸지 않았다
+        if head == "기종 ":   # 「100OA/A55Y」 → VENDOR '100OA' 이고 MODEL 'A55Y'. 한 열만이면 제조사·모델 전체 합계다
+            pairs = {(v, m) for v, _, m in (i.partition("/") for i in ids if "/" in i)}
+            vs, ms = vals("VENDOR"), vals("MODEL")
+            # 쌍으로 본다 — VENDOR in (A, B) · MODEL in (x, y) 는 A/y 같은 사건 밖 조합까지 더한다
+            hit = bool(vs and ms) and all((v, m) in pairs for v in vs for m in ms)
+        elif head == "도메인 ":
+            # http 행은 `0101` 꼴, dns 행은 `.0101.co.jp` 꼴로 같은 사이트를 적는다(창고 실측 · graphio 안내 줄). dns 를
+            # 바르게 걸러도 "다른 값"이 되지 않게 `.<d>.` 를 품으면 같은 도메인으로 본다. 대소문자는 구분한다
+            got = vals(cols[0])
+            hit = bool(got) and all(any(v == d or f".{d}." in v for d in ids) for v in got)
+        else:
+            got = vals(cols[0])
+            hit = bool(got) and got <= set(ids)
+        axis_hit = axis_hit or hit
+        if not hit:
+            notes.append(
+                f"filters restrict to other {label} values than the incident's query scope — not the incident's value"
+                if any(any(c in col for c in cols) for col, _ in conds) else
+                f"filters do not restrict to the incident's {label} — this is a value not filtered to the "
+                "incident's scope, not the incident's")
+    # 축 사건에도 셀이 있으면 범위 줄에 eNB 가 함께 실린다 — 축으로 바르게 걸렀으면 eNB·노드 표시는 건너뛴다
+    keyed = (bool(scope["nodes"]) or scope["has_enb"]) and not axis_hit
     if keyed:
         def hits(col_keys: tuple[str, ...], values: list[str] | None) -> bool:
             return any(any(k in col for k in col_keys) and (values is None or set(vals) & set(values))
@@ -968,7 +1034,12 @@ class BoundedAgent:
                         bounded["arguments_normalized"] = list(fixes)
                     if call.name == "query":
                         # 근거 수집 뒤에 붙인다 — 조건 값(where)의 숫자가 근거로 잡히면 안 된다
-                        meaning = _aggregation_meaning(tool_arguments)
+                        # 설명은 보조 정보다 — 만들다 실패해도 받은 조회 결과를 버리지 않는다(`_scope_note` 와 같은 결)
+                        try:
+                            meaning = _aggregation_meaning(tool_arguments)
+                        except Exception:  # noqa: BLE001
+                            LOG.warning("aggregation_meaning_failed", exc_info=True)
+                            meaning = []
                         if meaning:
                             bounded["aggregation_meaning"] = meaning
                         # 사건을 보며 한 조회가 사건 범위로 걸러졌나 — 아니면 결과 옆에 적는다(근거 수집 뒤)

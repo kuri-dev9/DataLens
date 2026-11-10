@@ -561,6 +561,7 @@ def build_app(
         except Exception as exc:
             LOG.error(
                 "message_handler_failed",
+                exc_info=True,  # 없으면 트레이스백이 남지 않아 원인을 코드에서 다시 짚어야 했다(2026-11-10)
                 extra={
                     "request_id": request.state.request_id,
                     "session_id": session_id,
