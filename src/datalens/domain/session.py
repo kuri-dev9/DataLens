@@ -1,8 +1,31 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Literal
+
+
+#: 질문 글자 — 한글 음절·자모와 히라가나·가타카나. **한자는 세지 않는다** — 일본어와 한국어가 모두 지명에
+#: 한자를 쓴다(新宿区·千代田区)
+_HANGUL = re.compile(r"[\uac00-\ud7a3\u3131-\u318e]")
+_KANA = re.compile(r"[\u3041-\u3096\u30a1-\u30fa\u30fc]")
+
+
+def question_locale(text: str | None) -> Literal["ko", "ja"] | None:
+    """질문을 쓴 말 — 한글이 많으면 ko, 가나가 많으면 ja, 둘 다 없으면 None(세션 기본값을 쓴다).
+
+    **답 언어는 세션이 아니라 질문한 언어를 따른다**(2026-11-11 사용자 결정). 세션 `locale` 은 만들 때 한 번
+    정해져, ja 세션에 한국어로 물으면 일본어로 답했다 — 시연자는 한국어로 묻고 현장 운영자는 일본어로 묻는다.
+    같은 세션에서 두 말이 섞여도 턴마다 자기 말로 답한다. 둘이 같은 수면 판정하지 않는다(None)
+    """
+    t = str(text or "")
+    ko, ja = len(_HANGUL.findall(t)), len(_KANA.findall(t))
+    if ko > ja:
+        return "ko"
+    if ja > ko:
+        return "ja"
+    return None
 
 
 @dataclass(frozen=True, slots=True)

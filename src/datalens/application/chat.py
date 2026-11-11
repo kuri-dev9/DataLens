@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 import logging
 from typing import Any, Awaitable, Callable, Protocol
 
@@ -12,6 +13,22 @@ from datalens.application.trace import TurnLog, blocks
 from datalens.application.sessions import SessionService
 from datalens.domain.memory import Recall
 from datalens.domain.session import Session
+
+
+def _turn_session(session: Session, locale: str | None) -> tuple[str | None, Session]:
+    """이 턴의 언어로 바꾼 세션 사본 — ``(세션 기본 언어, 사본)``. ``locale`` 이 없거나 같으면 그대로다.
+
+    **답 언어는 턴마다 질문 언어를 따른다**(2026-11-11 사용자 결정 · `question_locale`). 시스템 프롬프트·재시도
+    안내·이력 자르기 문구·메모리 조회가 모두 `session.locale` 을 읽으므로 사본 하나로 이 턴 전체가 바뀐다.
+    세션 `locale` 은 **기본값으로만** 남는다 — 커밋할 때 되돌린다(`_keep_locale`)"""
+    if locale not in ("ko", "ja") or locale == session.locale:
+        return None, session
+    return session.locale, replace(session, locale=locale)
+
+
+def _keep_locale(updated: Session, base: str | None) -> Session:
+    """턴 언어로 바꾼 사본을 커밋할 때 세션 기본 언어로 되돌린다 — 다음 턴이 이 턴의 말에 끌려가지 않게."""
+    return updated if base is None or updated.locale == base else replace(updated, locale=base)
 from datalens.observability import bind_request_id, reset_request_id
 
 
@@ -50,17 +67,20 @@ class ChatApplicationService:
                 for rid, (began, mode) in list(self._active.items())]
 
     async def handle(
-        self, session: Session, message: str, request_id: str, deadline: float, mode: Mode = "agent"
+        self, session: Session, message: str, request_id: str, deadline: float, mode: Mode = "agent",
+        locale: str | None = None,
     ) -> dict:
         started = time.monotonic()
         self._active[request_id] = (started, mode)
         try:
-            return await self._handle(session, message, request_id, deadline, mode, started)
+            base, session = _turn_session(session, locale)
+            return await self._handle(session, message, request_id, deadline, mode, started, base)
         finally:
             self._active.pop(request_id, None)
 
     async def _handle(
-        self, session: Session, message: str, request_id: str, deadline: float, mode: Mode, started: float
+        self, session: Session, message: str, request_id: str, deadline: float, mode: Mode, started: float,
+        base_locale: str | None = None,
     ) -> dict:
         context = bind_request_id(request_id)
         received, style = message, None
@@ -76,7 +96,7 @@ class ChatApplicationService:
         finally:
             reset_request_id(context)
         await self._remember(session, message, recall, result, mode)
-        committed = self._sessions.commit(result.updated_session)
+        committed = self._sessions.commit(_keep_locale(result.updated_session, base_locale))
         self._record(mode, result, started, committed.session_id, message, received, style, session.locale)
         logging.getLogger("datalens.agent").info(
             "agent_turn_completed",
@@ -121,11 +141,13 @@ class ChatApplicationService:
         deadline: float,
         event_sink: Callable[[str, dict[str, Any]], Awaitable[None]],
         mode: Mode = "agent",
+        locale: str | None = None,
     ) -> dict:
         started = time.monotonic()
         self._active[request_id] = (started, mode)
         try:
-            return await self._handle_stream(session, message, request_id, deadline, event_sink, mode, started)
+            base, session = _turn_session(session, locale)
+            return await self._handle_stream(session, message, request_id, deadline, event_sink, mode, started, base)
         finally:
             self._active.pop(request_id, None)
 
@@ -138,6 +160,7 @@ class ChatApplicationService:
         event_sink: Callable[[str, dict[str, Any]], Awaitable[None]],
         mode: Mode,
         started: float,
+        base_locale: str | None = None,
     ) -> dict:
         context = bind_request_id(request_id)
 
@@ -162,7 +185,7 @@ class ChatApplicationService:
         finally:
             reset_request_id(context)
         await self._remember(session, message, recall, result, mode)
-        committed = self._sessions.commit(result.updated_session)
+        committed = self._sessions.commit(_keep_locale(result.updated_session, base_locale))
         self._record(mode, result, started, committed.session_id, message, locale=session.locale)
         duration_ms = int((time.monotonic() - started) * 1000)
         logging.getLogger("datalens.agent").info(

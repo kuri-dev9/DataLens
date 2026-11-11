@@ -39,7 +39,7 @@ from datetime import UTC, datetime
 from datalens.application import answer_style
 from datalens.application.runtime_config import MODES, RuntimeConfig, RuntimeConfigError
 from datalens.application.trace import TurnLog, blocks
-from datalens.domain.session import Session
+from datalens.domain.session import Session, question_locale
 from datalens.config import Settings
 from datalens.infrastructure.queryforge_mcp import McpQueryForgeClient
 from datalens.ports.queryforge import QueryForgeClient, QueryForgeHttpResult, QueryForgeUnavailable
@@ -77,6 +77,10 @@ class MessageRequest(BaseModel):
     # evidence 는 보낸 맥락만으로 답한다(QueryForge 지침·데이터셋 목록·도구를 싣지 않는다).
     # 무엇을 싣는지는 모드별로 설정 화면(/ui)이 정한다.
     mode: Literal["agent", "evidence"] | None = None
+    # 이 턴의 답 언어(2026-11-11 · 사용자 "세션이 아니라 질문한 언어로"). 생략하면 질문 글자로 정하고
+    # (`question_locale`), 그것도 못 정하면 세션 기본값이다. graphio 처럼 질문 앞에 한국어 맥락을 붙여 보내는
+    # 호출자는 질문만으로 정한 값을 여기에 준다 — 메시지 전체로 세면 맥락의 한글이 이긴다
+    locale: Literal["ko", "ja"] | None = None
 
 
 class RuntimeSettingsRequest(BaseModel):
@@ -496,6 +500,10 @@ def build_app(
         turn_started = time.monotonic()
         # 모드를 지정한 요청만 넘긴다 — 생략한 요청은 예전 호출 모양 그대로 간다.
         mode_kwargs = {"mode": parsed.mode} if parsed.mode else {}
+        # 턴 언어 — 요청 값 > 질문 글자 > 세션 기본값. 세션과 같으면 넘기지 않는다(예전 호출 모양 그대로)
+        turn_locale = parsed.locale or question_locale(parsed.message)
+        if turn_locale and turn_locale != session.locale:
+            mode_kwargs["locale"] = turn_locale
         if wants_sse(request):
             async def events() -> AsyncIterator[bytes]:
                 queue: asyncio.Queue[tuple[str, dict[str, Any]] | None] = asyncio.Queue()
