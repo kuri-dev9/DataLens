@@ -813,18 +813,26 @@ class BoundedAgent:
                     answer = (turn.content or "").strip()
                     if not answer:
                         raise AgentInternalError("LLM returned an empty final answer")
-                    if (profile.mode != "evidence" and tool_count == 0 and unbacked_retry is None
-                            and not final_without_tools and sent_tools):
+                    # 조건은 "도구 0회"가 아니라 "query 0회"다(2026-11-12 · graphio 11번 재질의). schema 만 한 번 부르고
+                    # 맥락의 서버 합계 줄과 다른 값을 지어낸 답이 `tool_count` 1 이라 빠져나갔다 — schema·describe
+                    # 결과는 데이터 값이 아니다. 빈 출력 두 번 뒤 도구를 뺀 답(`final_without_tools`)도 같은 이유로
+                    # 대상이고, 그때는 아래 `_NO_QUERY_RETRY` 처럼 도구를 되돌린다. "확인하지 못했다"로 끝낸 답은
+                    # 그쪽 되묻기가 맡는다. 두 되묻기를 합쳐 한 턴에 한 번이다
+                    if (profile.mode != "evidence" and query_calls == 0 and unbacked_retry is None
+                            and no_query_retry is None and "query" in tool_map
+                            and (sent_tools or final_without_tools) and not _gave_up_without_query(answer)):
                         unbacked = _unbacked_numbers(
                             answer, facts, [m.content for m in messages if m.role == "user"])
                         if unbacked:
                             unbacked_retry = {"step": tool_count + 1, "values": unbacked[:10],
-                                              "first_answer_head": answer[:300]}
+                                              "first_answer_head": answer[:300],
+                                              **({"tools_restored": True} if final_without_tools else {})}
+                            final_without_tools = False
                             warnings.append({
                                 "code": "DATALENS_UNBACKED_NUMBERS_RETRY",
                                 "action": "regenerated_once",
                                 "detail": "numbers not found in tool results or the provided context were answered "
-                                          "without any tool call; asked the model once to query",
+                                          "without any query call; asked the model once to query",
                                 "values": unbacked[:10],
                             })
                             LOG.warning("agent_unbacked_numbers_retry",
@@ -839,7 +847,7 @@ class BoundedAgent:
                     # 포기"였다. 그때는 도구를 되돌려 한 번 더 부른다. 되묻기는 한 턴에 한 번이고, 다시 빈 출력이면
                     # 빈 출력 처리(`empty_retried` 이미 참)가 곧바로 도구 없는 답으로 보내므로 끝없이 돌지 않는다
                     if (profile.mode != "evidence" and query_calls == 0 and no_query_retry is None
-                            and "query" in tool_map and (sent_tools or final_without_tools)
+                            and unbacked_retry is None and "query" in tool_map and (sent_tools or final_without_tools)
                             and _gave_up_without_query(answer)):
                         no_query_retry = {"step": tool_count + 1, "first_answer_head": answer[:300],
                                           **({"tools_restored": True} if final_without_tools else {})}

@@ -153,8 +153,80 @@ def test_helper_returns_only_unbacked_numbers_and_survives_garbage():
 
 
 @pytest.mark.anyio
-async def test_tool_free_final_step_after_two_empty_generations_is_not_asked_again():
+async def test_tool_free_final_step_after_two_empty_generations_is_asked_once_with_tools_restored():
+    """빈 출력 두 번 뒤 도구를 뺀 답도 query 0회라 대상이다(2026-11-12) — 도구를 되돌려 한 번 다시 묻는다."""
     from datalens.ports.llm import LLMEmptyResponse
-    p = Provider([LLMEmptyResponse("a"), LLMEmptyResponse("b"), assistant(FAKE)])
+    p = Provider([LLMEmptyResponse("a"), LLMEmptyResponse("b"), assistant(FAKE), calling(), assistant("2,092件でした")])
+    qf = QF([_ok()])
+    result = await _run(p, qf)
+    assert result.answer == "2,092件でした" and len(qf.calls) == 1 and len(p.messages) == 5
+    assert p.tools[2] == () and p.tools[3] != ()                              # 지어낸 답을 낸 요청은 도구 없음, 되묻는 요청은 도구가 돌아옴
+    assert result.trace["unbacked_retry"]["tools_restored"] is True
+
+
+# ── query 0회 기준(schema 만 부른 답) · 두 되묻기는 합쳐 한 번 (2026-11-12 · graphio 11번 재질의) ─────────────
+
+SCHEMA_TOOL = QueryForgeToolDefinition("schema", "schema", {"type": "object", "additionalProperties": True})
+SCHEMA_CALL = {"action": "describe", "table": "T"}
+GIVEUP = "照会結果が取得できていないため、確認することができませんでした。"
+
+
+def schema_calling():
+    return AssistantTurn("", (ToolCall("s", "schema", SCHEMA_CALL),), "tool_calls")
+
+
+class QFS(QF):
+    """query 와 schema 를 다 내는 가짜 — schema 결과는 데이터 값이 없다."""
+
+    async def discover_tools(self, timeout_seconds=None):
+        return (QUERY_TOOL, SCHEMA_TOOL)
+
+    async def call_tool(self, name, arguments, *, application_session_id, timeout_seconds):
+        self.calls.append((name, arguments))
+        if name == "schema":
+            return QueryForgeResult(True, "S" * 22, {"ok": True, "tables": [{"name": "T", "columns": ["ENB_ID"]}]})
+        return self.results.popleft()
+
+
+def _w(result, code):
+    return [x for x in result.warnings if isinstance(x, dict) and x.get("code") == code]
+
+
+@pytest.mark.anyio
+async def test_schema_only_turn_with_fabricated_numbers_is_asked_once_more():
+    """schema 1회는 도구 1회지만 query 0회다 — 전에는 `tool_count` 1 이라 빠져나갔다."""
+    p = Provider([schema_calling(), assistant(FAKE), calling(), assistant("2,092件でした")])
+    qf = QFS([_ok()])
+    result = await _run(p, qf)
+    assert result.answer == "2,092件でした" and [c[0] for c in qf.calls] == ["schema", "query"]
+    assert len(_w(result, "DATALENS_UNBACKED_NUMBERS_RETRY")) == 1 and {"2,358", "1,460"} <= set(result.trace["unbacked_retry"]["values"])
+    assert "tools_restored" not in result.trace["unbacked_retry"]            # 도구는 빠진 적이 없다
+
+
+@pytest.mark.anyio
+async def test_giveup_with_numbers_runs_only_the_giveup_retry():
+    """"확인하지 못했다"로 끝낸 답에 수치가 섞여도 수치 되묻기는 건너뛰고 기존 포기 되묻기만 돈다."""
+    p = Provider([assistant(GIVEUP + " 参考: 2,358件"), calling(), assistant("2,092件でした")])
+    result = await _run(p, QF([_ok()]))
+    assert result.answer == "2,092件でした" and len(p.messages) == 3
+    assert len(_w(result, "DATALENS_NO_QUERY_RETRY")) == 1 and not _w(result, "DATALENS_UNBACKED_NUMBERS_RETRY")
+    assert "unbacked_retry" not in result.trace
+
+
+@pytest.mark.anyio
+async def test_no_third_call_after_the_retry_even_if_the_second_answer_gives_up_or_fabricates():
+    p = Provider([assistant(FAKE), assistant(GIVEUP)])                         # 수치 되묻기 뒤 두 번째 답이 포기 문구
     result = await _run(p, QF())
-    assert result.answer == FAKE and len(p.messages) == 3
+    assert result.answer == GIVEUP and len(p.messages) == 2
+    assert not _w(result, "DATALENS_NO_QUERY_RETRY")                          # 두 되묻기를 합쳐 한 번
+    p2 = Provider([assistant(GIVEUP), assistant(FAKE)])                        # 포기 되묻기 뒤 두 번째 답이 지어낸 수치
+    result2 = await _run(p2, QF())
+    assert result2.answer == FAKE and len(p2.messages) == 2
+    assert not _w(result2, "DATALENS_UNBACKED_NUMBERS_RETRY")
+
+
+@pytest.mark.anyio
+async def test_answer_using_only_the_context_total_line_is_not_asked_again():
+    p = Provider([assistant("SGW-10 の試行は 2,358件、失敗は 1,460件です")])
+    result = await _run(p, QF(), message="[서버 합계] SGW-10 시도 2,358건 실패 1,460건\nSGW-10 の試行数は？")
+    assert len(p.messages) == 1 and not _w(result, "DATALENS_UNBACKED_NUMBERS_RETRY")

@@ -116,9 +116,10 @@ async def test_giveup_again_after_restore_without_a_query_goes_out_as_is():
 
 @pytest.mark.anyio
 async def test_non_giveup_tool_free_answer_is_not_asked():
-    p = Provider([E1, E2, assistant("48件でした")])
+    # 수치가 없는 답으로 둔다 — 수치가 있으면 수치 되묻기(`DATALENS_UNBACKED_NUMBERS_RETRY`)가 돈다(2026-11-12 · 포기 되묻기와는 별개)
+    p = Provider([E1, E2, assistant("原因は MME 過負荷です")])
     result = await _run(p, QF())
-    assert result.answer == "48件でした" and len(p.messages) == 3 and not _w(result, "DATALENS_NO_QUERY_RETRY")
+    assert result.answer == "原因は MME 過負荷です" and len(p.messages) == 3 and not _w(result, "DATALENS_NO_QUERY_RETRY")
 
 
 @pytest.mark.anyio

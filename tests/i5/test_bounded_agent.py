@@ -733,7 +733,9 @@ async def test_notice_reaches_the_model_but_not_the_grounding_facts() -> None:
             "warnings": [],
         },
     )
-    provider = FakeProvider([calling("schema", {"action": "list_tables"}), assistant("전체 1000행 중 777 항목")])
+    # schema 만 부르고 수치를 쓴 답은 query 0회라 한 번 되묻는다(2026-11-12) — 되물은 뒤에도 같은 답이 나가는 경우를 본다
+    provider = FakeProvider([calling("schema", {"action": "list_tables"}), assistant("전체 1000행 중 777 항목"),
+                             assistant("전체 1000행 중 777 항목")])
     result = await BoundedAgent(provider, FakeQueryForge([partial]), max_tool_calls=3, recovery_budget=1).run(
         session(), "조회", time.monotonic() + 2
     )
